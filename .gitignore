@@ -1,0 +1,6 @@
+ai_data/gdrive_raw/
+__pycache__/
+*.pyc
+.venv/
+*.log
+java_error_in_studio_*.log
