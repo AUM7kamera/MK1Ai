@@ -1,0 +1,6 @@
+{
+  "ram_limit": 1500,
+  "mode": "RSI",
+  "compact_log": true,
+  "colab_endpoint": ""
+}

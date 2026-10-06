@@ -13,8 +13,8 @@ import json
 import logging
 import math
 import mmap
+import re
 import os
-import pathlib
 import platform
 import socket
 import subprocess
@@ -22,15 +22,49 @@ import sys
 import tempfile
 import threading
 import time
+import secrets
 import shutil
-from collections import deque
+from typing import Any
 
 try:
     import torch
     import torch.nn as nn
 except ImportError:
     torch = None
-    nn = None
+
+    class _DummyModule:
+        def __init__(self, *_args, **_kwargs):
+            del _args, _kwargs
+
+        def __call__(self, value):
+            return value
+
+        def load_state_dict(self, _state_dict):
+            del _state_dict
+            return None
+
+    class _DummyLinear(_DummyModule):
+        pass
+
+    class _DummyReLU(_DummyModule):
+        pass
+
+    class _DummySequential(_DummyModule):
+        def __init__(self, *layers):
+            self.layers = layers
+
+        def __call__(self, value):
+            for layer in self.layers:
+                value = layer(value)
+            return value
+
+    class _DummyNN:
+        Module = _DummyModule
+        Linear = _DummyLinear
+        ReLU = _DummyReLU
+        Sequential = _DummySequential
+
+    nn: Any = _DummyNN()
 
 try:
     import psutil
@@ -71,7 +105,6 @@ log = logging.getLogger("AirgapAI6")
 
 _MODEL_HASH_ENV = "AIRGAP_MODEL_HASH"
 _DEFAULT_SWAP_SIZE_MB = 100
-_METADATA_LOCK = threading.Lock()
 
 
 def _safe_sha256(path: str) -> str | None:
@@ -85,13 +118,24 @@ def _safe_sha256(path: str) -> str | None:
         return None
 
 
+def _normalize_expected_hash(raw_value: str) -> str | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    match = re.search(r"[A-Fa-f0-9]{64}", value)
+    if match:
+        return match.group(0).lower()
+    return None
+
+
 def _get_expected_model_hash(model_path: str) -> str | None:
-    explicit = os.environ.get(_MODEL_HASH_ENV, "").strip()
-    if explicit:
-        return explicit
     candidate = f"{model_path}.sha256"
     if os.path.exists(candidate):
-        return pathlib_read_text(candidate).strip()
+        return _normalize_expected_hash(pathlib_read_text(candidate))
+
+    explicit = os.environ.get(_MODEL_HASH_ENV, "").strip()
+    if explicit:
+        return _normalize_expected_hash(explicit)
     return None
 
 
@@ -123,26 +167,20 @@ def _validate_model_state_dict(state_dict: dict) -> bool:
     return required.issubset(set(state_dict.keys()))
 
 
-class AbsoluteDefenseModel(nn.Module if nn else object):
+class AbsoluteDefenseModel(nn.Module):
     def __init__(self):
-        if nn:
-            super().__init__()
-            self.shared_layer = nn.Sequential(
-                nn.Linear(128, 64),
-                nn.ReLU(),
-                nn.Linear(64, 32),
-            )
-            self.head_a = nn.Linear(32, 1)
-            self.head_b = nn.Linear(32, 1)
-            self.head_c = nn.Linear(32, 1)
-        else:
-            self.shared_layer = None
-            self.head_a = None
-            self.head_b = None
-            self.head_c = None
+        super().__init__()
+        self.shared_layer = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+        )
+        self.head_a = nn.Linear(32, 1)
+        self.head_b = nn.Linear(32, 1)
+        self.head_c = nn.Linear(32, 1)
 
     def forward(self, x):
-        if not nn:
+        if torch is None:
             raise RuntimeError("PyTorch is required for model inference")
         shared = self.shared_layer(x)
         return {
@@ -176,11 +214,18 @@ def load_local_model(model, model_path: str) -> bool:
         except Exception:
             device = torch.device("cpu")
 
-    load_kwargs = {"map_location": device}
+    load_kwargs = {"map_location": device, "weights_only": True}
     try:
         loaded = torch.load(model_path, **load_kwargs)
     except TypeError:
-        loaded = torch.load(model_path, map_location=device)
+        try:
+            loaded = torch.load(model_path, map_location=device)
+        except Exception as exc:
+            log.warning(f"[MODEL] ローカルモデルのロードに失敗しました: {exc}")
+            return False
+    except Exception as exc:
+        log.warning(f"[MODEL] ローカルモデルのロードに失敗しました: {exc}")
+        return False
     if isinstance(loaded, dict) and "state_dict" in loaded:
         state_dict = loaded["state_dict"]
     elif isinstance(loaded, dict) and "model_state_dict" in loaded:
@@ -207,7 +252,7 @@ def calculate_entropy(data: bytes) -> float:
     length = len(data)
     for count in counts.values():
         p = count / length
-        entropy -= p * (p and (p.bit_length() or 0))
+        entropy -= p * math.log2(p)
     return entropy
 
 
@@ -257,7 +302,7 @@ def analyze_packet_security(packet_bytes: bytes, src_ip: str = "", dst_ip: str =
     behavior = "benign"
     if aes["aes_candidate"] and ratio > 0.6:
         behavior = "encrypted_c2"
-    elif entropy > 7.2 and ratio > 0.75:
+    elif aes["entropy"] > 7.2 and ratio > 0.75:
         behavior = "high_entropy_payload"
     return {
         "aes": aes,
@@ -314,7 +359,7 @@ def profile_environment() -> dict:
     else:
         profile["memory"] = {"total_mb": 0, "available_mb": 0}
     try:
-        total, used, free = shutil.disk_usage(".")
+        total, _, free = shutil.disk_usage(".")
         profile["storage"] = {
             "total_mb": int(total / 1024 / 1024),
             "free_mb": int(free / 1024 / 1024),
@@ -436,12 +481,42 @@ def generate_absolute_defense_payload(profile: dict) -> dict:
 
 def _is_suspicious_process(proc) -> bool:
     try:
-        cmdline = proc.cmdline()
-        if not cmdline:
+        if proc.pid == os.getpid():
             return False
-        if "(deleted)" in " ".join(cmdline):
+        name = (proc.name() or "").lower()
+        cmdline = proc.cmdline() or []
+        cmdline_text = " ".join(cmdline)
+        protected_names = {
+            "systemd",
+            "init",
+            "kthreadd",
+            "ksoftirqd",
+            "kworker",
+            "dbus-daemon",
+            "sshd",
+            "cron",
+            "crond",
+            "rsyslogd",
+            "systemd-journald",
+            "systemd-logind",
+            "NetworkManager",
+            "docker",
+            "containerd",
+            "nginx",
+            "apache2",
+            "httpd",
+            "mysqld",
+            "postgres",
+            "snapd",
+            "polkitd",
+        }
+        if name in protected_names:
+            return False
+        if "(deleted)" in cmdline_text:
+            if proc.pid == 1 or proc.ppid() == 1:
+                return False
             return True
-        if proc.pid != os.getpid() and proc.name().lower() in {"bash", "sh", "python", "perl"}:
+        if proc.pid != os.getpid() and name in {"bash", "sh", "python", "perl"}:
             return False
     except Exception:
         return False
@@ -469,7 +544,7 @@ def execute_kill_switch(interface: str, dry_run: bool, profile: dict | None = No
     if profile is None:
         profile = profile_environment()
     payload = generate_absolute_defense_payload(profile)
-    log.critical(f"[KILL_SWITCH] 絶対防衛キルスイッチを発動します: interface={interface}")
+    log.critical(f"[KILL_SWITCH] キルスイッチを発動します: interface={interface}")
     success = True
     for cmd in payload["commands"]:
         if not _run_command(cmd, dry_run=dry_run):
@@ -489,20 +564,20 @@ class MemoryManager:
             os.chmod(swap_dir, 0o700)
         except Exception:
             pass
-        self.swap_path = os.path.join(swap_dir, "vm_swap.bin")
-        with open(self.swap_path, "wb") as handle:
-            handle.write(b"\x00" * (_DEFAULT_SWAP_SIZE_MB * 1024 * 1024))
+        swap_fd, self.swap_path = tempfile.mkstemp(prefix="vm_swap_", suffix=".bin", dir=swap_dir)
         try:
-            os.chmod(self.swap_path, 0o600)
+            os.fchmod(swap_fd, 0o600)
         except Exception:
             pass
-        self.swap_fd = open(self.swap_path, "r+b")
+        self.swap_fd = os.fdopen(swap_fd, "r+b")
+        self.swap_fd.truncate(_DEFAULT_SWAP_SIZE_MB * 1024 * 1024)
         self.mmap = mmap.mmap(self.swap_fd.fileno(), 0)
         self.offset = 0
         self.is_critical = False
         self._ema_ratio = 0.0
         self._ema_alpha = 0.2
-        self._swap_key = hashlib.sha256(f"{os.getpid()}_{socket.gethostname()}_{time.time()}".encode()).digest()
+        self._lock = threading.Lock()
+        self._swap_key = secrets.token_bytes(32)
         log.info(f"[MEMORY] MemoryManager 起動: {max_memory_mb}MB, swap={self.swap_path}")
 
     def get_usage_ratio(self) -> float:
@@ -534,23 +609,25 @@ class MemoryManager:
             return 0
         blob = (json.dumps(data) + "\n").encode("utf-8")
         encrypted = self._xor_encrypt(blob)
-        if len(encrypted) >= len(self.mmap):
-            return 0
-        if self.offset + len(encrypted) >= len(self.mmap):
-            self.offset = 0
-            log.warning("[MEMORY] swap 領域が循環したため位置をリセットしました。")
-        self.mmap.seek(self.offset)
-        self.mmap.write(encrypted)
-        self.offset += len(encrypted)
+        with self._lock:
+            if len(encrypted) >= len(self.mmap):
+                return 0
+            if self.offset + len(encrypted) >= len(self.mmap):
+                self.offset = 0
+                log.warning("[MEMORY] swap 領域が循環したため位置をリセットしました。")
+            self.mmap.seek(self.offset)
+            self.mmap.write(encrypted)
+            self.offset += len(encrypted)
         log.warning(f"[MEMORY] {len(data)} 件のバッファを暗号化してストレージへ退避しました。")
         return len(data)
 
     def cleanup(self):
-        try:
-            self.mmap.close()
-            self.swap_fd.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self.mmap.close()
+                self.swap_fd.close()
+            except Exception:
+                pass
         try:
             os.unlink(self.swap_path)
         except OSError:
@@ -567,18 +644,19 @@ class SelfProtection:
         self.base_hash = self._compute_self_hash()
 
     def _compute_self_hash(self) -> str | None:
-        exe_path = getattr(sys, "executable", None)
-        if exe_path and os.path.exists(exe_path):
-            return _safe_sha256(exe_path)
-        try:
-            return _safe_sha256(__file__)
-        except Exception:
-            return None
+        script_path = None
+        if "__file__" in globals():
+            script_path = os.path.abspath(__file__)
+        elif len(sys.argv) > 0:
+            script_path = os.path.abspath(sys.argv[0])
+        if script_path and os.path.exists(script_path):
+            return _safe_sha256(script_path)
+        return None
 
     def _check_integrity(self) -> bool:
         new_hash = self._compute_self_hash()
         if self.base_hash and new_hash and new_hash != self.base_hash:
-            log.critical("[SELF_DEFENSE] 実行ファイルが改ざんされました。絶対防衛を発動します。")
+            log.critical("[SELF_DEFENSE] 実行ファイルが改ざんされました 防衛を発動します。")
             return False
         return True
 

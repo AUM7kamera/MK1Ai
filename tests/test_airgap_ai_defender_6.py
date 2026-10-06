@@ -5,16 +5,39 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from typing import Any
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "airgap_ai_defender_6.py"
 spec = importlib.util.spec_from_file_location("airgap_ai_defender_6", MODULE_PATH)
-module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None, "Failed to load spec or loader"
+module: Any = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
 class AirgapAI6Test(unittest.TestCase):
+    def test_calculate_entropy_returns_shannon_entropy(self):
+        self.assertEqual(module.calculate_entropy(b""), 0.0)
+        self.assertEqual(module.calculate_entropy(b"aaaa"), 0.0)
+        self.assertEqual(module.calculate_entropy(b"abab"), 1.0)
+
+    def test_analyze_packet_security_classifies_high_entropy_payload(self):
+        byte_values = list(range(32)) + list(range(128, 256))
+        symbol_indexes = (
+            [0, 0, 1, 1, *range(2, 14)]
+            + list(range(2, 14))
+            + [index for index in range(14, 96) for _ in range(2)]
+            + list(range(96, 160))
+        )
+        payload = bytes(byte_values[index] for index in symbol_indexes)
+
+        result = module.analyze_packet_security(payload)
+
+        self.assertGreater(result["aes"]["entropy"], 7.2)
+        self.assertFalse(result["aes"]["aes_candidate"])
+        self.assertEqual(result["behavior"], "high_entropy_payload")
+
     def test_load_local_model_uses_cpu_map_location(self):
         class DummyModel:
             def __init__(self):
@@ -57,6 +80,15 @@ class AirgapAI6Test(unittest.TestCase):
             model = DummyModel()
             self.assertFalse(module.load_local_model(model, "/tmp/local.pth"))
             load_mock.assert_not_called()
+
+    def test_get_expected_model_hash_accepts_sha256sum_sidecar_format(self):
+        expected_hash = hashlib.sha256(b"model-bytes").hexdigest()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = pathlib.Path(temp_dir) / "local.pth"
+            model_path.write_bytes(b"model-bytes")
+            sidecar_path = pathlib.Path(str(model_path) + ".sha256")
+            sidecar_path.write_text(f"{expected_hash}  local.pth\n", encoding="utf-8")
+            self.assertEqual(module._get_expected_model_hash(str(model_path)), expected_hash)
 
     def test_boot_time_auto_hardening_reports_missing_root(self):
         profile = {"permissions": {"root": False}}

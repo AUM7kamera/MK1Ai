@@ -2,5 +2,7 @@ ai_data/gdrive_raw/
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
+ai_data/vm_swap_*.bin
 *.log
 java_error_in_studio_*.log

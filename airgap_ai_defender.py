@@ -29,8 +29,14 @@
 """
 
 # ── 標準ライブラリ (インストール不要) ──
-import os, sys, time, struct, socket, threading, queue, json, tempfile, mmap, subprocess, argparse, logging, random, shutil, platform, math, re, hmac, pickle, zipfile, hashlib, getpass, multiprocessing, ctypes, errno
+import atexit
+import os, sys, time, struct, socket, threading, queue, json, tempfile, mmap, subprocess, argparse, logging, random, shutil, platform, math, re, hmac, pickle, zipfile, hashlib, getpass, multiprocessing, ctypes, errno, secrets, importlib.util, gc, stat
+import warnings
+import multiprocessing.util as _multiprocessing_util
 from collections import Counter, OrderedDict, deque
+from dataclasses import dataclass
+from typing import Any, Iterable, cast
+from urllib.parse import urlparse
 
 try:
     import pwd
@@ -54,117 +60,252 @@ _CODE_EXECUTION_CONTEXT = (
 
 _UNSAFE_SHELL_CHARS_RE = re.compile(r"[;&|`$<>\\\n\r\t\f\v]")
 
-# ── 外部ライブラリ (pip install torch psutil requests gdown) ──
+def ensure_dependencies() -> dict[str, bool]:
+    """不足ライブラリの導入を試みる。失敗時は呼び出し元のstubへフォールバックする。"""
+    packages = {
+        "torch": "torch",
+        "psutil": "psutil",
+        "cryptography": "cryptography",
+    }
+    availability = {}
+    for module_name, package_name in packages.items():
+        try:
+            availability[module_name] = importlib.util.find_spec(module_name) is not None
+        except (ImportError, ValueError):
+            availability[module_name] = False
+
+        if availability[module_name]:
+            continue
+
+        command = [
+            sys.executable, "-m", "pip", "install",
+            "--disable-pip-version-check", "--retries", "3", "--timeout", "300",
+        ]
+        if module_name == "torch":
+            command.extend([
+                "--extra-index-url", "https://download.pytorch.org/whl/cpu",
+            ])
+        command.append(package_name)
+        try:
+            print(f"[DEPENDENCIES] {package_name} をインストールします。", file=sys.stderr)
+            result = subprocess.run(
+                command,
+                check=False,
+                timeout=1800,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            availability[module_name] = result.returncode == 0
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(
+                f"[DEPENDENCIES] {package_name} を導入できません。stub/安全な代替処理で続行します ({exc})",
+                file=sys.stderr,
+            )
+            availability[module_name] = False
+
+        if not availability[module_name]:
+            print(
+                f"[DEPENDENCIES] {package_name} が利用できません。機能を制限して続行します。",
+                file=sys.stderr,
+            )
+    return availability
+
+
+# ── 外部ライブラリ ──
+# Optional imports are dynamically shaped; keep their public bindings opaque to
+# static analysis in both the installed and fallback environments.
+torch: Any
+nn: Any
+optim: Any
+psutil: Any
+requests: Any
+gdown: Any
+AESGCM: Any
+
 try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
-except ImportError:  # テスト/最小環境でも import できるように軽量なスタブを提供
+except Exception:  # テスト/最小環境でも import できるように軽量なスタブを提供
     class _DummyModule:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
-        def __call__(self, x):
-            return x
-        def forward(self, x):
-            return x
-        def train(self):
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return self.forward(*args, **kwargs)
+
+        def forward(self, *args: Any, **kwargs: Any) -> Any:
+            return args[0] if args else None
+
+        def to(self, *args: Any, **kwargs: Any) -> "_DummyModule":
+            return self
+
+        def train(self, mode: bool = True) -> "_DummyModule":
+            return self
+
+        def eval(self) -> "_DummyModule":
+            return self.train(False)
+
+        def load_state_dict(self, state_dict: Any, *args: Any, **kwargs: Any) -> None:
             return None
-        def eval(self):
-            return None
-        def load_state_dict(self, state_dict):
-            return None
-        def state_dict(self):
+
+        def state_dict(self) -> dict[str, Any]:
             return {}
-        def named_parameters(self):
+
+        def named_parameters(self, *args: Any, **kwargs: Any) -> list[tuple[str, Any]]:
             return []
-        def parameters(self):
+
+        def parameters(self, *args: Any, **kwargs: Any) -> list[Any]:
             return []
+
+        def __getattr__(self, name: str) -> Any:
+            return lambda *args, **kwargs: self
 
     class _DummyLayer(_DummyModule):
         pass
 
     class _DummySequential(_DummyModule):
-        def __init__(self, *layers):
+        def __init__(self, *layers: Any) -> None:
             super().__init__()
             self.layers = list(layers)
-        def __call__(self, x):
-            out = x
+
+        def forward(self, value: Any) -> Any:
+            out = value
             for layer in self.layers:
                 out = layer(out)
             return out
 
     class _DummyTensor:
-        def __init__(self, value=0.0):
+        def __init__(self, value: Any = 0.0) -> None:
             self._value = value
-        def item(self):
+
+        @property
+        def data(self) -> "_DummyTensor":
+            return self
+
+        def item(self) -> Any:
             if isinstance(self._value, list):
                 return self._value[0] if self._value else 0.0
             return float(self._value)
-        def backward(self):
+
+        def to(self, *args: Any, **kwargs: Any) -> "_DummyTensor":
+            return self
+
+        def clone(self) -> "_DummyTensor":
+            return _DummyTensor(self._value)
+
+        def abs(self) -> "_DummyTensor":
+            return _DummyTensor(abs(self.item()))
+
+        def backward(self, *args: Any, **kwargs: Any) -> None:
             return None
-        def tolist(self):
+
+        def tolist(self) -> list[Any]:
             if isinstance(self._value, list):
                 return list(self._value)
             return [self._value]
 
+        def __getattr__(self, name: str) -> Any:
+            return lambda *args, **kwargs: self
+
     class _NoGradContext:
-        def __enter__(self):
+        def __enter__(self) -> "_NoGradContext":
             return self
-        def __exit__(self, exc_type, exc, tb):
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
             return False
 
     class _DummyLoss:
-        def __call__(self, *args, **kwargs):
+        def __call__(self, *args: Any, **kwargs: Any) -> _DummyTensor:
             return _DummyTensor(0.0)
 
     class _DummyOptimizer:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
-        def zero_grad(self):
+
+        def zero_grad(self, *args: Any, **kwargs: Any) -> None:
             pass
-        def step(self):
+
+        def step(self, *args: Any, **kwargs: Any) -> None:
             pass
+
+        def __getattr__(self, name: str) -> Any:
+            return lambda *args, **kwargs: None
+
+    class _DummyNamespace:
+        def __getattr__(self, name: str) -> Any:
+            if name == "is_available":
+                return lambda: False
+            return lambda *args, **kwargs: _DummyTensor(0.0)
 
     class _DummyNN:
-        Module = _DummyModule
-        Linear = _DummyLayer
-        Sequential = _DummySequential
-        ReLU = _DummyLayer
-        Sigmoid = _DummyLayer
-        BCELoss = _DummyLoss
+        Module: Any = _DummyModule
+        Linear: Any = _DummyLayer
+        Sequential: Any = _DummySequential
+        ReLU: Any = _DummyLayer
+        Sigmoid: Any = _DummyLayer
+        BCELoss: Any = _DummyLoss
 
     class _DummyOptim:
-        SGD = _DummyOptimizer
+        SGD: Any = _DummyOptimizer
 
     class _TorchStub:
-        float32 = "float32"
-        float64 = "float64"
+        float32: Any = "float32"
+        float64: Any = "float64"
 
         @staticmethod
-        def tensor(*args, **kwargs):
+        def tensor(*args: Any, **kwargs: Any) -> _DummyTensor:
             if not args:
                 return _DummyTensor(0.0)
             value = args[0]
             return _DummyTensor(value)
+
         @staticmethod
-        def rand(*args, **kwargs):
+        def rand(*args: Any, **kwargs: Any) -> _DummyTensor:
             return _DummyTensor(0.0)
+
         @staticmethod
-        def load(*args, **kwargs):
-            raise ImportError("torch is not available")
+        def zeros(*args: Any, **kwargs: Any) -> _DummyTensor:
+            return _DummyTensor(0.0)
+
         @staticmethod
-        def device(*args, **kwargs):
+        def load(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if hasattr(file, "read"):
+                return pickle.load(file)
+            with open(file, "rb") as model_file:
+                return pickle.load(model_file)
+
+        @staticmethod
+        def save(value: Any, file: Any, *args: Any, **kwargs: Any) -> None:
+            if hasattr(file, "write"):
+                pickle.dump(value, file)
+            else:
+                with open(file, "wb") as model_file:
+                    pickle.dump(value, model_file)
+
+        @staticmethod
+        def device(*args: Any, **kwargs: Any) -> Any:
             return args[0] if args else "cpu"
+
         @staticmethod
-        def no_grad():
+        def no_grad() -> _NoGradContext:
             return _NoGradContext()
 
-    torch = _TorchStub()
-    nn = _DummyNN()
-    optim = _DummyOptim()
+        @staticmethod
+        def set_num_threads(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        def __getattr__(self, name: str) -> Any:
+            if name in {"cuda", "backends"}:
+                return _DummyNamespace()
+            return lambda *args, **kwargs: _DummyTensor(0.0)
+
+    torch = _TorchStub()  # type: ignore[assignment]
+    nn = _DummyNN()  # type: ignore[assignment]
+    optim = _DummyOptim()  # type: ignore[assignment]
 try:
     import psutil
-except ImportError:
+except Exception:
     class _PsutilStub:
         CONN_LISTEN = "LISTEN"
         CONN_ESTABLISHED = "ESTABLISHED"
@@ -174,35 +315,47 @@ except ImportError:
         ZombieProcess = Exception
 
         @staticmethod
-        def net_if_addrs():
+        def net_if_addrs() -> dict[str, Any]:
             return {}
 
         @staticmethod
-        def net_connections(kind="inet"):
+        def net_connections(kind: str = "inet") -> list[Any]:
             return []
 
         @staticmethod
-        def process_iter(attrs=None):
+        def process_iter(attrs: list[str] | None = None) -> list[Any]:
             return []
 
         class Process:
-            def __init__(self, pid):
+            def __init__(self, pid: int) -> None:
                 self.pid = pid
-            def memory_info(self):
+
+            def memory_info(self) -> Any:
                 return type("MemoryInfo", (), {"rss": 0})()
 
-    psutil = _PsutilStub()
+        def __getattr__(self, name: str) -> Any:
+            if name == "cpu_percent":
+                return lambda *args, **kwargs: 0.0
+            return lambda *args, **kwargs: []
+
+    psutil = _PsutilStub()  # type: ignore[assignment]
 
 try:
     import requests
-except ImportError:
+except Exception:
     requests = None
 
 try:
     import gdown  # Googleドライブフォルダのダウンロードに特化したライブラリ
     GDOWN_AVAILABLE = True
-except ImportError:
+except Exception:
+    gdown = None
     GDOWN_AVAILABLE = False
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except Exception:
+    AESGCM = None
 
 # ── ロギング設定 ──
 class SecurityLogger(logging.Logger):
@@ -230,6 +383,64 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger("AirgapAI")
+
+
+class CompactLogFilter(logging.Filter):
+    """通常時のログを抑え、異常値や運用エラーだけを通す。"""
+    _IMPORTANT_MARKERS = (
+        "キルスイッチ", "ram危機", "dpi_full_inspection", "self_protection",
+        "backdoor", "active_defense",
+    )
+
+    def filter(self, record):
+        if record.levelno >= logging.ERROR:
+            return True
+        if record.levelno < logging.WARNING:
+            return False
+        message = record.getMessage().lower()
+        if any(marker in message for marker in self._IMPORTANT_MARKERS):
+            return True
+        scores = re.findall(r"(?:score|スコア)\s*[=:]\s*(0?\.\d+|1(?:\.0+)?)", message)
+        return any(float(score) >= 0.88 for score in scores)
+
+
+def configure_compact_logging(enabled: bool) -> None:
+    root_logger = logging.getLogger()
+    compact_filter = next(
+        (item for handler in root_logger.handlers for item in handler.filters if isinstance(item, CompactLogFilter)),
+        None,
+    )
+    if enabled and compact_filter is None:
+        compact_filter = CompactLogFilter()
+        for handler in root_logger.handlers:
+            handler.addFilter(compact_filter)
+    elif not enabled and compact_filter is not None:
+        for handler in root_logger.handlers:
+            handler.removeFilter(compact_filter)
+
+configure_compact_logging(True)
+
+_ALLOWED_ROOT_COMMANDS = {
+    "ip",
+    "iptables",
+    "nft",
+    "powershell",
+    "netsh",
+    "ipconfig",
+    "networksetup",
+    "ifconfig",
+    "systemctl",
+}
+_ALLOWED_PRIVILEGED_COMMAND_TYPES = {"kill_switch", "run_command"}
+_ALLOWED_PACKET_FEATURE_LENGTH = 10
+
+@dataclass(frozen=True)
+class PacketQueueItem:
+    feature_vector: list[float]
+    packet_bytes: bytes
+
+    def __iter__(self):
+        return iter((self.feature_vector, self.packet_bytes))
 
 # =====================================================================
 # 追加機能: ネットワーク自動判別 / 暗号解析 / バックドア検査 / MTD
@@ -305,10 +516,27 @@ FULL_PACKET_INSPECTION = str(os.environ.get("FULL_PACKET_INSPECTION", "")).lower
 _DPI_WINDOW_SIZE = 256
 _DPI_SAMPLE_STRIDE = 128
 _DPI_MAX_SAMPLE_WINDOWS = 32
-_FULL_PACKET_INSPECTION_LOG_PATH = os.path.join("./ai_data", "full_packet_inspection.log")
+_FULL_PACKET_INSPECTION_LOG_PATH = os.path.join("./ai_data", "packet_logs", "full_packet_inspection.log")
+_FULL_PACKET_INSPECTION_LOG_FD = None
+_FULL_PACKET_INSPECTION_LOG_FD_PATH = None
+_FULL_PACKET_INSPECTION_LOG_LOCK = threading.Lock()
 _MAINTENANCE_ACTIVE = False
 _MAINTENANCE_REASON = ""
 _MAINTENANCE_LOCK = threading.Lock()
+_RSI_MODE_ACTIVE = False
+_RSI_CONNECTION_STATUS = "Not configured"
+_MODEL_SYNC_STATUS = "Disabled"
+_LAST_THREAT_SCORE = 0.0
+_MODEL_RELOAD_LOCK = threading.Lock()
+_MODEL_ACCESS_LOCK = threading.RLock()
+_CAPTURE_DATA_LOCK = threading.Lock()
+_PENDING_CLOUD_STATE = None
+_PENDING_CLOUD_REVIEWED = False
+_HEAD_B_REVIEWED_LABELS: set[int] = set()
+_HEAD_B_REVIEWED = False
+_LEARNING_ALERT_LOCK = threading.Lock()
+_LAST_LEARNING_ALERT_TIME = 0.0
+_LEARNING_ALERT_INTERVAL_SEC = 30.0
 _CONTAINMENT_LOCK = threading.Lock()
 _KILL_SWITCH_EVENT = threading.Event()
 _ADMIN_RECOVERY_TOKEN = os.environ.get("AIRGAP_ADMIN_RECOVERY_TOKEN", "")
@@ -354,6 +582,7 @@ _ANOMALY_DECAY_WINDOW_SEC = 30.0
 _HEAD_C_EVICT_ACTIVE = False
 _HEAD_C_ON_THRESHOLD = 0.75
 _HEAD_C_OFF_THRESHOLD = 0.50
+_DEFAULT_SWAP_SIZE_MB = 100
 _MANAGEMENT_SAFE_HARBOR_DEFAULT_PORTS = (22,)
 _MANAGEMENT_SAFE_HARBOR_DEFAULT_IPS = ("127.0.0.1", "::1")
 _TRACE_SEQUENCE = 0
@@ -380,6 +609,20 @@ def exit_maintenance_mode():
 def is_maintenance_mode() -> bool:
     with _MAINTENANCE_LOCK:
         return _MAINTENANCE_ACTIVE
+
+
+def is_learning_mode() -> bool:
+    return _RSI_MODE_ACTIVE or is_maintenance_mode()
+
+
+def _report_learning_detection(message: str) -> None:
+    global _LAST_LEARNING_ALERT_TIME
+    now = time.monotonic()
+    with _LEARNING_ALERT_LOCK:
+        if now - _LAST_LEARNING_ALERT_TIME < _LEARNING_ALERT_INTERVAL_SEC:
+            return
+        _LAST_LEARNING_ALERT_TIME = now
+    log.warning("[LEARNING_MODE] %s。Dry-Run中のため遮断せず、監査ログに記録しました。", message)
 
 
 def update_gdrive_ips() -> set:
@@ -643,7 +886,7 @@ def _classify_payload_text(payload_bytes: bytes) -> str:
     return "binary-or-opaque"
 
 
-def _get_dynamic_calibration(interface: str = None, payload_len: int = 0, text_class: str = None, lower_payload: bytes | None = None, payload_bytes: bytes | None = None) -> dict:
+def _get_dynamic_calibration(interface: str | None = None, payload_len: int = 0, text_class: str | None = None, lower_payload: bytes | None = None, payload_bytes: bytes | None = None) -> dict:
     """通常時トラフィック密度に合わせて、DPIの判定閾値を動的に補正する。"""
     iface_key = interface or "default"
     history = _TRAFFIC_CALIBRATION_WINDOW.setdefault(iface_key, deque(maxlen=64))
@@ -730,7 +973,7 @@ def _maybe_recover_security_hardening() -> None:
         log.info("[SELF_HEALING] 異常イベントの収束を確認しました。通常モードへ徐々に復帰します。\n")
 
 
-def _update_head_b_learning_queue(payload_bytes: bytes, interface: str = None, text_class: str = "binary-or-opaque") -> float:
+def _update_head_b_learning_queue(payload_bytes: bytes, interface: str | None = None, text_class: str = "binary-or-opaque") -> float:
     """Head B が正常通信の学習キューを保持し、端末特有の正常パターンに対する補正値を返す。"""
     if not payload_bytes or len(payload_bytes) < 16:
         return 0.0
@@ -1013,7 +1256,7 @@ def _assess_jittered_c2_pattern(flow_state: dict) -> float:
     return min(0.99, score)
 
 
-def _assess_destination_correlation(dst_ip: str, flow_state: dict) -> bool:
+def _assess_destination_correlation(dst_ip: str | None, flow_state: dict) -> bool:
     if not dst_ip:
         return False
 
@@ -1223,7 +1466,7 @@ def _detect_local_anomaly_regions(payload_bytes: bytes, text_class: str) -> tupl
     return anomalies, local_anomaly
 
 
-def _get_adaptive_fast_pass_result(packet_bytes: bytes, payload_bytes: bytes, interface: str = None) -> dict | None:
+def _get_adaptive_fast_pass_result(packet_bytes: bytes, payload_bytes: bytes, interface: str | None = None) -> dict | None:
     """高信頼フローでは先頭/末尾ウィンドウだけで即応答し、危険シグナルが見つかった場合だけフルDPIへ昇格する。"""
     if not payload_bytes:
         return None
@@ -1339,7 +1582,7 @@ def _apply_contextual_smoothing(payload_bytes: bytes, text_class: str, printable
     return correction
 
 
-def analyze_dpi_payload(packet_bytes: bytes, payload: bytes = None, interface: str = None) -> dict:
+def analyze_dpi_payload(packet_bytes: bytes, payload: bytes | None = None, interface: str | None = None) -> dict:
     """全文Byte列をベクトル化し、DPI評価器のように挙動・エントロピー・全体の異常度をAI的にスコアリングする。"""
     try:
         flow_cache_hit = _get_flow_cache_result(packet_bytes) if packet_bytes else None
@@ -1603,16 +1846,12 @@ def analyze_dpi_payload(packet_bytes: bytes, payload: bytes = None, interface: s
         return _build_fail_closed_dpi_result(packet_bytes, "dpi_exception")
 
 
-def log_full_packet_inspection(packet_bytes: bytes, interface: str, dpi_result: dict, stage: str, reason: str, log_path: str = None):
+def log_full_packet_inspection(packet_bytes: bytes, interface: str | None, dpi_result: dict, stage: str, reason: str, log_path: str | None = None):
     """異常疑惑パケットの完全なヘッダー・DPI詳細をログ/ファイルへ保存する。"""
     if not (FULL_PACKET_INSPECTION or dpi_result.get("suspicious")):
         return
 
     path = log_path or _FULL_PACKET_INSPECTION_LOG_PATH
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except OSError:
-        pass
 
     transport = parse_packet_transport(packet_bytes)
     findings = dpi_result.get("findings", [])
@@ -1626,8 +1865,35 @@ def log_full_packet_inspection(packet_bytes: bytes, interface: str, dpi_result: 
         "findings": findings,
         "hex_dump": " ".join(f"{b:02x}" for b in packet_bytes[:256]),
     }
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
+    record_bytes = (json.dumps(record) + "\n").encode("utf-8")
+    prepared_fd = _FULL_PACKET_INSPECTION_LOG_FD
+    if (
+        prepared_fd is not None
+        and os.path.abspath(path) == _FULL_PACKET_INSPECTION_LOG_FD_PATH
+    ):
+        with _FULL_PACKET_INSPECTION_LOG_LOCK:
+            remaining = memoryview(record_bytes)
+            while remaining:
+                written = os.write(prepared_fd, remaining)
+                if written == 0:
+                    raise OSError(errno.EIO, "packet inspection log write made no progress")
+                remaining = remaining[written:]
+    else:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        directory_stat = os.lstat(directory)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError(f"packet inspection log parent is not a directory: {directory}")
+        os.chmod(directory, 0o700)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                handle.write(record_bytes.decode("utf-8"))
+        except Exception:
+            os.close(descriptor)
+            raise
 
     log.warning("[DPI_FULL_INSPECTION] パケット全調査ログを記録しました。")
     log.warning(f"  - stage={stage} reason={reason} entropy={dpi_result.get('entropy', 0.0):.3f}")
@@ -1641,6 +1907,70 @@ def log_full_packet_inspection(packet_bytes: bytes, interface: str, dpi_result: 
         elif finding.get("type") == "entropy":
             log.warning(f"  - offset={finding.get('offset')} entropy={finding.get('entropy', 0.0):.3f} high_entropy_window")
 
+
+def _prepare_packet_inspection_log() -> None:
+    """降格先だけが触れるパケットログ領域を、権限降格前に作成する。"""
+    global _FULL_PACKET_INSPECTION_LOG_FD, _FULL_PACKET_INSPECTION_LOG_FD_PATH
+    if _FULL_PACKET_INSPECTION_LOG_FD is not None:
+        os.close(_FULL_PACKET_INSPECTION_LOG_FD)
+        _FULL_PACKET_INSPECTION_LOG_FD = None
+        _FULL_PACKET_INSPECTION_LOG_FD_PATH = None
+
+    path = os.path.abspath(_FULL_PACKET_INSPECTION_LOG_PATH)
+    directory = os.path.dirname(path)
+    parent = os.path.dirname(directory)
+    effective_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+
+    if effective_uid == 0 and pwd is not None:
+        sudo_uid = os.environ.get("SUDO_UID", "").strip()
+        try:
+            target = pwd.getpwuid(int(sudo_uid)) if sudo_uid.isdigit() else pwd.getpwnam("nobody")
+            if target.pw_uid == 0:
+                target = pwd.getpwnam("nobody")
+        except (KeyError, ValueError, OverflowError):
+            target = pwd.getpwnam("nobody")
+        target_uid, target_gid = target.pw_uid, target.pw_gid
+    else:
+        target_uid = os.getuid()
+        target_gid = os.getgid()
+
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    parent_stat = os.lstat(parent)
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise OSError(f"packet inspection log parent is not a directory: {parent}")
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    directory_stat = os.lstat(directory)
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise OSError(f"packet inspection log directory is not a directory: {directory}")
+    if effective_uid == 0:
+        os.chown(directory, target_uid, target_gid, follow_symlinks=False)
+    os.chmod(directory, 0o700)
+
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchown(descriptor, target_uid, target_gid)
+        os.fchmod(descriptor, 0o600)
+    except Exception:
+        os.close(descriptor)
+        raise
+    _FULL_PACKET_INSPECTION_LOG_FD = descriptor
+    _FULL_PACKET_INSPECTION_LOG_FD_PATH = path
+
+
+def _close_packet_inspection_log() -> None:
+    global _FULL_PACKET_INSPECTION_LOG_FD, _FULL_PACKET_INSPECTION_LOG_FD_PATH
+    descriptor = _FULL_PACKET_INSPECTION_LOG_FD
+    _FULL_PACKET_INSPECTION_LOG_FD = None
+    _FULL_PACKET_INSPECTION_LOG_FD_PATH = None
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 def _get_model_hash_sidecar_path(model_path: str) -> str:
     return os.path.abspath(str(model_path) + ".sha256")
@@ -1660,16 +1990,31 @@ def _read_model_hash_from_sidecar(model_path: str) -> str:
 
 
 def _write_model_hash_sidecar(model_path: str, hash_value: str) -> bool:
+    temporary_path = None
     try:
         sidecar_path = _get_model_hash_sidecar_path(model_path)
         directory = os.path.dirname(sidecar_path) or "."
         os.makedirs(directory, exist_ok=True)
-        with open(sidecar_path, "w", encoding="utf-8") as handle:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=".model-hash-", suffix=".tmp",
+            dir=directory, delete=False,
+        ) as handle:
+            temporary_path = handle.name
             handle.write(f"{hash_value}  {os.path.basename(model_path)}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, sidecar_path)
+        temporary_path = None
         return True
     except Exception as exc:
-        log.warning(f"[システム] モデルハッシュサイドカーの保存に失敗しました ({exc})")
+        log.warning(f"[システム] MK1 Aiモデルハッシュサイドカーの保存に失敗しました ({exc})")
         return False
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 def _get_expected_model_hash(model_path: str | None = None) -> str:
@@ -1681,7 +2026,7 @@ def _get_expected_model_hash(model_path: str | None = None) -> str:
 def _verify_model_hash(model_path: str, expected_hash: str) -> bool:
     """モデルファイルの SHA-256 を計算して、期待値と照合する。"""
     if not expected_hash:
-        log.warning("[システム] モデルハッシュが未設定のため、Pickle/RCE 低減のためモデルロードを拒否します。")
+        log.warning("[システム] MK1 Aiモデルハッシュが未設定のため、Pickle/RCE 低減のためモデルロードを拒否します。")
         return False
     if not os.path.exists(model_path):
         return False
@@ -1689,14 +2034,15 @@ def _verify_model_hash(model_path: str, expected_hash: str) -> bool:
         digest = hashlib.sha256()
         with open(model_path, "rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+                if isinstance(chunk, bytes):
+                    digest.update(chunk)
         actual_hash = digest.hexdigest()
         if actual_hash != expected_hash:
-            log.warning(f"[システム] モデルハッシュが不一致です: expected={expected_hash}, actual={actual_hash}")
+            log.warning(f"[システム] MK1 Aiモデルハッシュが不一致です: expected={expected_hash}, actual={actual_hash}")
             return False
         return True
     except Exception as exc:
-        log.warning(f"[システム] モデルハッシュ検証に失敗しました ({exc})")
+        log.warning(f"[システム] MK1 Aiモデルハッシュ検証に失敗しました ({exc})")
         return False
 
 
@@ -1714,7 +2060,159 @@ def _validate_model_state_dict(state_dict: dict) -> bool:
     return all(key in state_dict for key in required_parts)
 
 
-def build_containment_plan(interface: str, containment_mode: str = "full_isolation", management_ports=None, management_ips=None) -> dict:
+def _prepare_model_state_dict(state_dict: dict, model) -> dict | None:
+    """現行形式を検証し、既知の旧形式なら出力を保って現行形式へ変換する。"""
+    if not isinstance(state_dict, dict) or not hasattr(model, "state_dict"):
+        return None
+
+    expected = model.state_dict()
+    expected_keys = set(expected)
+    legacy_shapes = {
+        "shared_layer.0.weight": (32, 10),
+        "shared_layer.0.bias": (32,),
+        "shared_layer.2.weight": (16, 32),
+        "shared_layer.2.bias": (16,),
+        "head_a.0.weight": (1, 16),
+        "head_a.0.bias": (1,),
+        "head_b.0.weight": (1, 16),
+        "head_b.0.bias": (1,),
+        "head_c.0.weight": (1, 16),
+        "head_c.0.bias": (1,),
+    }
+
+    if set(state_dict) == expected_keys:
+        prepared = {}
+        for key, reference in expected.items():
+            tensor = torch.as_tensor(state_dict[key], dtype=reference.dtype, device=reference.device)
+            if tuple(tensor.shape) != tuple(reference.shape) or not torch.isfinite(tensor).all():
+                return None
+            prepared[key] = tensor
+        return prepared
+
+    if set(state_dict) != set(legacy_shapes):
+        return None
+
+    legacy = {}
+    for key, shape in legacy_shapes.items():
+        tensor = torch.as_tensor(state_dict[key], device="cpu")
+        if tuple(tensor.shape) != shape or not torch.isfinite(tensor).all():
+            return None
+        legacy[key] = tensor
+
+    prepared = {key: torch.zeros_like(value) for key, value in expected.items()}
+    prepared["shared_layer.0.weight"][:32].copy_(legacy["shared_layer.0.weight"])
+    prepared["shared_layer.0.bias"][:32].copy_(legacy["shared_layer.0.bias"])
+    prepared["shared_layer.2.weight"][:16, :32].copy_(legacy["shared_layer.2.weight"])
+    prepared["shared_layer.2.bias"][:16].copy_(legacy["shared_layer.2.bias"])
+    prepared["shared_layer.4.weight"][:16, :16].copy_(torch.eye(16, dtype=prepared["shared_layer.4.weight"].dtype))
+    prepared["head_a.0.weight"][0].copy_(legacy["head_a.0.weight"][0])
+    prepared["head_a.0.weight"][1].copy_(-legacy["head_a.0.weight"][0])
+    prepared["head_a.0.bias"][0].copy_(legacy["head_a.0.bias"][0])
+    prepared["head_a.0.bias"][1].copy_(-legacy["head_a.0.bias"][0])
+    prepared["head_a.2.weight"][0, :2] = torch.tensor(
+        [1.0, -1.0], dtype=prepared["head_a.2.weight"].dtype,
+    )
+    for key in ("head_b.0.weight", "head_b.0.bias", "head_c.0.weight", "head_c.0.bias"):
+        prepared[key].copy_(legacy[key])
+    return prepared
+
+
+def _save_local_adaptation(model, checkpoint_path: str) -> bool:
+    """Save the adapted model and its digest using atomic replacement."""
+    directory = os.path.dirname(os.path.abspath(checkpoint_path))
+    os.makedirs(directory, exist_ok=True)
+    model_temporary = None
+    hash_temporary = None
+    try:
+        with _MODEL_ACCESS_LOCK:
+            cpu_state = {
+                key: value.detach().cpu()
+                for key, value in model.state_dict().items()
+                if key in {"head_b.0.weight", "head_b.0.bias"}
+            }
+        with tempfile.NamedTemporaryFile(
+            prefix=".local-model-", suffix=".tmp", dir=directory, delete=False,
+        ) as handle:
+            model_temporary = handle.name
+            os.fchmod(handle.fileno(), 0o600)
+            torch.save({
+                "format_version": 2,
+                "state_dict": cpu_state,
+                "reviewed_labels": sorted(_HEAD_B_REVIEWED_LABELS),
+            }, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        digest = hashlib.sha256()
+        with open(model_temporary, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                if isinstance(chunk, bytes):
+                    digest.update(chunk)
+        digest_hex = digest.hexdigest()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="ascii", prefix=".local-model-hash-", suffix=".tmp",
+            dir=directory, delete=False,
+        ) as handle:
+            hash_temporary = handle.name
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(f"{digest_hex}  {os.path.basename(checkpoint_path)}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.replace(model_temporary, checkpoint_path)
+        model_temporary = None
+        os.replace(hash_temporary, _get_model_hash_sidecar_path(checkpoint_path))
+        hash_temporary = None
+        return True
+    except Exception as exc:
+        log.warning(f"[MODEL_SAVE] ローカル学習済みモデルを保存できませんでした ({exc})")
+        return False
+    finally:
+        for temporary_path in (model_temporary, hash_temporary):
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+
+
+def _load_local_adaptation(model, checkpoint_path: str) -> bool:
+    """Load a locally trained state only when its sidecar digest and tensors validate."""
+    global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    if not os.path.isfile(checkpoint_path):
+        return False
+    expected_hash = _read_model_hash_from_sidecar(checkpoint_path)
+    if not expected_hash or not _verify_model_hash(checkpoint_path, expected_hash):
+        log.warning("[MODEL_SAVE] ローカル学習済みモデルのSHA-256がないか一致しないため、復元をスキップします。")
+        return False
+    try:
+        loaded = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if not isinstance(loaded, dict) or loaded.get("format_version") != 2:
+            log.warning("[MODEL_SAVE] 旧ラベル仕様のローカル適応を無視します。確認済みデータで再学習してください。")
+            return False
+        state_dict = loaded.get("state_dict")
+        if not isinstance(state_dict, dict) or set(state_dict) != {"head_b.0.weight", "head_b.0.bias"}:
+            raise ValueError("local adaptation checkpoint must contain only Head B")
+        current_state = model.state_dict()
+        for key in ("head_b.0.weight", "head_b.0.bias"):
+            tensor = torch.as_tensor(state_dict[key], dtype=current_state[key].dtype, device=current_state[key].device)
+            if tuple(tensor.shape) != tuple(current_state[key].shape) or not torch.isfinite(tensor).all():
+                raise ValueError(f"local Head B tensor is invalid: {key}")
+            current_state[key] = tensor
+        with _MODEL_ACCESS_LOCK:
+            model.load_state_dict(current_state, strict=True)
+        labels = loaded.get("reviewed_labels", [])
+        _HEAD_B_REVIEWED_LABELS = {label for label in labels if label in (0, 1)}
+        _HEAD_B_REVIEWED = _HEAD_B_REVIEWED_LABELS == {0, 1}
+        log.info(f"[MODEL_SAVE] ローカル学習済みモデルを復元しました: {checkpoint_path}")
+        return True
+    except Exception as exc:
+        log.warning(f"[MODEL_SAVE] ローカル学習済みモデルを読み込めません ({exc})")
+        return False
+
+
+def build_containment_plan(interface: str | None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None) -> dict:
     """キルスイッチ発動時の隔離モードを構造化して返し、管理セッション維持オプションを明示する。"""
     ports = [int(port) for port in (management_ports or _MANAGEMENT_SAFE_HARBOR_DEFAULT_PORTS)]
     ips = [str(ip) for ip in (management_ips or _MANAGEMENT_SAFE_HARBOR_DEFAULT_IPS)]
@@ -1793,7 +2291,7 @@ def _call_prctl(option: int, arg2: int = 0, arg3: int = 0, arg4: int = 0, arg5: 
         return -1
 
 
-def _set_linux_capabilities(permitted: set[int] = None, effective: set[int] = None, inheritable: set[int] = None) -> bool:
+def _set_linux_capabilities(permitted: set[int] | None = None, effective: set[int] | None = None, inheritable: set[int] | None = None) -> bool:
     """Linux capset でプロセスの capabilities を明示的に制限する。"""
     if platform.system().lower() != "linux":
         return False
@@ -1881,13 +2379,21 @@ def _drop_to_user(username: str = "nobody", preserve_caps: set[int] | None = Non
 
 
 def _drop_privileges_if_possible() -> bool:
-    """Linux で root 実行中なら、できる限り非特権ユーザーへ降格する。"""
+    """Linux root 起動時は呼び出し元ユーザー、情報がなければ nobody へ降格する。"""
     if platform.system().lower() != "linux":
         return False
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         return False
     if pwd is None:
         return False
+    sudo_uid = os.environ.get("SUDO_UID", "").strip()
+    if sudo_uid.isdigit():
+        try:
+            invoking_user = pwd.getpwuid(int(sudo_uid)).pw_name
+            if invoking_user and invoking_user != "root":
+                return _drop_to_user(invoking_user, preserve_caps=None)
+        except (KeyError, ValueError, OverflowError):
+            pass
     return _drop_to_user("nobody", preserve_caps=None)
 
 
@@ -1904,6 +2410,70 @@ def _dispatch_privileged_command(command_type: str, **kwargs) -> bool:
     except Exception as exc:
         log.warning(f"[PRIVILEGE] コマンド送信に失敗しました ({exc})")
         return False
+
+
+def _normalize_command_basename(token: str) -> str:
+    try:
+        return os.path.basename(token).lower().strip()
+    except Exception:
+        return str(token).lower().strip()
+
+
+def _validate_privileged_command_message(message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+    command_type = message.get("type")
+    if command_type not in _ALLOWED_PRIVILEGED_COMMAND_TYPES:
+        return False
+    if command_type == "kill_switch":
+        if message.get("interface") is not None and not isinstance(message["interface"], str):
+            return False
+        if not isinstance(message.get("dry_run", False), bool):
+            return False
+        containment_mode = message.get("containment_mode", "full_isolation")
+        if containment_mode not in {"full_isolation", "management_safe_harbor"}:
+            return False
+        if message.get("management_ports") is not None:
+            if not isinstance(message["management_ports"], (list, tuple)):
+                return False
+            if not all(isinstance(port, int) and 0 < port < 65536 for port in message["management_ports"]):
+                return False
+        if message.get("management_ips") is not None:
+            if not isinstance(message["management_ips"], (list, tuple)):
+                return False
+            if not all(isinstance(ip, str) and ip for ip in message["management_ips"]):
+                return False
+        if message.get("available_interfaces") is not None:
+            if not isinstance(message["available_interfaces"], (list, tuple)):
+                return False
+            if not all(isinstance(iface, str) and iface for iface in message["available_interfaces"]):
+                return False
+        return True
+    if command_type == "run_command":
+        command = message.get("cmd")
+        if not isinstance(command, (list, tuple)) or not _validate_command_tokens(command):
+            return False
+        return True
+    return False
+
+
+def _validate_packet_queue_item(item) -> bool:
+    if isinstance(item, PacketQueueItem):
+        feature_vector, packet_bytes = item.feature_vector, item.packet_bytes
+    elif isinstance(item, (list, tuple)) and len(item) == 2:
+        feature_vector, packet_bytes = item
+    else:
+        return False
+    if not isinstance(feature_vector, list) or len(feature_vector) != _ALLOWED_PACKET_FEATURE_LENGTH:
+        return False
+    for value in feature_vector:
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return False
+        if value < 0.0 or value > 1.0:
+            return False
+    if not isinstance(packet_bytes, (bytes, bytearray)):
+        return False
+    return True
 
 
 def _execute_root_command(cmd: list, dry_run: bool = False) -> bool:
@@ -1925,14 +2495,26 @@ def _execute_root_command(cmd: list, dry_run: bool = False) -> bool:
     return True
 
 
-def _privileged_command_process_main():
+def _privileged_command_process_main(stop_event=None):
     """root 権限保持のまま特権コマンドを実行するワーカープロセス。"""
+    stop_event = stop_event or _PRIVILEGED_STOP_EVENT
+    try:
+        _signal_module.signal(_signal_module.SIGINT, _signal_module.SIG_IGN)
+        _signal_module.signal(_signal_module.SIGTERM, _signal_module.SIG_DFL)
+    except Exception:
+        pass
     log.info("[PRIVILEGE] root 特権コマンドワーカープロセスを起動しました。")
-    while True:
+    while not stop_event.is_set():
         try:
-            command = _command_queue.get()
+            command = _command_queue.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        try:
             if command is None:
                 break
+            if not _validate_privileged_command_message(command):
+                log.warning("[PRIVILEGE] 特権メッセージのスキーマ検証に失敗しました。破棄します。")
+                continue
             cmd_type = command.get("type")
             if cmd_type == "kill_switch":
                 execute_kill_switch(
@@ -1966,7 +2548,7 @@ def _compile_kernel_bpf_program(safe_ports: set[int]) -> bytes:
             ("filter", ctypes.POINTER(SockFilter)),
         ]
 
-    safe_ports = list(sorted(set(int(p) for p in safe_ports if 0 <= p <= 65535)))
+    normalized_ports = list(sorted(set(int(p) for p in safe_ports if 0 <= p <= 65535)))
     program = [
         (0x28, 0, 0, 12),       # load ethertype
         (0x15, 0, 7, 0x0800),   # if IPv4 -> next
@@ -1990,7 +2572,7 @@ def _compile_kernel_bpf_program(safe_ports: set[int]) -> bytes:
         (0x68, 0, 0, 2),        # ldh [x + 2] => destination TCP port
     ]
 
-    for port in safe_ports:
+    for port in normalized_ports:
         program.extend([
             (0x15, 0, 1, port),  # if dest port == port then drop on next instruction
             (0x06, 0, 0, 0),
@@ -2003,11 +2585,12 @@ def _compile_kernel_bpf_program(safe_ports: set[int]) -> bytes:
 
 
 def _attach_kernel_bpf_filter(sock: socket.socket, safe_ports: set[int] | None = None) -> bool:
-    if not hasattr(socket, "SO_ATTACH_FILTER"):
+    attach_filter_option = getattr(socket, "SO_ATTACH_FILTER", None)
+    if not isinstance(attach_filter_option, int):
         return False
     try:
         program = _compile_kernel_bpf_program(safe_ports or _SAFE_KERNEL_BPF_PORTS)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_ATTACH_FILTER, program)
+        sock.setsockopt(socket.SOL_SOCKET, attach_filter_option, program)
         log.info(f"[BPF] カーネル側のパケットフィルタを RAW ソケットにアタッチしました: safe_ports={sorted(safe_ports or _SAFE_KERNEL_BPF_PORTS)}")
         return True
     except Exception as exc:
@@ -2023,7 +2606,7 @@ def _refresh_kernel_bpf_filter(sock: socket.socket) -> None:
 
 
 def _learn_safe_kernel_flow(transport: dict, dpi_result: dict) -> None:
-    """AI が安全と判定した大容量ストリームをカーネルレベルでバイパスするための学習。"""
+    """MK1 Ai が安全と判定した大容量ストリームをカーネルレベルでバイパスするための学習。"""
     global _SAFE_KERNEL_BPF_DIRTY
     if not transport or not dpi_result or dpi_result.get("suspicious"):
         return
@@ -2042,7 +2625,7 @@ def _learn_safe_kernel_flow(transport: dict, dpi_result: dict) -> None:
     if dst_port not in _SAFE_KERNEL_BPF_PORTS:
         _SAFE_KERNEL_BPF_PORTS.add(dst_port)
         _SAFE_KERNEL_BPF_DIRTY = True
-        log.info(f"[BPF_LEARNER] 安全と判定した大容量 TLS/HTTP フローをカーネルフィルタへ追加しました: port={dst_port}")
+        log.info(f"[BPF_LEARNER] MK1 Ai が安全と判定した大容量 TLS/HTTP フローをカーネルフィルタへ追加しました: port={dst_port}")
 
 
 def _open_proc_event_socket() -> socket.socket | None:
@@ -2115,7 +2698,7 @@ def _is_suspicious_executable_path(exe_path: str) -> bool:
     trusted_dirs = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/", "/lib/", "/lib64/", "/usr/lib/", "/usr/local/bin/", "/usr/local/sbin/")
     if not any(lowercase.startswith(prefix) for prefix in trusted_dirs):
         return True
-    suspicious_basenames = {"nc", "ncat", "socat", "curl", "wget", "bash", "sh", "python", "perl", "ruby", "node", "php", "java", "pwsh", "powershell", "cmd.exe", "rundll32", "netcat"}
+    suspicious_basenames = {"nc", "ncat", "socat", "curl", "wget", "bash", "sh", "python", "python3", "perl", "ruby", "node", "php", "java", "pwsh", "powershell", "cmd.exe", "rundll32", "netcat"}
     if os.path.basename(lowercase) in suspicious_basenames:
         return True
     return False
@@ -2140,7 +2723,7 @@ def _is_suspicious_process_command(process_identifier: int | str, cmdline: str =
         return pid is not None
 
     suspicious_tokens = [
-        "nc", "ncat", "socat", "curl", "wget", "python -c", "bash -c", "powershell", "pwsh", "cmd.exe",
+        "nc", "ncat", "socat", "curl", "wget", "python -c", "python3 -c", "bash -c", "powershell", "pwsh", "cmd.exe",
         "ssh ", "perl", "ruby", "start-process", "/tmp/", "/var/tmp/", "/dev/shm/", "curl -", "wget -"
     ]
     if any(token in lowered for token in suspicious_tokens):
@@ -2177,7 +2760,8 @@ def _process_event_monitor_worker() -> None:
                 cmdline = " ".join(proc.cmdline() or [])
                 if _is_suspicious_process_command(pid, cmdline):
                     exe_path = _resolve_proc_executable(pid)
-                    log.warning(f"[PROCESS_MONITOR] 短命プロセス検知: PID={pid} type={event_type} exe={exe_path} cmdline={cmdline}")
+                    report = log.debug if is_learning_mode() else log.warning
+                    report(f"[PROCESS_MONITOR] 短命プロセス検知: PID={pid} type={event_type} exe={exe_path} cmdline={cmdline}")
                     findings = [{
                         "type": "event_drive_process",
                         "pid": pid,
@@ -2196,22 +2780,113 @@ def _process_event_monitor_worker() -> None:
             time.sleep(1.0)
 
 
-def _privileged_agent_main(interface: str, max_memory_mb: int, local_dir: str, dry_run: bool):
+def _privileged_agent_main(
+    interface: str,
+    max_memory_mb: int,
+    local_dir: str,
+    dry_run: bool,
+    stop_event=None,
+):
     log.info("[PRIVILEGE] 特権キャプチャエージェントを起動します。")
+    stop_event = stop_event or _PRIVILEGED_STOP_EVENT
+    try:
+        _signal_module.signal(_signal_module.SIGINT, _signal_module.SIG_IGN)
+    except Exception:
+        pass
     if platform.system().lower() == "linux":
         _drop_to_user("nobody", preserve_caps={_CAP_NET_RAW})
-    mem_mgr = MemoryManager(max_memory_mb=max_memory_mb, swap_dir=local_dir)
-    threading.Thread(target=_packet_capture_worker, args=(interface, mem_mgr, dry_run), daemon=True).start()
-    if platform.system().lower() == "linux":
-        threading.Thread(target=_process_event_monitor_worker, daemon=True).start()
-
+    swap_dir = tempfile.mkdtemp(prefix="mk1_capture_swap_")
+    mem_mgr = None
+    capture_thread = None
     try:
-        while True:
-            time.sleep(1.0)
+        mem_mgr = MemoryManager(max_memory_mb=max_memory_mb, swap_dir=swap_dir)
+        capture_thread = threading.Thread(
+            target=_packet_capture_worker,
+            args=(interface, mem_mgr, dry_run, stop_event),
+            daemon=True,
+        )
+        capture_thread.start()
+        if platform.system().lower() == "linux":
+            try:
+                threading.Thread(target=_process_event_monitor_worker, daemon=True).start()
+            except RuntimeError as exc:
+                log.warning(f"[PROCESS_MONITOR] 監視スレッドを開始できません。パケット監視を継続します ({exc})")
+        while not stop_event.wait(1.0):
+            pass
     except KeyboardInterrupt:
         pass
     finally:
-        mem_mgr.cleanup()
+        stop_event.set()
+        if capture_thread is not None:
+            capture_thread.join(timeout=2.0)
+        if mem_mgr is not None:
+            mem_mgr.cleanup()
+        try:
+            os.rmdir(swap_dir)
+        except OSError:
+            pass
+
+
+def _shutdown_privileged_agent():
+    """共有イベントとキューで特権ワーカーを協調終了し、親の降格後も安全に回収する。"""
+    global _PRIVILEGED_AGENT_ACTIVE, _PRIVILEGED_COMMAND_PROCESS, _PRIVILEGED_CAPTURE_PROCESS
+    try:
+        _PRIVILEGED_STOP_EVENT.set()
+    except (OSError, ValueError):
+        pass
+    if _PRIVILEGED_COMMAND_PROCESS is not None:
+        try:
+            _command_queue.put(None)
+        except (OSError, ValueError):
+            pass
+
+    process_refs = (
+        ("_PRIVILEGED_CAPTURE_PROCESS", _PRIVILEGED_CAPTURE_PROCESS),
+        ("_PRIVILEGED_COMMAND_PROCESS", _PRIVILEGED_COMMAND_PROCESS),
+    )
+    for process_name, process in process_refs:
+        if process is not None:
+            try:
+                process.join(timeout=15.0)
+            except (OSError, PermissionError, ValueError):
+                pass
+
+            try:
+                still_alive = process.is_alive()
+            except (AssertionError, OSError, ValueError):
+                still_alive = True
+            if not still_alive:
+                if process_name == "_PRIVILEGED_CAPTURE_PROCESS":
+                    _PRIVILEGED_CAPTURE_PROCESS = None
+                else:
+                    _PRIVILEGED_COMMAND_PROCESS = None
+
+    _PRIVILEGED_AGENT_ACTIVE = bool(
+        _PRIVILEGED_CAPTURE_PROCESS is not None or _PRIVILEGED_COMMAND_PROCESS is not None
+    )
+
+
+def _guard_process_terminate_permission(process) -> None:
+    """親の降格後に terminate() が EPERM を返しても終了処理を止めない。"""
+    popen = getattr(process, "_popen", None)
+    if popen is None:
+        return
+
+    terminate = getattr(popen, "terminate", None)
+    if not callable(terminate) or getattr(popen, "_mk1_permission_guarded", False) is True:
+        return
+
+    def terminate_if_permitted():
+        try:
+            terminate()
+        except PermissionError:
+            pass
+
+    try:
+        setattr(popen, "terminate", terminate_if_permitted)
+        setattr(popen, "_mk1_permission_guarded", True)
+    except (AttributeError, TypeError):
+        pass
 
 
 def _ensure_privileged_agent(interface: str, max_memory_mb: int, local_dir: str, dry_run: bool):
@@ -2228,15 +2903,32 @@ def _ensure_privileged_agent(interface: str, max_memory_mb: int, local_dir: str,
         log.info("[PRIVILEGE] 特権エージェントは既に起動しています。")
         return _PRIVILEGED_CAPTURE_PROCESS
 
-    _PRIVILEGED_COMMAND_PROCESS = multiprocessing.Process(target=_privileged_command_process_main, daemon=True)
-    _PRIVILEGED_COMMAND_PROCESS.start()
-
+    _PRIVILEGED_STOP_EVENT.clear()
+    _PRIVILEGED_COMMAND_PROCESS = multiprocessing.Process(
+        target=_privileged_command_process_main,
+        args=(_PRIVILEGED_STOP_EVENT,),
+    )
     _PRIVILEGED_CAPTURE_PROCESS = multiprocessing.Process(
         target=_privileged_agent_main,
-        args=(interface, max_memory_mb, local_dir, dry_run),
-        daemon=True,
+        args=(interface, max_memory_mb, local_dir, dry_run, _PRIVILEGED_STOP_EVENT),
     )
-    _PRIVILEGED_CAPTURE_PROCESS.start()
+    try:
+        _PRIVILEGED_COMMAND_PROCESS.start()
+        _guard_process_terminate_permission(_PRIVILEGED_COMMAND_PROCESS)
+        _PRIVILEGED_CAPTURE_PROCESS.start()
+        _guard_process_terminate_permission(_PRIVILEGED_CAPTURE_PROCESS)
+    except OSError as exc:
+        for process in (_PRIVILEGED_CAPTURE_PROCESS, _PRIVILEGED_COMMAND_PROCESS):
+            if process is not None and getattr(process, "pid", None) is not None:
+                try:
+                    process.terminate()
+                    process.join(timeout=1)
+                except (OSError, ValueError):
+                    pass
+        _PRIVILEGED_COMMAND_PROCESS = None
+        _PRIVILEGED_CAPTURE_PROCESS = None
+        log.warning(f"[PRIVILEGE] 特権エージェントの起動に失敗しました。メモリ不足の可能性があります ({exc})")
+        return None
     _PRIVILEGED_AGENT_ACTIVE = True
     return _PRIVILEGED_CAPTURE_PROCESS
 
@@ -2309,20 +3001,23 @@ def _store_admin_recovery_token(token: str, token_path: str | None = None) -> st
     return token_value
 
 
-def load_cloud_model(model, cloud_model_path: str) -> bool:
+def load_cloud_model(model, cloud_model_path: str, ignore_model_hash: bool = False) -> bool:
     """GPU 保存済みモデルを CPU / 利用可能デバイスへ安全にマップしてロードする。"""
     if not os.path.exists(cloud_model_path):
         log.warning(f"[システム] クラウドモデルが見つかりません: {cloud_model_path}")
         log.warning("           → 未学習の状態で起動します。防衛力は学習が進むにつれて向上します。")
         return False
 
-    expected_hash = _get_expected_model_hash(cloud_model_path)
-    if not expected_hash:
-        log.warning("[システム] 期待されるモデルハッシュが明示的に設定されていません。モデルロードを拒否しました。")
-        return False
-    if not _verify_model_hash(cloud_model_path, expected_hash):
-        log.warning("[システム] 期待されるモデルハッシュと一致しないため、モデルロードを拒否しました。")
-        return False
+    if ignore_model_hash:
+        log.warning("[システム] --ignore-model-hash が指定されました。開発用としてモデルハッシュ照合をスキップします。")
+    else:
+        expected_hash = _get_expected_model_hash(cloud_model_path)
+        if not expected_hash:
+            log.warning("[システム] 期待されるMK1 Aiモデルハッシュが明示的に設定されていません。モデルロードを拒否しました。")
+            return False
+        if not _verify_model_hash(cloud_model_path, expected_hash):
+            log.warning("[システム] 期待されるMK1 Aiモデルハッシュと一致しないため、モデルロードを拒否しました。")
+            return False
 
     try:
         device = torch.device("cpu") if hasattr(torch, "device") else "cpu"
@@ -2333,10 +3028,7 @@ def load_cloud_model(model, cloud_model_path: str) -> bool:
                 device = torch.device("cpu") if hasattr(torch, "device") else "cpu"
 
         load_kwargs = {"map_location": device}
-        try:
-            loaded = torch.load(cloud_model_path, weights_only=True, **load_kwargs)
-        except TypeError:
-            loaded = torch.load(cloud_model_path, **load_kwargs)
+        loaded = torch.load(cloud_model_path, weights_only=True, **load_kwargs)
         if isinstance(loaded, dict):
             if "state_dict" in loaded:
                 state_dict = loaded["state_dict"]
@@ -2348,17 +3040,24 @@ def load_cloud_model(model, cloud_model_path: str) -> bool:
             state_dict = loaded
 
         if not _validate_model_state_dict(state_dict):
-            log.warning("[システム] ロードしたモデルの state_dict が期待される構造と一致しません。モデルロードを拒否しました。")
+            log.warning("[システム] ロードした MK1 Aiモデルの state_dict が期待される構造と一致しません。モデルロードを拒否しました。")
             return False
 
-        model.load_state_dict(state_dict)
-        log.info(f"[システム] ✓ クラウド学習済みモデル({cloud_model_path})をロードしました！防衛力起動！")
+        prepared_state_dict = _prepare_model_state_dict(state_dict, model)
+        if prepared_state_dict is None:
+            log.warning("[システム] MK1 Aiモデルのテンソル形状または値が不正なため、モデルロードを拒否しました。")
+            return False
+        if set(state_dict) != set(model.state_dict()):
+            log.info("[MODEL] 旧形式チェックポイントを現行モデル構造へ互換変換します。")
+
+        model.load_state_dict(prepared_state_dict, strict=True)
+        log.info(f"[システム] ✓ クラウド学習済みモデル({cloud_model_path})をロードしました 起動します")
         return True
     except (RuntimeError, OSError, TypeError, ValueError, EOFError, AttributeError, pickle.UnpicklingError, zipfile.BadZipFile) as exc:
-        log.warning(f"[システム] モデルの読み込みに失敗しました ({exc})。未学習状態で起動します。")
+        log.warning(f"[システム] MK1 Aiモデルの読み込みに失敗しました ({exc})。未学習状態で起動します。")
         return False
     except Exception as exc:
-        log.warning(f"[システム] モデルの読み込み中に予期しない例外が発生しました ({exc})。未学習状態で起動します。")
+        log.warning(f"[システム] MK1 Aiモデルの読み込み中に予期しない例外が発生しました ({exc})。未学習状態で起動します。")
         return False
 
 
@@ -2446,7 +3145,7 @@ def _apply_kernel_hardening(profile: dict, report: dict):
         "/proc/sys/net/ipv4/conf/default/accept_source_route": "0",
         "/proc/sys/kernel/sysrq": "0",
         "/proc/sys/vm/swappiness": "10",
-        "/proc/sys/vm/overcommit_memory": "2",
+        "/proc/sys/vm/overcommit_memory": "0",
         "/proc/sys/fs/suid_dumpable": "0",
     }
     for path, value in sysctl_map.items():
@@ -2551,36 +3250,67 @@ def _hash_file(path: str, max_bytes: int = 4096) -> str | None:
 
 
 def _self_protection_monitor() -> None:
-    initial_path = _resolve_self_executable()
-    initial_hash = _hash_file(initial_path) if initial_path else None
+    # 初期実行ファイル情報を取得（取得失敗は改ざんとは見なさない）
+    initial_path = None
+    initial_hash = None
+    try:
+        initial_path = _resolve_self_executable()
+    except Exception:
+        initial_path = None
+    try:
+        initial_hash = _hash_file(initial_path) if initial_path else None
+    except Exception:
+        initial_hash = None
+
+    # NOTE: コンテナ環境では /proc/self/status の State 読み取りや実行パス取得が失敗する
+    # 場合があるため、以下の監視は「両方の値が確実に取得できている時のみ」整合性比較を行う。
     while True:
-        time.sleep(1.0)
-        current_path = _resolve_self_executable()
-        if not current_path or current_path != initial_path:
-            log.warning("[SELF_PROTECTION] 実行ファイルが変更されました。即時遮断を発動します。")
-            evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
-            break
-        current_hash = _hash_file(current_path)
-        if initial_hash and current_hash != initial_hash:
-            log.warning("[SELF_PROTECTION] 実行ファイルの整合性が失いました。即時遮断を発動します。")
-            evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
-            break
+        # 誤検知低減のためチェック間隔を緩める
+        time.sleep(2.0)
         try:
-            with open("/proc/self/status") as handle:
-                state_line = next((line for line in handle if line.startswith("State:")), "")
-                if "T" in state_line or "t" in state_line:
-                    log.warning("[SELF_PROTECTION] プロセスが停止状態に入りました。即時遮断を発動します。")
+            current_path = None
+            try:
+                current_path = _resolve_self_executable()
+            except Exception:
+                current_path = None
+
+            # パス比較: 初期時・現在ともに取得できている場合のみ比較
+            if initial_path and current_path:
+                if current_path != initial_path:
+                    log.warning("[SELF_PROTECTION] 実行ファイルが変更されました。即時遮断を発動します。")
                     evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
                     break
+
+            # ハッシュ比較: 初期ハッシュと現在ハッシュが共に取得できている場合のみ比較
+            current_hash = None
+            try:
+                current_hash = _hash_file(current_path) if current_path else None
+            except (PermissionError, OSError):
+                # コンテナや制限付き環境でアクセスできない場合は改ざんとみなさず継続
+                current_hash = None
+            except Exception:
+                current_hash = None
+
+            if initial_hash and current_hash:
+                if current_hash != initial_hash:
+                    log.warning("[SELF_PROTECTION] 実行ファイルの整合性が失いました。即時遮断を発動します。")
+                    evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
+                    break
+
+            # /proc/self/status のチェックはコンテナ環境で誤検知を起こすため削除
+            # 代わりに、アクセス例外が発生してもループを継続するようにしておく
+        except (PermissionError, OSError):
+            # アクセス制限のある環境では静かに待機して監視ループを維持
+            continue
         except Exception:
-            pass
+            # それ以外の例外もループを継続してサービスを止めない
+            continue
 
 
 def _install_self_protection_handlers() -> None:
     def _handler(signum, frame):
-        log.warning(f"[SELF_PROTECTION] シグナル {signum} 受信。強制遮断シーケンスを開始します。")
-        evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
-        sys.exit(1)
+        log.info(f"[SELF_PROTECTION] 終了シグナル {signum} を受信しました。安全に終了します。")
+        raise KeyboardInterrupt
 
     for sig in (_signal_module.SIGTERM, _signal_module.SIGINT, _signal_module.SIGHUP, _signal_module.SIGABRT):
         try:
@@ -2656,23 +3386,20 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
     fallback_payloads = []
 
     if os_family == "linux":
-        for iface in interfaces:
-            primary_commands.append(["ip", "link", "set", iface, "down"])
-        if tools.get("ip"):
+        if tools.get("iptables"):
+            primary_commands.extend([
+                ["iptables", "-I", "INPUT", "-j", "DROP"],
+                ["iptables", "-I", "OUTPUT", "-j", "DROP"],
+                ["iptables", "-I", "FORWARD", "-j", "DROP"],
+            ])
+        elif tools.get("nft"):
+            primary_commands.append(["nft", "flush", "ruleset"])
+        elif tools.get("ip"):
             primary_commands.extend([
                 ["ip", "route", "replace", "default", "unreachable"],
                 ["ip", "route", "add", "default", "unreachable"],
             ])
-        if tools.get("iptables"):
-            primary_commands.extend([
-                ["iptables", "-F"],
-                ["iptables", "-P", "INPUT", "DROP"],
-                ["iptables", "-P", "OUTPUT", "DROP"],
-                ["iptables", "-P", "FORWARD", "DROP"],
-            ])
-        if tools.get("nft"):
-            primary_commands.append(["nft", "flush", "ruleset"])
-        if layers & {"bridge", "vpn", "virtual"}:
+        if layers & {"bridge", "vpn", "virtual"} and tools.get("ip"):
             for iface in interfaces:
                 if any(prefix in iface for prefix in ("veth", "docker", "br-", "tun", "tap", "wg", "tailscale")):
                     primary_commands.append(["ip", "link", "set", iface, "down"])
@@ -2765,22 +3492,21 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
 
 
 def _terminate_suspicious_processes() -> int:
-    terminated = 0
+    suspicious_candidates = []
     for proc in psutil.process_iter(attrs=["pid", "name", "exe", "cmdline"]):
         try:
             if proc.pid == os.getpid():
                 continue
             executable = (proc.info.get("exe") or "").lower()
             commandline = " ".join(proc.info.get("cmdline") or []).lower()
-            if any(marker in executable for marker in ["python", "bash", "sh", "socat", "nc", "curl", "wget"]) or \
-               any(marker in commandline for marker in ["python", "bash", "sh", "socat", "nc", "curl", "wget"]):
-                proc.kill()
-                terminated += 1
+            if any(marker in executable for marker in ["socat", "nc", "curl", "wget"]) or \
+               any(marker in commandline for marker in ["socat", "nc", "curl", "wget"]):
+                suspicious_candidates.append(f"{proc.pid}:{proc.info.get('name') or '<unknown>'}")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
-    if terminated:
-        log.warning(f"[SELF_DEFENSE] 疑わしいプロセスを {terminated} 件終了しました。")
-    return terminated
+    if suspicious_candidates:
+        log.warning(f"[SELF_DEFENSE] 疑わしいプロセス候補を検知しましたが、強制終了は行いません: {', '.join(suspicious_candidates)}")
+    return 0
 
 
 def _probe_network_connectivity() -> bool | None:
@@ -2792,7 +3518,7 @@ def _probe_network_connectivity() -> bool | None:
         return None
 
 
-def execute_generated_payload(payload: dict, dry_run: bool = False, available_interfaces=None, interface: str = None) -> bool:
+def execute_generated_payload(payload: dict, dry_run: bool = False, available_interfaces=None, interface: str | None = None) -> bool:
     """生成済みペイロードを動的に実行し、必要ならフォールバック戦略へ切り替える。"""
     if not payload:
         return False
@@ -2807,7 +3533,6 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
             log.critical(f"    - 予定: {' '.join(cmd)}")
         return True
 
-    _terminate_suspicious_processes()
     success_count = 0
     for cmd in commands:
         log.critical(f"    - 実行: {' '.join(cmd)}")
@@ -3029,7 +3754,7 @@ def _extract_tls_sni(packet_bytes: bytes) -> tuple[str | None, bool]:
     return metadata.get("sni"), metadata.get("malformed", False)
 
 
-def analyze_packet_security_markers(packet_bytes: bytes, interface: str = None) -> list:
+def analyze_packet_security_markers(packet_bytes: bytes, interface: str | None = None) -> list:
     """パケットのバイト列から、暗号技術の痕跡を推定する。"""
     markers = []
     if not packet_bytes:
@@ -3108,20 +3833,31 @@ def maybe_log_crypto_markers(packet_bytes: bytes, interface: str, now: float):
         _CRYPTO_LOG_COOLDOWN = now
 
 
+def _is_benign_development_connection(process_name, connection) -> bool:
+    name = str(process_name or "").lower()
+    known_tools = {"code", "code-server", "code-insiders", "node", "nodejs", "python", "python3"}
+    if name not in known_tools and not re.fullmatch(r"python(?:3(?:\.\d+)*)", name):
+        return False
+
+    remote = getattr(connection, "raddr", None)
+    remote_ip = getattr(remote, "ip", None)
+    remote_port = getattr(remote, "port", None)
+    if isinstance(remote, tuple):
+        remote_ip = remote[0] if remote else None
+        remote_port = remote[1] if len(remote) > 1 else None
+    return str(remote_ip or "").lower() in {"127.0.0.1", "::1", "localhost"} or remote_port == 443
+
+
 def _vectorize_process_behavior(proc_info: dict) -> tuple[list, float]:
-    """プロセスの名称・コマンド・通信・リソース使用量をベクトル化し、通常の開発ツールを過剰に叩かないように重みを調整する。"""
+    """プロセスのコマンドとリソース使用量だけをベクトル化する。"""
     cmdline = " ".join(filter(None, proc_info.get("cmdline") or []))
-    name_lower = str(proc_info.get("name") or "").lower()
     cmdline_lower = cmdline.lower()
-    dev_process = any(token in name_lower for token in ["code", "vscode", "node", "npm", "python", "python3", "git"])
-    normal_cli = any(token in cmdline_lower for token in ["--version", "-v", "--help", "-h", "install", "run", "serve"])
     shell_exec = any(token in cmdline_lower for token in ["-c", "-command", "-enc", "encodedcommand", "powershell", "cmd.exe"])
 
     feature_vector = [
         float(bool(cmdline)),
         float(shell_exec),
         float(any(token in cmdline_lower for token in ["nc", "ncat", "socat", "curl", "wget", "bash", "sh"])),
-        float(dev_process),
         float(proc_info.get("cpu_percent", 0.0) > 0.0),
         float(proc_info.get("memory_percent", 0.0) > 0.0),
         float(proc_info.get("num_threads", 0) > 1),
@@ -3130,31 +3866,53 @@ def _vectorize_process_behavior(proc_info: dict) -> tuple[list, float]:
     suspicious_score = 0.05 * feature_vector[0]
     suspicious_score += 0.30 * feature_vector[1]
     suspicious_score += 0.20 * feature_vector[2]
+    suspicious_score += 0.08 * feature_vector[3]
     suspicious_score += 0.08 * feature_vector[4]
-    suspicious_score += 0.08 * feature_vector[5]
-    suspicious_score += 0.04 * feature_vector[6]
+    suspicious_score += 0.04 * feature_vector[5]
 
-    if dev_process and normal_cli:
-        suspicious_score *= 0.25
-    if dev_process and not shell_exec and not any(token in cmdline_lower for token in ["nc", "ncat", "socat", "curl", "wget"]):
-        suspicious_score *= 0.5
+    connections = proc_info.get("_connections", ())
+    if (
+        connections
+        and not proc_info.get("_parent_suspicious", False)
+        and all(_is_benign_development_connection(proc_info.get("name"), conn) for conn in connections)
+    ):
+        suspicious_score = max(0.0, suspicious_score - 0.35)
 
     suspicious_score = min(1.0, suspicious_score)
     return feature_vector, suspicious_score
+
+
+def _process_connections(proc) -> Iterable[Any]:
+    get_connections = getattr(proc, "net_connections", None)
+    if callable(get_connections):
+        try:
+            return cast(Iterable[Any], get_connections(kind="inet"))
+        except (AttributeError, NotImplementedError):
+            pass
+    get_connections = getattr(proc, "connections", None)
+    if not callable(get_connections):
+        return ()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return cast(Iterable[Any], get_connections(kind="inet"))
+
+
+def _is_suspicious_parent_command(parent_info: str) -> bool:
+    indicators = ("powershell", "pwsh", "nc", "ncat", "socat", "encodedcommand")
+    return any(
+        re.search(rf"(?<![a-z0-9]){re.escape(indicator)}(?![a-z0-9])", parent_info)
+        for indicator in indicators
+    )
 
 
 def scan_for_backdoors() -> list:
     """通常の開発ツールを過剰に叩かない、マルチファクターのプロセス監査へ更新する。"""
     findings = []
     try:
-        for proc in psutil.process_iter(attrs=["pid", "name", "cmdline", "memory_percent", "cpu_percent", "num_threads"]):
+        for proc in psutil.process_iter(attrs=["pid", "name", "cmdline", "exe", "memory_percent", "cpu_percent", "num_threads"]):
             info = proc.info
             name_lower = str(info.get("name") or "").lower()
             cmdline_lower = " ".join(filter(None, info.get("cmdline") or [])).lower()
-            dev_process = any(token in name_lower for token in ["code", "vscode", "node", "npm", "python", "python3", "git"])
-            if dev_process and not any(token in cmdline_lower for token in ["-c", "-command", "-enc", "encodedcommand", "nc", "ncat", "socat", "curl", "wget"]):
-                continue
-
             parent_suspicious = False
             try:
                 parent = proc.parent()
@@ -3162,41 +3920,52 @@ def scan_for_backdoors() -> list:
                     parent_name = str(getattr(parent, "name", lambda: "")()).lower() if hasattr(parent, "name") else ""
                     parent_cmd = " ".join(getattr(parent, "cmdline", lambda: [])() or []).lower() if hasattr(parent, "cmdline") else ""
                     parent_info = f"{parent_name} {parent_cmd}"
-                    parent_suspicious = any(token in parent_info for token in ["cmd", "powershell", "bash", "sh", "zsh", "pwsh", "python", "perl", "ruby", "node", "nc", "ncat", "socat"])
+                    parent_suspicious = _is_suspicious_parent_command(parent_info)
             except Exception:
                 pass
 
-            feature_vector, risk_score = _vectorize_process_behavior(info)
+            try:
+                connections = _process_connections(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            process_info = dict(info, _connections=connections, _parent_suspicious=parent_suspicious)
+            feature_vector, risk_score = _vectorize_process_behavior(process_info)
             if risk_score < 0.35 and not parent_suspicious:
                 continue
 
             try:
                 remote_connections = 0
-                for conn in proc.connections(kind="inet"):
+                for conn in connections:
                     if conn.status in (psutil.CONN_ESTABLISHED, psutil.CONN_SYN_SENT) and conn.raddr:
-                        remote_connections += 1
                         remote_port = getattr(conn.raddr, "port", None)
-                        local_port = getattr(conn.laddr, "port", None)
+                        remote_ip = getattr(conn.raddr, "ip", None)
+                        if remote_port is None and isinstance(conn.raddr, tuple):
+                            remote_ip = conn.raddr[0]
+                            remote_port = conn.raddr[1]
+                        remote_connections += 1
+                        if not parent_suspicious and _is_benign_development_connection(info.get("name"), conn):
+                            continue
                         nonstandard_port = remote_port not in (80, 443)
                         if nonstandard_port or parent_suspicious:
                             if risk_score < 0.45:
                                 risk_score = 0.45
+                            remote_host = getattr(conn.raddr, "ip", remote_ip)
                             findings.append({
                                 "type": "external_connection",
                                 "pid": info.get("pid"),
                                 "name": info.get("name"),
-                                "remote": f"{conn.raddr.ip}:{remote_port}",
+                                "remote": f"{remote_host}:{remote_port}",
                                 "risk_score": round(risk_score, 4),
                                 "feature_vector": feature_vector,
                                 "parent_suspicious": parent_suspicious,
                                 "nonstandard_port": nonstandard_port,
                             })
-                        elif remote_connections > 1 and (risk_score >= 0.45 or not dev_process):
+                        elif remote_connections > 1 and risk_score >= 0.45:
                             findings.append({
                                 "type": "external_connection",
                                 "pid": info.get("pid"),
                                 "name": info.get("name"),
-                                "remote": f"{conn.raddr.ip}:{remote_port}",
+                                "remote": f"{remote_ip}:{remote_port}",
                                 "risk_score": round(risk_score, 4),
                                 "feature_vector": feature_vector,
                             })
@@ -3210,6 +3979,9 @@ def scan_for_backdoors() -> list:
 
 def apply_backdoor_findings(findings: list) -> float:
     global _BACKDOOR_RISK_SCORE
+    if findings and is_learning_mode():
+        _report_learning_detection(f"不審なプロセス通信を {len(findings)} 件検出")
+        return 0.0
     if not findings:
         with _CONTAINMENT_LOCK:
             _BACKDOOR_RISK_SCORE = max(0.0, _BACKDOOR_RISK_SCORE - 0.05)
@@ -3362,48 +4134,69 @@ class MemoryManager:
     - check(head_c_score) で Head C AI 予測値も考慮した先制退避判断
     """
     def __init__(self, max_memory_mb=500, swap_dir="./swap"):
+        if AESGCM is None:
+            log.warning("[MemoryManager] AESGCM が利用できません。安全性のためディスク退避を無効化します。")
+
         self.max_bytes = max_memory_mb * 1024 * 1024
-        self.swap_dir  = swap_dir
-        self.process   = psutil.Process(os.getpid())
+        self.swap_dir = swap_dir
+        self.process = psutil.Process(os.getpid())
         os.makedirs(swap_dir, exist_ok=True)
-        # スワップディレクトリも 0o700 に限定
         try:
             os.chmod(swap_dir, 0o700)
         except Exception:
             pass
 
-        # 仮想メモリ用のファイルを作成 (100MB確保) – 権限 0o600 で保護
-        self._swap_path = os.path.join(swap_dir, "vm_swap.bin")
-        with open(self._swap_path, "wb") as f:
-            f.write(b'\x00' * (100 * 1024 * 1024))
         try:
-            os.chmod(self._swap_path, 0o600)
+            swap_fd, self._swap_path = tempfile.mkstemp(prefix="vm_swap_", suffix=".bin", dir=swap_dir)
+        except PermissionError:
+            log.warning(
+                f"[MemoryManager] スワップ先 {swap_dir} に書き込めないため、OS一時領域を使用します。"
+            )
+            swap_fd, self._swap_path = tempfile.mkstemp(prefix="vm_swap_", suffix=".bin")
+        try:
+            os.fchmod(swap_fd, 0o600)
         except Exception:
             pass
-        self._swap_fd  = open(self._swap_path, "r+b")
-        self._mmap     = mmap.mmap(self._swap_fd.fileno(), 0)
-        self._offset   = 0
-        self._swap_key = hashlib.sha256(f"{os.getpid()}_{socket.gethostname()}_{time.time()}".encode()).digest()
+        self._swap_fd = os.fdopen(swap_fd, "r+b")
+        self._swap_fd.truncate(_DEFAULT_SWAP_SIZE_MB * 1024 * 1024)
+        self._mmap = mmap.mmap(self._swap_fd.fileno(), 0)
+        self._offset = 0
+        self._lock = threading.Lock()
+        self._swap_key = secrets.token_bytes(32)
+        self._aead = AESGCM(self._swap_key) if AESGCM is not None else None
+        self._nonce_size = 12
 
         self.is_critical = False
-        self._ema_ratio  = 0.0          # EMA スムージングされた使用率
-        self._ema_alpha  = 0.2          # EMA 係数 (小さいほど平滑化)
+        self._ema_ratio = 0.0          # EMA スムージングされた使用率
+        self._ema_alpha = 0.2          # EMA 係数 (小さいほど平滑化)
         log.info(f"MemoryManager 起動 (上限: {max_memory_mb}MB / スワップ: {self._swap_path})")
 
     def get_usage_ratio(self) -> float:
         """EMA スムージング付き RAM 使用率を返す。一時スパイクで誤退避しない。"""
         raw = self.process.memory_info().rss / self.max_bytes
-        self._ema_ratio = self._ema_alpha * raw + (1.0 - self._ema_alpha) * self._ema_ratio
+        if self._ema_ratio == 0.0:
+            self._ema_ratio = raw
+        else:
+            self._ema_ratio = self._ema_alpha * raw + (1.0 - self._ema_alpha) * self._ema_ratio
         return self._ema_ratio
 
-    def check(self, head_c_score: float = 0.0) -> float:
+    def check(self, head_c_score: float | int | list[float] | tuple[float, ...] = 0.0) -> float:
         """
         RAM 使用率を確認し、必要なら is_critical フラグを立てる。
         head_c_score: Head C の出力スコア（AI による予測的退避判断に使用）
         """
         global _HEAD_C_EVICT_ACTIVE
+        if isinstance(head_c_score, (list, tuple)):
+            head_c_score = max((float(score) for score in head_c_score), default=0.0)
+        else:
+            head_c_score = float(head_c_score)
+
         ratio = self.get_usage_ratio()
-        self.is_critical = ratio > 0.9 or (ratio > 0.82 and head_c_score > 0.65)
+        self.is_critical = (
+            ratio > 0.9
+            or (ratio > 0.82 and head_c_score > 0.65)
+            or head_c_score >= _HEAD_C_ON_THRESHOLD
+        )
 
         # Head C ヒステリシス制御: AIが予測的に退避を指示する
         if head_c_score >= _HEAD_C_ON_THRESHOLD:
@@ -3420,32 +4213,49 @@ class MemoryManager:
         """Head C スコアまたは RAM 使用率が閾値を超えている場合に True。"""
         return _HEAD_C_EVICT_ACTIVE or self.is_critical
 
-    def _xor_encrypt(self, data: bytes) -> bytes:
-        return bytes(b ^ self._swap_key[i % len(self._swap_key)] for i, b in enumerate(data))
+    def _encrypt_blob(self, data: bytes) -> bytes | None:
+        if self._aead is None:
+            return None
+        nonce = secrets.token_bytes(self._nonce_size)
+        ciphertext = self._aead.encrypt(nonce, data, None)
+        return nonce + ciphertext
 
     def evict_buffer(self, data: list) -> int:
         """RAMのデータリストをmmapファイル(ストレージ)へ退避する（リングバッファ）"""
         if not data:
             return 0
-        blob = (json.dumps(data) + "\n").encode()
-        encrypted_blob = self._xor_encrypt(blob)
-        if len(encrypted_blob) >= len(self._mmap):
+        if self._aead is None:
+            log.warning("[MemoryManager] 暗号化機能がないため、データ退避を安全にスキップしました。")
             return 0
-        if self._offset + len(encrypted_blob) >= len(self._mmap):
-            self._offset = 0
-            log.warning("[MemoryManager] mmapの上限に達したため、オフセットを0にリセットして循環書き込み（リングバッファ）として動作します。")
-
-        self._mmap.seek(self._offset)
-        self._mmap.write(encrypted_blob)
-        self._offset += len(encrypted_blob)
+        blob = (json.dumps(data) + "\n").encode()
+        encrypted_blob = self._encrypt_blob(blob)
+        if encrypted_blob is None:
+            return 0
+        record = len(encrypted_blob).to_bytes(4, "big") + encrypted_blob
+        with self._lock:
+            if len(record) >= len(self._mmap):
+                return 0
+            if self._offset + len(record) >= len(self._mmap):
+                self._offset = 0
+                log.warning("[MemoryManager] mmapの上限に達したため、オフセットを0にリセットして循環書き込み（リングバッファ）として動作します。")
+            self._mmap.seek(self._offset)
+            self._mmap.write(record)
+            self._offset += len(record)
         log.warning(f"[司令塔] {len(data)}件のデータを暗号化してストレージへ退避 → RAMを確保！")
         return len(data)
 
     def cleanup(self):
-        self._mmap.close()
-        self._swap_fd.close()
+        with self._lock:
+            try:
+                self._mmap.close()
+                self._swap_fd.close()
+            except Exception:
+                pass
         if os.path.exists(self._swap_path):
-            os.unlink(self._swap_path)
+            try:
+                os.unlink(self._swap_path)
+            except OSError:
+                pass
 
 
 # =====================================================================
@@ -3495,59 +4305,310 @@ def is_network_available(host: str = "drive.google.com", port: int = 443, timeou
     return False
 
 
+_MAX_DRIVE_FILE_BYTES = 8 * 1024 * 1024
+_MAX_DRIVE_TOTAL_BYTES = 32 * 1024 * 1024
+_MAX_DRIVE_FILES = 4
+
+
 def download_from_gdrive_folder(folder_id: str, dest_dir: str) -> list:
-    """エアギャップ原則により、外部 Google Drive からのダウンロードを無効化する。"""
+    """Download a few small data files directly into the raw-data tree."""
     os.makedirs(dest_dir, exist_ok=True)
-    log.warning("[AIRGAP] エアギャップ原則により、外部 Google Drive からの更新を無効化しました。ローカルディレクトリのみを監視します。")
-    return []
+    if not folder_id:
+        log.info("[Google Drive] フォルダID未指定のため取得をスキップします。")
+        return []
+    if not GDOWN_AVAILABLE or requests is None:
+        log.warning("[Google Drive] gdown または requests がないため取得をスキップします。")
+        return []
+
+    try:
+        candidates = gdown.download_folder(
+            id=folder_id,
+            output=dest_dir,
+            skip_download=True,
+            quiet=True,
+            use_cookies=False,
+            timeout=(30, 120),
+            retries=4,
+        )
+    except Exception as exc:
+        log.warning(f"[Google Drive] フォルダ一覧を取得できませんでした ({exc})")
+        return []
+
+    if not candidates:
+        log.info("[Google Drive] 取得候補がないためスキップします。")
+        return []
+    if isinstance(candidates, (str, os.PathLike)):
+        candidates = [candidates]
+
+    downloaded = []
+    total_bytes = 0
+    inspected = 0
+    root_path = os.path.realpath(dest_dir)
+    for candidate in candidates:
+        if inspected >= _MAX_DRIVE_FILES * 2 or len(downloaded) >= _MAX_DRIVE_FILES:
+            break
+        if candidate is None:
+            continue
+        candidate_id = getattr(candidate, "id", None)
+        if not isinstance(candidate_id, str) or not candidate_id:
+            continue
+        candidate_path = getattr(candidate, "path", None)
+        if not isinstance(candidate_path, (str, os.PathLike)):
+            continue
+        relative_path = os.fspath(candidate_path)
+        if not relative_path:
+            continue
+        extension = os.path.splitext(relative_path)[1].lower()
+        if extension not in {".json", ".jsonl", ".csv"}:
+            continue
+        if any(part.startswith(".") for part in relative_path.split(os.sep)):
+            continue
+
+        target_path = os.path.realpath(os.path.join(dest_dir, relative_path))
+        if os.path.commonpath((root_path, target_path)) != root_path:
+            log.warning(f"[Google Drive] 保存先が範囲外のためスキップします: {relative_path}")
+            continue
+        if os.path.exists(target_path):
+            continue
+
+        inspected += 1
+        size = None
+        for attempt in range(3):
+            response = None
+            try:
+                response = requests.head(
+                    "https://drive.google.com/uc",
+                    params={"id": candidate_id},
+                    allow_redirects=True,
+                    timeout=(30, 120),
+                )
+                size = int(response.headers.get("Content-Length", "-1"))
+                content_type = response.headers.get("Content-Type", "").lower()
+                if response.status_code >= 400 or size < 0 or size > _MAX_DRIVE_FILE_BYTES:
+                    size = None
+                elif content_type.startswith("text/html") or total_bytes + size > _MAX_DRIVE_TOTAL_BYTES:
+                    size = None
+                break
+            except requests.RequestException as exc:
+                if attempt == 2:
+                    log.debug(f"[Google Drive] サイズ確認をスキップしました ({relative_path}: {exc})")
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+            except (AttributeError, TypeError, ValueError) as exc:
+                log.debug(f"[Google Drive] サイズ確認をスキップしました ({relative_path}: {exc})")
+                break
+            finally:
+                if response is not None:
+                    response.close()
+        if size is None:
+            continue
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix=".gdown-", dir=os.path.dirname(target_path), delete=False) as temp_file:
+                temp_path = temp_file.name
+            gdown.download(
+                id=candidate_id,
+                output=temp_path,
+                quiet=True,
+                use_cookies=False,
+                timeout=(30, 300),
+                retries=4,
+            )
+            actual_size = os.path.getsize(temp_path)
+            if actual_size != size or actual_size > _MAX_DRIVE_FILE_BYTES:
+                log.warning(f"[Google Drive] 事前確認サイズと異なるため破棄します: {relative_path}")
+                continue
+            os.replace(temp_path, target_path)
+            temp_path = None
+            downloaded.append(target_path)
+            total_bytes += actual_size
+        except Exception as exc:
+            log.warning(f"[Google Drive] ダウンロードをスキップしました ({relative_path}: {exc})")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    log.info(f"[Google Drive] 小容量データ {len(downloaded)} 件を配置しました (合計 {total_bytes} bytes)")
+    return downloaded
 
 
-def load_raw_data_from_files(file_paths: list) -> list:
-    """
-    ダウンロードしたファイル（JSON/JSONL/CSV）を読み込んで
-    AIが処理できる統一フォーマット [{"features": [...10次元...]}] に変換します。
-    様々なファイル形式に対応するため、パースに失敗したファイルはスキップします。
-    """
-    all_data = []
+_DATA_BATCH_SIZE = 100
+_MAX_DATA_RECORD_BYTES = 64 * 1024
+
+
+def _iter_json_array(handle, max_record_bytes: int = _MAX_DATA_RECORD_BYTES):
+    """Read top-level JSON arrays one record at a time with a bounded buffer."""
+    decoder = json.JSONDecoder()
+    first = ""
+    while True:
+        char = handle.read(1)
+        if not char:
+            return
+        if not char.isspace():
+            first = char
+            break
+    if first != "[":
+        remainder = handle.read(max_record_bytes)
+        if len(remainder) >= max_record_bytes and handle.read(1):
+            log.warning("[データ変換] JSON object が上限を超えたためスキップします。")
+            return
+        try:
+            yield json.loads(first + remainder)
+        except json.JSONDecodeError as exc:
+            log.warning(f"[データ変換] JSON を解析できません: {exc}")
+        return
+
+    buffer = ""
+    expecting_value = True
+    while True:
+        buffer = buffer.lstrip()
+        if not buffer:
+            chunk = handle.read(65536)
+            if not chunk:
+                log.warning("[データ変換] JSON 配列が途中で終了しました。")
+                return
+            buffer = chunk
+            continue
+
+        if buffer[0] == "]":
+            return
+        if buffer[0] == ",":
+            if expecting_value:
+                log.warning("[データ変換] JSON 配列の区切りが不正です。")
+                return
+            buffer = buffer[1:]
+            expecting_value = True
+            continue
+        if not expecting_value:
+            log.warning("[データ変換] JSON 配列の区切りがありません。")
+            return
+
+        try:
+            value, end = decoder.raw_decode(buffer)
+        except json.JSONDecodeError:
+            if len(buffer.encode("utf-8")) >= max_record_bytes:
+                log.warning("[データ変換] JSON レコードが上限を超えたためファイルをスキップします。")
+                return
+            chunk = handle.read(65536)
+            if not chunk:
+                log.warning("[データ変換] JSON レコードを解析できません。")
+                return
+            buffer += chunk
+            continue
+
+        yield value
+        buffer = buffer[end:]
+        expecting_value = False
+
+
+def _iter_jsonl_records(handle, max_record_bytes: int = _MAX_DATA_RECORD_BYTES):
+    while True:
+        line = handle.readline(max_record_bytes + 1)
+        if not line:
+            return
+        if len(line.encode("utf-8")) > max_record_bytes:
+            while line and not line.endswith("\n"):
+                line = handle.readline(max_record_bytes + 1)
+            log.warning("[データ変換] 上限を超える JSONL 行をスキップしました。")
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
+def load_raw_data_from_files(
+    file_paths,
+    batch_size: int = _DATA_BATCH_SIZE,
+    max_samples: int | None = None,
+    preserve_labels: bool = False,
+):
+    """Yield JSON/JSONL/CSV records in bounded batches instead of retaining all rows."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if max_samples is not None and max_samples < 1:
+        raise ValueError("max_samples must be >= 1")
+    batch = []
+    total = 0
+
+    def normalize_record(record):
+        if not isinstance(record, dict):
+            return None
+        features = record.get("features")
+        if not isinstance(features, (list, tuple)) or len(features) < 10:
+            return None
+        try:
+            normalized = [float(value) for value in features[:10]]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in normalized):
+            return None
+        normalized_record: dict[str, Any] = {"features": normalized}
+        if preserve_labels:
+            label = record.get("label")
+            if isinstance(label, bool) or not isinstance(label, (int, float)) or label not in (0, 1):
+                return None
+            normalized_record["label"] = int(label)
+        return normalized_record
+
+    def emit_records(records):
+        nonlocal total, batch
+        for record in records:
+            if max_samples is not None and total >= max_samples:
+                break
+            normalized = normalize_record(record)
+            if normalized is None:
+                continue
+            batch.append(normalized)
+            total += 1
+            if len(batch) >= batch_size:
+                ready, batch = batch, []
+                yield ready
+
     for path in file_paths:
+        if max_samples is not None and total >= max_samples:
+            break
         try:
             ext = os.path.splitext(path)[1].lower()
             if ext == ".json":
-                with open(path) as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        all_data.extend(data)
+                with open(path, "r", encoding="utf-8") as handle:
+                    yield from emit_records(_iter_json_array(handle))
             elif ext == ".jsonl":
-                with open(path) as f:
-                    for line in f:
-                        try:
-                            all_data.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
+                with open(path, "r", encoding="utf-8") as handle:
+                    yield from emit_records(_iter_jsonl_records(handle))
             elif ext == ".csv":
                 import csv
-                with open(path, newline='') as f:
-                    reader = csv.reader(f)
-                    for i, row in enumerate(reader):
-                        if i == 0:
-                            continue  # ヘッダ行をスキップ
-                        try:
-                            nums = [float(v) for v in row[:10]]
-                            # 10次元に満たない場合は0でパディング
-                            while len(nums) < 10:
-                                nums.append(0.0)
-                            all_data.append({"features": nums[:10]})
-                        except ValueError:
-                            pass
+                with open(path, newline="", encoding="utf-8") as handle:
+                    reader = csv.reader(handle)
+                    next(reader, None)
+                    def csv_records():
+                        for row in reader:
+                            try:
+                                values = [float(value) for value in row[:10]]
+                            except ValueError:
+                                continue
+                            values.extend([0.0] * (10 - len(values)))
+                            yield {"features": values[:10]}
+                    yield from emit_records(csv_records())
             else:
                 log.warning(f"[データ変換] 未対応の形式をスキップ: {path}")
-        except Exception as e:
-            log.warning(f"[データ変換] 読み込み失敗 ({path}): {e}")
-    log.info(f"[データ変換] 合計 {len(all_data)} 件のデータを読み込みました")
-    return all_data
+        except Exception as exc:
+            log.warning(f"[データ変換] 読み込み失敗 ({path}): {exc}")
+
+    if batch:
+        yield batch
+    log.info(f"[データ変換] 合計 {total} 件のデータを読み込みました")
 
 
-def curate_and_save(model: LightweightMultiTaskAI, raw_data: list, save_dir: str) -> str:
+def curate_and_save(
+    model: LightweightMultiTaskAI,
+    raw_data,
+    save_dir: str,
+    batch_callback=None,
+    batch_size: int = _DATA_BATCH_SIZE,
+) -> str:
     """
     【100GBのドライブからどうやってデータを厳選しているか？】
     ダウンロードした生データを1件ずつAI（推論モード）に査定させます。
@@ -3568,26 +4629,47 @@ def curate_and_save(model: LightweightMultiTaskAI, raw_data: list, save_dir: str
     os.makedirs(save_dir, exist_ok=True)
     curated_path = os.path.join(save_dir, "curated_data.jsonl")
 
-    model.eval()
+    with _MODEL_ACCESS_LOCK:
+        model.eval()
     kept, discarded = 0, 0
+    training_batch = []
+
+    def iter_items(data):
+        for value in data:
+            if isinstance(value, list):
+                yield from value
+            else:
+                yield value
+
+    def publish_batch():
+        nonlocal training_batch
+        if training_batch and batch_callback is not None:
+            batch_callback(training_batch)
+        training_batch = []
 
     with open(curated_path, "a") as out_f:
         with torch.no_grad():  # 推論時は勾配不要 → メモリ節約！
-            for item in raw_data:
+            for item in iter_items(raw_data):
                 # featuresキーがない場合はスキップ
                 if "features" not in item or len(item["features"]) < 10:
                     discarded += 1
                     continue
                 feat = torch.tensor([item["features"][:10]], dtype=torch.float32)
-                score_a, score_b, _ = model(feat)
+                with _MODEL_ACCESS_LOCK:
+                    score_a, score_b, _ = model(feat)
                 a, b = score_a.item(), score_b.item()
 
                 # 厳選フィルター: 中程度の異常度 AND 高い適合度
                 if 0.4 <= a <= 0.7 and b >= 0.6:
                     out_f.write(json.dumps({"features": item["features"][:10], "label": 0}) + "\n")
                     kept += 1
+                    training_batch.append({"features": item["features"][:10], "label": 0})
+                    if len(training_batch) >= batch_size:
+                        publish_batch()
                 else:
                     discarded += 1
+
+    publish_batch()
 
     log.info(f"[AI厳選完了] 採用: {kept}件 / 破棄: {discarded}件 → {curated_path} に保存")
     return curated_path
@@ -3596,7 +4678,21 @@ def curate_and_save(model: LightweightMultiTaskAI, raw_data: list, save_dir: str
 # =====================================================================
 # Task 3-b: ローカル差分学習 (Head Bのみ / 破滅的忘却の防止)
 # =====================================================================
-def train_local_whitelist(model: LightweightMultiTaskAI, optimizer, data: list):
+def _head_b_targets(class_labels: list[int]):
+    """Map label=benign(0)/threat(1) to Head B's benign-probability targets."""
+    targets = torch.tensor([[1.0 - label] for label in class_labels], dtype=torch.float32)
+    class_counts = torch.bincount(targets.reshape(-1).to(torch.int64), minlength=2).to(torch.float32)
+    if (class_counts > 0).sum() > 1:
+        weights = torch.empty_like(targets)
+        for target in (0.0, 1.0):
+            mask = targets == target
+            weights[mask] = len(class_labels) / (2.0 * class_counts[int(target)])
+    else:
+        weights = torch.ones_like(targets)
+    return targets, weights
+
+
+def train_local_whitelist(model: LightweightMultiTaskAI, optimizer, data: list, checkpoint_path: str | None = None):
     """
     【クラウド2：ローカル1の学習制御とは？】
     クラウドが学んだ「ハッキングを見抜く知識」(shared_layer, Head A)を壊さずに、
@@ -3606,27 +4702,49 @@ def train_local_whitelist(model: LightweightMultiTaskAI, optimizer, data: list):
     凍結された層は学習中に更新されないため、クラウドの知識が永久に保たれます。
     これが「破滅的忘却を防ぐ」仕組みです！
     """
-    if not data:
+    global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    labeled_data = []
+    for record in data:
+        features = record.get("features") if isinstance(record, dict) else None
+        label = record.get("label", 0) if isinstance(record, dict) else None
+        if not isinstance(features, (list, tuple)) or len(features) != _ALLOWED_PACKET_FEATURE_LENGTH:
+            continue
+        if isinstance(label, bool) or not isinstance(label, (int, float)) or label not in (0, 1):
+            continue
+        try:
+            normalized_features = [float(value) for value in features]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in normalized_features):
+            labeled_data.append((normalized_features, int(label)))
+
+    if not labeled_data:
         return
 
-    log.info(f"[バックグラウンド学習] {len(data)}件 → Head Bのみ適応中...")
-    model.train()
+    _HEAD_B_REVIEWED_LABELS.update(label for _, label in labeled_data)
+    _HEAD_B_REVIEWED = _HEAD_B_REVIEWED_LABELS == {0, 1}
+    with _MODEL_ACCESS_LOCK:
+        log.info(f"[バックグラウンド学習] {len(labeled_data)}件 → Head Bのみ適応中...")
+        model.train()
 
-    # ── クラウド知識を凍結 (絶対に触らない！) ──
-    for name, param in model.named_parameters():
-        param.requires_grad = (name.startswith("head_b"))  # Head B以外は凍結
+        for name, param in model.named_parameters():
+            param.requires_grad = name.startswith("head_b")
 
-    inputs = torch.tensor([d["features"] for d in data], dtype=torch.float32)
-    labels = torch.zeros((len(data), 1), dtype=torch.float32)  # ホワイトリスト=正常(0)
+        inputs = torch.tensor([features for features, _ in labeled_data], dtype=torch.float32)
+        labels, sample_weights = _head_b_targets([label for _, label in labeled_data])
+        loss_values = nn.BCELoss(reduction="none")
 
-    optimizer.zero_grad()
-    _, out_b, _ = model(inputs)
-    loss = nn.BCELoss()(out_b, labels)
-    loss.backward()
-    optimizer.step()
+        optimizer.zero_grad()
+        _, out_b, _ = model(inputs)
+        loss = (loss_values(out_b, labels) * sample_weights).mean()
+        loss.backward()
+        optimizer.step()
 
-    log.info(f"[バックグラウンド学習完了] Loss={loss.item():.4f} (防衛知識は維持済)")
-    model.eval()
+        log.info(f"[バックグラウンド学習完了] Loss={loss.item():.4f} (防衛知識は維持済)")
+        model.eval()
+        if checkpoint_path:
+            if _save_local_adaptation(model, checkpoint_path):
+                log.info(f"[MODEL_SAVE] 学習済みモデルを保存しました: {checkpoint_path}")
 
 
 # =====================================================================
@@ -3637,11 +4755,14 @@ _command_queue = multiprocessing.Queue()            # 特権エージェント�
 _PRIVILEGED_AGENT_ACTIVE = False
 _PRIVILEGED_COMMAND_PROCESS = None
 _PRIVILEGED_CAPTURE_PROCESS = None
+_PRIVILEGED_STOP_EVENT = multiprocessing.Event()
+atexit.register(_close_packet_inspection_log)
+atexit.register(_shutdown_privileged_agent)
 _PROCESS_EVENT_HISTORY = {}
 _PROCESS_EVENT_HISTORY_LOCK = threading.Lock()
 _last_pkt_time = time.time()
 
-def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool):
+def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool, stop_event=None):
     """
     生ソケット(SOCK_RAW)で直接カーネルからパケットを受け取り、
     structで即座に解析 → 10次元特徴量に変換します。
@@ -3649,6 +4770,39 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
     推論は 1 ms 以下を目指しています。
     """
     global _last_pkt_time, _ema_delta, _last_dpi_result
+    if platform.system().lower() != "linux":
+        log.warning(
+            f"[キャプチャ] {platform.system()} ではAF_PACKETを使用できないため、"
+            "安全なシミュレーションフレームで監視パイプラインを継続します。"
+        )
+        ethernet_header = b"\xff" * 6 + b"\x02\x00\x00\x00\x00\x01" + struct.pack("!H", 0x0806)
+        arp_payload = struct.pack(
+            "!HHBBH6s4s6s4s",
+            1, 0x0800, 6, 4, 1,
+            b"\x02\x00\x00\x00\x00\x01", socket.inet_aton("192.0.2.1"),
+            b"\x00" * 6, socket.inet_aton("192.0.2.2"),
+        )
+        simulated_packet = ethernet_header + arp_payload
+        while stop_event is None or not stop_event.is_set():
+            if stop_event is not None and stop_event.wait(1.0):
+                break
+            if stop_event is None:
+                time.sleep(1.0)
+            now = time.time()
+            delta = now - _last_pkt_time
+            _ema_delta = 0.9 * _ema_delta + 0.1 * delta
+            _last_pkt_time = now
+            features = [
+                min(len(simulated_packet) / 1500.0, 1.0), min(_ema_delta, 1.0),
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, mem_mgr.get_usage_ratio(),
+            ]
+            if not _packet_queue.full():
+                _packet_queue.put(PacketQueueItem(feature_vector=features, packet_bytes=simulated_packet))
+            dpi_result = analyze_dpi_payload(simulated_packet)
+            _last_dpi_result = dpi_result
+            handle_packet_event(simulated_packet, interface, True, dpi_result=dpi_result)
+        return
+
     try:
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
         s.bind((interface, 0))
@@ -3662,7 +4816,7 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
         log.error(f"[キャプチャ] ソケットエラー: {e}")
         return
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             pkt, _ = s.recvfrom(65535)
             _refresh_kernel_bpf_filter(s)
@@ -3717,7 +4871,7 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
             ]
 
             if not _packet_queue.full():
-                _packet_queue.put((feat, pkt))
+                _packet_queue.put(PacketQueueItem(feature_vector=feat, packet_bytes=pkt))
 
             dpi_result = analyze_dpi_payload(pkt)
             _last_dpi_result = dpi_result
@@ -3729,20 +4883,52 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
             break
         except Exception as exc:
             log.warning(f"[CAPTURE] パケット処理中に例外が発生しました: {type(exc).__name__}: {exc}")
+    s.close()
 
 
 # =====================================================================
 # Task 3-c: バックグラウンド学習ワーカー (別スレッドで防衛ループを邪魔しない)
 # =====================================================================
-_train_queue: queue.Queue = queue.Queue()
+_TRAIN_QUEUE_MAX_BATCHES = 10
+_train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
-def _training_worker(model: LightweightMultiTaskAI, optimizer):
-    """防衛ループから独立した別スレッドで学習を実行 → 1ms応答を保証"""
+
+def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
+    if not batch:
+        return True
+    warned = False
+    while True:
+        try:
+            _train_queue.put(batch, timeout=wait_timeout)
+            return True
+        except queue.Full:
+            if not warned:
+                log.warning("[学習キュー] 未処理バッチが上限に達しました。空きができるまで入力を抑制します。")
+                warned = True
+
+
+def _buffer_monitor_candidate(buffer: list, features: list, head_b_score: float) -> None:
+    """監視中の候補を一時保持する。学習投入はデータ更新側に限定する。"""
+    if head_b_score > 0.7:
+        buffer.append({"features": features, "label": 0})
+
+
+def _training_worker(model: LightweightMultiTaskAI, optimizer, checkpoint_path: str | None = None):
+    """防衛ループから独立して bounded queue のバッチを学習する。"""
+    processed_batches = 0
     while True:
         batch = _train_queue.get()
-        if batch is None:
-            break
-        train_local_whitelist(model, optimizer, batch)
+        try:
+            if batch is None:
+                return
+            train_local_whitelist(model, optimizer, batch, checkpoint_path=checkpoint_path)
+            processed_batches += 1
+            if processed_batches % 10 == 0:
+                gc.collect()
+        except Exception as exc:
+            log.warning(f"[バックグラウンド学習] バッチ処理に失敗しました。次のバッチへ継続します ({exc})")
+        finally:
+            _train_queue.task_done()
 
 
 # =====================================================================
@@ -3771,11 +4957,17 @@ def _compute_statistical_anomaly_score(pkt_len: int) -> float:
     return 0.0
 
 
-def _validate_command_tokens(cmd: list) -> bool:
+def _validate_command_tokens(cmd: list | tuple) -> bool:
     """sudoで使うコマンドをシェルメタ文字由来の注入に対して安全に検証する。"""
     _MAX_TOKEN_LEN = 256
     if not isinstance(cmd, (list, tuple)) or not cmd:
         return False
+
+    basename = _normalize_command_basename(cmd[0])
+    if basename not in _ALLOWED_ROOT_COMMANDS:
+        log.warning(f"[SECURITY] 許可されていない root コマンドを拒否しました: {basename}")
+        return False
+
     for token in cmd:
         if not isinstance(token, str) or not token.strip():
             return False
@@ -3806,7 +4998,7 @@ def _run_command_with_sudo(cmd: list, dry_run: bool = False) -> bool:
     return _execute_root_command(cmd, dry_run=dry_run)
 
 
-def _attempt_pure_python_network_barrier(interface: str = None, available_interfaces=None) -> bool:
+def _attempt_pure_python_network_barrier(interface: str | None = None, available_interfaces=None) -> bool:
     """OSコマンドが利用できない場合でも、可能な限り純粋Pythonでフェールクローズ遮断を試みる。"""
     interfaces = []
     if available_interfaces:
@@ -3817,7 +5009,7 @@ def _attempt_pure_python_network_barrier(interface: str = None, available_interf
     if not interfaces:
         return False
 
-    if platform.system().lower() == "windows":
+    if platform.system().lower() != "linux":
         return False
 
     try:
@@ -3875,7 +5067,7 @@ def _load_admin_recovery_token() -> str:
     return ""
 
 
-def handle_admin_recovery_signal(token: str | None = None, interface: str = None, available_interfaces=None,
+def handle_admin_recovery_signal(token: str | None = None, interface: str | None = None, available_interfaces=None,
                                  loopback_signal: str | None = None, dry_run: bool = False) -> dict:
     """認証済み管理者シグナルを受け取り、Fail-Closed状態のまま安全に NIC 復旧を試みる。"""
     provided_token = token or loopback_signal
@@ -3934,12 +5126,17 @@ def _apply_anomaly_decay(now: float | None = None) -> tuple[float, bool]:
     return _ANOMALY_DECAY_LAST_TIME, False
 
 
-def evaluate_threat_state(interface: str, dry_run: bool, score_a: float = 0.0,
+def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float = 0.0,
                           backdoor_detected: bool = False, backdoor_boost: float = 0.0) -> bool:
     """バックドア/異常スコアを評価して必要なら即座にキルスイッチを発動する。"""
-    global _KILL_SWITCH_TRIGGERED, _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter
+    global _KILL_SWITCH_TRIGGERED, _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _LAST_THREAT_SCORE
+    _LAST_THREAT_SCORE = max(0.0, min(0.99, float(score_a)))
 
-    effective_dry_run = dry_run or is_maintenance_mode()
+    if is_learning_mode() and (backdoor_detected or backdoor_boost > 0.0 or score_a >= 0.95):
+        _report_learning_detection(f"脅威スコア {score_a:.3f} を検出")
+        return False
+
+    effective_dry_run = dry_run or is_learning_mode()
     now = time.time()
     with _CONTAINMENT_LOCK:
         if _KILL_SWITCH_TRIGGERED and now - _LAST_KILL_SWITCH_TRIGGER < _KILL_SWITCH_COOLDOWN_SEC:
@@ -3965,7 +5162,7 @@ def evaluate_threat_state(interface: str, dry_run: bool, score_a: float = 0.0,
         if should_trigger:
             if effective_dry_run:
                 log.warning("[MAINTENANCE] メンテナンス状態のため、遮断処理は Dry-Run として扱います。")
-            log.critical(f"[!!!] キルスイッチ発動！ スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
+            log.critical(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
             _KILL_SWITCH_EVENT.set()
             if not _dispatch_privileged_command("kill_switch", interface=interface, dry_run=effective_dry_run):
                 execute_kill_switch(interface, effective_dry_run)
@@ -4052,28 +5249,45 @@ def _compute_behavioral_signature_score(packet_bytes: bytes, transport: dict, dp
     if recent_sizes:
         avg = sum(recent_sizes) / len(recent_sizes)
         std = math.sqrt(sum((x - avg) ** 2 for x in recent_sizes) / len(recent_sizes)) if len(recent_sizes) > 1 else max(1.0, avg * 0.1)
+        std = max(std, 1.0)
         if avg > 0:
             ratio = packet_len / avg
             if ratio >= 4.0 or ratio <= 0.25:
-                score += 0.12
+                score += 0.20
             if abs(packet_len - avg) / std >= 3.0:
-                score += 0.14
+                score += 0.22
         if len(recent_sizes) >= 8:
             small_count = sum(1 for size in recent_sizes if size < avg * 0.5)
             large_count = sum(1 for size in recent_sizes if size > avg * 2)
             if small_count >= 5 and packet_len < avg * 0.5:
-                score += 0.08
+                score += 0.14
             if large_count >= 5 and packet_len > avg * 2:
-                score += 0.08
+                score += 0.14
+
+    recent_lengths = list(_PACKET_LENGTH_HISTORY)[-16:]
+    if len(recent_lengths) >= 8:
+        length_mean = sum(recent_lengths) / len(recent_lengths)
+        length_std = math.sqrt(sum((size - length_mean) ** 2 for size in recent_lengths) / len(recent_lengths))
+        if length_mean > 0 and length_std / length_mean <= 0.04:
+            score += 0.16
+        if abs(packet_len - length_mean) / max(length_std, 1.0) >= 3.0:
+            score += 0.18
 
     if _PACKET_INTERARRIVAL_HISTORY:
         intervals = list(_PACKET_INTERARRIVAL_HISTORY)[-16:]
         avg_interval = sum(intervals) / len(intervals)
         jitter = math.sqrt(sum((d - avg_interval) ** 2 for d in intervals) / len(intervals)) if len(intervals) > 1 else 0.0
-        if avg_interval > 0 and jitter <= avg_interval * 0.2 and len(intervals) >= 8:
-            score += 0.12
+        if avg_interval > 0 and jitter <= avg_interval * 0.05 and len(intervals) >= 8:
+            score += 0.22
+        elif avg_interval > 0 and jitter <= avg_interval * 0.15 and len(intervals) >= 8:
+            score += 0.14
         if avg_interval < 0.05 and len(intervals) >= 6:
-            score += 0.08
+            score += 0.14
+        if avg_interval > 0 and len(intervals) >= 8:
+            burst_gaps = sum(1 for interval in intervals if interval < avg_interval * 0.25)
+            quiet_gaps = sum(1 for interval in intervals if interval > avg_interval * 1.75)
+            if burst_gaps >= 2 and quiet_gaps >= 2:
+                score += 0.20
 
     if dpi_result.get("tls_ja3_hash") and not dpi_result.get("tls_sni") and transport.get("dst_port") in {443, 8443}:
         score += 0.18
@@ -4109,8 +5323,39 @@ def _estimate_tls_meta_risk(packet_bytes: bytes, markers: list) -> float:
     return 0.0
 
 
-def inspect_packet_pipeline(packet_bytes: bytes, interface: str, model=None, dry_run: bool = False,
-                            feature_vector=None, dpi_result: dict = None) -> dict:
+def _combine_threat_scores(model_score: float, pipeline_score: float) -> float:
+    """ニューラル推論と独立した DPI/ルール判定を安全に合成する。"""
+    valid_scores = []
+    for value in (model_score, pipeline_score):
+        try:
+            score = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(score):
+            valid_scores.append(max(0.0, min(0.99, score)))
+    return max(valid_scores, default=0.0)
+
+
+def _compute_composite_anomaly_score(rule_score: float, ai_score: float, math_score: float,
+                                     unknown_score: float, behavior_score: float) -> float:
+    """暗号化通信でも利用できる行動メタデータを中心に複合異常度を計算する。"""
+    return min(
+        0.99,
+        rule_score * 0.12 + ai_score * 0.10 + math_score * 0.10
+        + unknown_score * 0.13 + behavior_score * 0.55,
+    )
+
+
+def _adjust_soft_ai_score(ai_score: float, benign_probability: float, reviewed: bool) -> float:
+    """確認済みHead BだけでソフトAIスコアを最大25%抑制する。"""
+    if not reviewed or ai_score >= 0.95 or benign_probability < 0.90:
+        return ai_score
+    attenuation = min(0.25, (benign_probability - 0.90) * 2.5)
+    return ai_score * (1.0 - attenuation)
+
+
+def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=None, dry_run: bool = False,
+                            feature_vector=None, dpi_result: dict | None = None) -> dict:
     """固定ルールを排し、DPI/AI/入力ベクトルによる連続スコアリングでパケットを評価する。"""
     global _BACKDOOR_RISK_SCORE
 
@@ -4161,8 +5406,17 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str, model=None, dry
             rule_reason = "security_marker"
 
     ai_score = 0.0
+    benign_probability = 0.0
     if feature_vector is not None:
         ai_score = min(0.99, 0.2 + 0.15 * max(feature_vector[:3]) + 0.1 * sum(feature_vector[3:8]) + 0.1 * feature_vector[9])
+        if model is not None and _HEAD_B_REVIEWED:
+            try:
+                with _MODEL_ACCESS_LOCK, torch.no_grad():
+                    _, score_b, _ = model(torch.tensor([feature_vector], dtype=torch.float32))
+                benign_probability = float(score_b.reshape(-1)[0].item())
+                ai_score = _adjust_soft_ai_score(ai_score, benign_probability, reviewed=True)
+            except Exception:
+                benign_probability = 0.0
     elif model is not None:
         try:
             with torch.no_grad():
@@ -4187,9 +5441,8 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str, model=None, dry
 
     behavior_score = _compute_behavioral_signature_score(packet_bytes, transport, dpi_result)
     unknown_score = _compute_unknown_behavior_score(packet_bytes, transport, markers, dpi_result)
-    composite_score = min(
-        0.99,
-        rule_score * 0.22 + ai_score * 0.20 + math_score * 0.13 + unknown_score * 0.25 + behavior_score * 0.20,
+    composite_score = _compute_composite_anomaly_score(
+        rule_score, ai_score, math_score, unknown_score, behavior_score,
     )
 
     if behavior_score >= 0.30 and (unknown_score >= 0.16 or rule_score >= 0.25):
@@ -4206,7 +5459,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str, model=None, dry
     return {"block": False, "stage": "pass", "score": max(rule_score, ai_score, math_score, unknown_score), "reason": rule_reason}
 
 
-def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_result: dict = None) -> bool:
+def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_result: dict | None = None) -> bool:
     """パケット到着時に既存の脅威状態を参照し、必要なら遮断へ遷移する。"""
     global _LAST_PACKET_EVENT_TIME
     now = time.time()
@@ -4219,6 +5472,7 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
         return False
 
     effective_dry_run = dry_run or is_maintenance_mode()
+    dpi_result = dpi_result or analyze_dpi_payload(packet_bytes, interface=interface)
     pipeline = inspect_packet_pipeline(packet_bytes, interface, dry_run=effective_dry_run, dpi_result=dpi_result)
     if pipeline.get("block"):
         stage = pipeline.get("stage")
@@ -4243,7 +5497,7 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
     return False
 
 
-def execute_kill_switch(interface: str, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
+def execute_kill_switch(interface: str | None, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
     """
     異常検知時にOSコマンドでネットワークを物理的に切断します。
     失敗しても次のコマンドを続ける fail-safe 方式です。
@@ -4283,12 +5537,13 @@ def execute_kill_switch(interface: str, dry_run: bool, available_interfaces=None
 # ローカル限定のデータ更新スケジューラ
 # =====================================================================
 def _gdrive_update_worker(model: LightweightMultiTaskAI, optimizer,
-                          folder_id: str, local_dir: str, interval_sec: int):
+                          folder_id: str, local_dir: str, interval_sec: int,
+                          checkpoint_path: str | None = None):
     """
-    外部ネットワークを使わず、ローカルディレクトリのデータのみを再評価するバックグラウンドワーカー。
-    これにより、完全オフライン運用が保証されます。
+    Driveから上限付きで初回取得し、その後はローカルデータを再評価する。
     """
     first_run = True
+    drive_attempted = False
     while True:
         if not first_run:
             time.sleep(interval_sec)
@@ -4302,55 +5557,596 @@ def _gdrive_update_worker(model: LightweightMultiTaskAI, optimizer,
         try:
             log.info("[ローカル更新] ローカルディレクトリから再評価を開始します。")
             local_raw_dir = os.path.join(local_dir, "gdrive_raw")
+            if not drive_attempted:
+                download_from_gdrive_folder(folder_id, local_raw_dir)
+                drive_attempted = True
             if not os.path.exists(local_raw_dir):
                 log.debug("[ローカル更新] 入力データディレクトリが存在しません。次回まで待機します。")
                 continue
 
-            downloaded_files = []
-            for root, _, files in os.walk(local_raw_dir):
-                for file_name in files:
-                    if file_name.lower().endswith((".json", ".jsonl", ".txt")):
-                        downloaded_files.append(os.path.join(root, file_name))
+            def iter_downloaded_files():
+                for root, _, files in os.walk(local_raw_dir):
+                    for file_name in files:
+                        if file_name.lower().endswith((".json", ".jsonl", ".csv")):
+                            yield os.path.join(root, file_name)
 
+            downloaded_files = list(iter_downloaded_files())
             if not downloaded_files:
-                log.warning("[ローカル更新] 監視対象ファイルが見つかりません。次の更新を待ちます。")
-                continue
-
-            raw_data = load_raw_data_from_files(downloaded_files)
-            if raw_data:
-                curated_dir = os.path.join(local_dir, "curated")
-                curated_path = curate_and_save(model, raw_data, curated_dir)
-
-                if os.path.exists(curated_path):
-                    batch = []
-                    with open(curated_path) as f:
-                        for line in f:
-                            try:
-                                batch.append(json.loads(line))
-                            except json.JSONDecodeError:
-                                pass
-                    if batch:
-                        _train_queue.put(batch)
-                        log.info(f"[ローカル更新] {len(batch)}件の厳選データを学習キューへ投入しました。")
+                curated_path = os.path.join(local_dir, "curated", "curated_data.jsonl")
+                if os.path.isfile(curated_path):
+                    log.info("[ローカル更新] rawデータがないため既存の curated_data.jsonl をHead B学習に使用します。")
+                    for batch in load_raw_data_from_files([curated_path], batch_size=_DATA_BATCH_SIZE):
+                        _enqueue_training_batch(batch)
+                    continue
+            raw_batches = load_raw_data_from_files(downloaded_files, batch_size=_DATA_BATCH_SIZE)
+            curated_dir = os.path.join(local_dir, "curated")
+            curated_path = curate_and_save(
+                model,
+                raw_batches,
+                curated_dir,
+                batch_callback=_enqueue_training_batch,
+                batch_size=_DATA_BATCH_SIZE,
+            )
+            log.info(f"[ローカル更新] 厳選データを逐次処理しました: {curated_path}")
         finally:
             exit_maintenance_mode()
+
+
+def _run_lightweight_training_validation(
+    local_dir: str,
+    drive_id: str,
+    max_samples: int,
+    model=None,
+    fetch_drive: bool = True,
+) -> int:
+    if hasattr(torch, "set_num_threads"):
+        torch.set_num_threads(1)
+
+    raw_dir = os.path.join(local_dir, "gdrive_raw")
+    if fetch_drive:
+        download_from_gdrive_folder(drive_id, raw_dir)
+    else:
+        log.info("[検証] RSIモードのため追加のDrive取得を行わず、ローカルデータを使います。")
+    data_files = []
+    if os.path.isdir(raw_dir):
+        for root, dirs, files in os.walk(raw_dir):
+            dirs[:] = [name for name in dirs if not name.startswith(".")]
+            data_files.extend(
+                os.path.join(root, name)
+                for name in files
+                if name.lower().endswith((".json", ".jsonl", ".csv"))
+            )
+
+    if not data_files:
+        curated_path = os.path.join(local_dir, "curated", "curated_data.jsonl")
+        if os.path.isfile(curated_path):
+            data_files = [curated_path]
+            log.info("[検証] 生データがないため既存の curated_data.jsonl を使用します。")
+    reviewed_feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
+    training_sources = [(data_files, False)] if data_files else []
+    if os.path.isfile(reviewed_feedback_path):
+        training_sources.append(([reviewed_feedback_path], True))
+    if not training_sources:
+        log.error("[検証] 読み込み可能なJSON/JSONL/CSVデータがありません。")
+        return 2
+
+    if model is None:
+        model = LightweightMultiTaskAI(input_dim=10)
+    checkpoint_path = os.path.join(local_dir, "local_adaptation.pth")
+    _load_local_adaptation(model, checkpoint_path)
+    optimizer = optim.SGD(model.parameters(), lr=0.005)
+    trained = 0
+    batch_count = 0
+    for source_paths, preserve_labels in training_sources:
+        remaining = max_samples - trained
+        if remaining <= 0:
+            break
+        for batch in load_raw_data_from_files(
+            source_paths,
+            batch_size=8,
+            max_samples=remaining,
+            preserve_labels=preserve_labels,
+        ):
+            train_local_whitelist(model, optimizer, batch, checkpoint_path=checkpoint_path)
+            trained += len(batch)
+            batch_count += 1
+            del batch
+            if batch_count % 10 == 0:
+                gc.collect()
+
+    if trained == 0:
+        log.error("[検証] 有効な特徴量データがありませんでした。")
+        return 2
+    log.info(f"[検証] Head B のオンライン適合学習を {trained} 件で完了しました。")
+    return 0
+
+
+def _build_rsi_payload(model: LightweightMultiTaskAI, local_dir: str, records: list | None = None) -> dict:
+    """Colabへ選別済み特徴量と明示的な確認ラベルだけを送る。"""
+    source_records = []
+    reviewed_feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
+    if os.path.isfile(reviewed_feedback_path):
+        for batch in load_raw_data_from_files(
+            [reviewed_feedback_path], batch_size=128,
+            max_samples=2048, preserve_labels=True,
+        ):
+            source_records.extend(batch)
+
+    remaining = max(0, 2048 - len(source_records))
+    if records is None and remaining:
+        selected_paths = [
+            os.path.join(local_dir, "curated", "curated_data.jsonl"),
+            os.path.join(local_dir, "curated", "selected_features.jsonl"),
+        ]
+        existing_paths = [path for path in selected_paths if os.path.isfile(path)]
+        if existing_paths:
+            for batch in load_raw_data_from_files(existing_paths, batch_size=128, max_samples=remaining):
+                source_records.extend(batch)
+    elif records is not None and remaining:
+        source_records.extend(records[:remaining])
+
+    selected_records = []
+    for record in source_records:
+        features = record.get("features") if isinstance(record, dict) else None
+        if not isinstance(features, (list, tuple)) or len(features) != _ALLOWED_PACKET_FEATURE_LENGTH:
+            continue
+        try:
+            values = [float(value) for value in features]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        label = record.get("label", 0)
+        if (
+            isinstance(label, bool)
+            or not isinstance(label, (int, float))
+            or label not in (0, 1)
+            or not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in values)
+        ):
+            continue
+        selected_records.append({"features": values, "label": int(label)})
+
+    return {
+        "task": "recursive_self_improvement",
+        "curated_data": {
+            "records": selected_records,
+            "contents_uploaded": bool(selected_records),
+        },
+        "training": {"epochs": 1, "learning_rate": 0.001, "batch_size": 100, "device": "cuda"},
+        "submitted_at": int(time.time()),
+    }
+
+
+_MAX_LOCAL_CAPTURE_BYTES = 4 * 1024 * 1024
+
+
+def _append_selected_feature_records(local_dir: str, records: list) -> int:
+    """Persist bounded feature-only samples atomically; raw packet bytes are never written."""
+    normalized_records = []
+    for record in records:
+        features = record.get("features") if isinstance(record, dict) else None
+        if not isinstance(features, (list, tuple)) or len(features) != _ALLOWED_PACKET_FEATURE_LENGTH:
+            continue
+        try:
+            values = [float(value) for value in features]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in values):
+            continue
+        normalized_records.append(json.dumps({"features": values, "label": 0}, separators=(",", ":")))
+    if not normalized_records:
+        return 0
+
+    capture_path = os.path.join(local_dir, "curated", "selected_features.jsonl")
+    os.makedirs(os.path.dirname(capture_path), exist_ok=True)
+    new_bytes = ("\n".join(normalized_records) + "\n").encode("utf-8")
+    with _CAPTURE_DATA_LOCK:
+        old_bytes = b""
+        if os.path.isfile(capture_path):
+            with open(capture_path, "rb") as handle:
+                handle.seek(max(0, os.path.getsize(capture_path) - _MAX_LOCAL_CAPTURE_BYTES))
+                old_bytes = handle.read(_MAX_LOCAL_CAPTURE_BYTES)
+            if len(old_bytes) >= _MAX_LOCAL_CAPTURE_BYTES:
+                first_line_end = old_bytes.find(b"\n")
+                old_bytes = old_bytes[first_line_end + 1:] if first_line_end >= 0 else b""
+
+        content = old_bytes + new_bytes
+        if len(content) > _MAX_LOCAL_CAPTURE_BYTES:
+            content = content[-_MAX_LOCAL_CAPTURE_BYTES:]
+            first_line_end = content.find(b"\n")
+            content = content[first_line_end + 1:] if first_line_end >= 0 else b""
+
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".selected-features-", suffix=".tmp",
+                dir=os.path.dirname(capture_path), delete=False,
+            ) as temporary_file:
+                temporary_path = temporary_file.name
+                os.fchmod(temporary_file.fileno(), 0o600)
+                temporary_file.write(content)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, capture_path)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+    return len(normalized_records)
+
+
+def _derive_cloud_model_urls(rsi_endpoint: str) -> tuple[str, str] | None:
+    parsed = urlparse(rsi_endpoint.strip())
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    endpoint_path = parsed.path.rstrip("/")
+    if not endpoint_path.endswith("/rsi"):
+        return None
+    base_path = endpoint_path[:-4]
+    model_url = parsed._replace(path=f"{base_path}/model", params="", query="", fragment="").geturl()
+    hash_url = parsed._replace(path=f"{base_path}/model.sha256", params="", query="", fragment="").geturl()
+    return model_url, hash_url
+
+
+_MAX_CLOUD_MODEL_BYTES = 128 * 1024 * 1024
+
+
+def _read_validated_cloud_state_dict(model_path: str) -> dict:
+    loaded = torch.load(model_path, map_location="cpu", weights_only=True)
+    if isinstance(loaded, dict) and "state_dict" in loaded:
+        state_dict = loaded["state_dict"]
+    elif isinstance(loaded, dict) and "model_state_dict" in loaded:
+        state_dict = loaded["model_state_dict"]
+    else:
+        state_dict = loaded
+    if not _validate_model_state_dict(state_dict):
+        raise ValueError("downloaded model state_dict structure is invalid")
+    candidate_model = LightweightMultiTaskAI(input_dim=10)
+    candidate_model.load_state_dict(state_dict)
+    return state_dict
+
+
+def _cloud_checkpoint_has_reviewed_labels(model_path: str) -> bool:
+    try:
+        loaded = torch.load(model_path, map_location="cpu", weights_only=True)
+    except Exception:
+        return False
+    return (
+        isinstance(loaded, dict)
+        and loaded.get("format_version") == 2
+        and set(loaded.get("reviewed_labels", [])) == {0, 1}
+    )
+
+
+def sync_cloud_model(model_url: str, hash_url: str, model_path: str, token: str = "") -> dict:
+    """HTTPSモデルとSHA-256を検証し、正常なstate_dictのみ原子的に配置する。"""
+    global _MODEL_SYNC_STATUS, _PENDING_CLOUD_STATE, _PENDING_CLOUD_REVIEWED
+    if requests is None:
+        _MODEL_SYNC_STATUS = "Unavailable"
+        return {"updated": False, "state_dict": None, "reason": "requests unavailable"}
+    if any(urlparse(url).scheme != "https" for url in (model_url, hash_url)):
+        _MODEL_SYNC_STATUS = "Rejected"
+        return {"updated": False, "state_dict": None, "reason": "HTTPS required"}
+
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
+    temporary_path = None
+    _MODEL_SYNC_STATUS = "Downloading"
+    try:
+        hash_response = requests.get(hash_url, headers=headers, timeout=(30, 120))
+        try:
+            hash_response.raise_for_status()
+            expected_hash = (hash_response.text or "").strip().split()[0].lower()
+        finally:
+            hash_response.close()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ValueError("model SHA-256 response is invalid")
+
+        if os.path.isfile(model_path) and _verify_model_hash(model_path, expected_hash):
+            _read_validated_cloud_state_dict(model_path)
+            _MODEL_SYNC_STATUS = "Current"
+            return {"updated": False, "state_dict": None, "reason": "already current"}
+
+        model_response = requests.get(model_url, headers=headers, timeout=(30, 300), stream=True)
+        try:
+            model_response.raise_for_status()
+            content_length = model_response.headers.get("Content-Length")
+            if content_length and int(content_length) > _MAX_CLOUD_MODEL_BYTES:
+                raise ValueError("model artifact exceeds the configured size limit")
+            with tempfile.NamedTemporaryFile(
+                prefix=".cloud-model-", suffix=".tmp",
+                dir=os.path.dirname(os.path.abspath(model_path)), delete=False,
+            ) as temporary_file:
+                temporary_path = temporary_file.name
+                digest = hashlib.sha256()
+                total_bytes = 0
+                for chunk in model_response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    total_bytes += len(chunk)
+                    if total_bytes > _MAX_CLOUD_MODEL_BYTES:
+                        raise ValueError("model artifact exceeds the configured size limit")
+                    digest.update(chunk)
+                    temporary_file.write(chunk)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+        finally:
+            model_response.close()
+
+        if digest.hexdigest() != expected_hash:
+            raise ValueError("downloaded model SHA-256 does not match")
+
+        state_dict = _read_validated_cloud_state_dict(temporary_path)
+        reviewed = _cloud_checkpoint_has_reviewed_labels(temporary_path)
+
+        os.replace(temporary_path, model_path)
+        temporary_path = None
+        _write_model_hash_sidecar(model_path, expected_hash)
+        with _MODEL_RELOAD_LOCK:
+            _PENDING_CLOUD_STATE = state_dict
+            _PENDING_CLOUD_REVIEWED = reviewed
+        _MODEL_SYNC_STATUS = "Updated"
+        log.info(f"[MODEL_SYNC] SHA-256検証済みモデルを原子的に配置しました: {model_path}")
+        return {"updated": True, "state_dict": state_dict, "reason": "updated"}
+    except Exception as exc:
+        _MODEL_SYNC_STATUS = "Failed"
+        log.warning(f"[MODEL_SYNC] モデル同期に失敗しました。現在のモデルを維持します ({exc})")
+        return {"updated": False, "state_dict": None, "reason": str(exc)}
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
+def _cloud_model_sync_worker(model_url: str, hash_url: str, model_path: str,
+                             token: str, interval_sec: int) -> None:
+    while True:
+        sync_cloud_model(model_url, hash_url, model_path, token=token)
+        time.sleep(max(30, interval_sec))
+
+
+def _apply_pending_cloud_model(model, local_checkpoint_path: str | None = None) -> bool:
+    global _PENDING_CLOUD_STATE, _PENDING_CLOUD_REVIEWED, _MODEL_SYNC_STATUS
+    global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    with _MODEL_RELOAD_LOCK:
+        state_dict = _PENDING_CLOUD_STATE
+        reviewed = _PENDING_CLOUD_REVIEWED
+        _PENDING_CLOUD_STATE = None
+        _PENDING_CLOUD_REVIEWED = False
+    if state_dict is None:
+        return False
+    try:
+        with _MODEL_ACCESS_LOCK:
+            model.load_state_dict(state_dict)
+            _HEAD_B_REVIEWED_LABELS = {0, 1} if reviewed else set()
+            _HEAD_B_REVIEWED = reviewed
+            if local_checkpoint_path:
+                local_dir = os.path.dirname(os.path.abspath(local_checkpoint_path))
+                feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
+                if os.path.isfile(feedback_path):
+                    optimizer = optim.SGD(model.parameters(), lr=0.005)
+                    for batch in load_raw_data_from_files(
+                        [feedback_path], batch_size=32, max_samples=2048,
+                        preserve_labels=True,
+                    ):
+                        train_local_whitelist(
+                            model, optimizer, batch, checkpoint_path=local_checkpoint_path,
+                        )
+            model.eval()
+        _MODEL_SYNC_STATUS = "Loaded"
+        log.info("[MODEL_SYNC] 最新クラウドモデルを推論エンジンへ反映しました。")
+        return True
+    except Exception as exc:
+        _MODEL_SYNC_STATUS = "Failed"
+        log.error(f"[MODEL_SYNC] 推論モデルへの反映に失敗しました。現在の重みを維持します ({exc})")
+        return False
+
+
+def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait_for_result: bool = False,
+                             records: list | None = None, token: str = ""):
+    global _RSI_CONNECTION_STATUS
+    endpoint = os.environ.get("COLAB_RSI_ENDPOINT", "").strip()
+    completion = threading.Event()
+    result = {"sent": False, "simulated": False}
+
+    if not endpoint:
+        _RSI_CONNECTION_STATUS = "Simulated"
+        result["simulated"] = True
+        log.info("[RSI_CLOUD] COLAB_RSI_ENDPOINT未設定のため送信をシミュレーションします。")
+        log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (シミュレーション)")
+        completion.set()
+        return None, completion, result
+
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        _RSI_CONNECTION_STATUS = "Rejected"
+        log.error("[RSI_CLOUD] endpointはHTTPSまたはlocalhostに限定します。ローカル軽量処理を継続します。")
+        log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (送信拒否・ローカル継続)")
+        completion.set()
+        return None, completion, result
+    if requests is None:
+        _RSI_CONNECTION_STATUS = "Unavailable"
+        log.error("[RSI_CLOUD] requestsが利用できません。ローカル軽量処理を継続します。")
+        log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (送信不可・ローカル継続)")
+        completion.set()
+        return None, completion, result
+
+    payload = _build_rsi_payload(model, local_dir, records=records)
+    label_set = {record["label"] for record in payload["curated_data"]["records"]}
+    if label_set != {0, 1}:
+        _RSI_CONNECTION_STATUS = "Insufficient labels"
+        result["rejected"] = True
+        completion.set()
+        log.warning("[RSI_CLOUD] 確認済みの正常(label=0)・脅威(label=1)の両方がないため送信を見送ります。")
+        return None, completion, result
+    _RSI_CONNECTION_STATUS = "Connecting"
+
+    def send_request():
+        global _RSI_CONNECTION_STATUS
+        response = None
+        try:
+            auth_token = token or os.environ.get("COLAB_RSI_TOKEN", "")
+            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+            response = requests.post(endpoint, json=payload, headers=headers, timeout=(60, 300))
+            response.raise_for_status()
+            result["sent"] = True
+            _RSI_CONNECTION_STATUS = "Connected"
+            log.info("[RSI_CLOUD] Colab endpointが学習指示を受理しました。")
+        except Exception as exc:
+            _RSI_CONNECTION_STATUS = "Failed"
+            log.error(f"[RSI_CLOUD] Colabへの送信に失敗しました。ローカル軽量処理を継続します ({exc})")
+        finally:
+            if response is not None:
+                response.close()
+            payload.clear()
+            completion.set()
+            if not result.get("timed_out"):
+                log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (%s)", "送信成功" if result["sent"] else "失敗・ローカル継続")
+
+    worker = threading.Thread(target=send_request, name="colab-rsi-request", daemon=True)
+    worker.start()
+    if wait_for_result:
+        completion.wait(365)
+        if not completion.is_set():
+            result["timed_out"] = True
+            log.error("[RSI_CLOUD] Colab応答待ちが上限に達しました。ローカル軽量処理を継続します。")
+            log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (応答待ち上限・ローカル継続)")
+    else:
+        log.info("[RSI_CLOUD] ColabへのRSI指示を非同期で送信中です。")
+    return worker, completion, result
+
+
+def _load_runtime_config(config_path: str) -> dict:
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning(f"[CONFIG] 設定ファイルを読み込めません。CLI既定値で続行します ({exc})")
+        return {}
+
+    if not isinstance(config, dict):
+        log.warning("[CONFIG] 設定ファイルの最上位はJSON objectである必要があります。既定値で続行します。")
+        return {}
+
+    validators = {
+        "interface": lambda value: isinstance(value, str) and bool(value.strip()),
+        "ram_limit": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+        "drive_id": lambda value: isinstance(value, str),
+        "colab_endpoint": lambda value: isinstance(value, str),
+        "model_url": lambda value: isinstance(value, str),
+        "model_hash_url": lambda value: isinstance(value, str),
+        "model_sync_token": lambda value: isinstance(value, str),
+        "model_sync_interval": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 30,
+        "ignore_model_hash": lambda value: isinstance(value, bool),
+        "compact_log": lambda value: isinstance(value, bool),
+        "mode": lambda value: isinstance(value, str) and value in {"normal", "RSI", "rsi"},
+        "update_interval": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+    }
+    validated = {}
+    for key, value in config.items():
+        validator = validators.get(key)
+        if validator is None:
+            continue
+        if validator(value):
+            validated[key] = value.strip() if isinstance(value, str) else value
+        else:
+            log.warning(f"[CONFIG] {key} の値が不正なため無視します。")
+    return validated
+
+
+def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_data/config.json"):
+    config = config or {}
+    parser = argparse.ArgumentParser(description="MK1")
+    parser.add_argument("--config", default=config_path, help="JSON設定ファイルのパス")
+    parser.add_argument("--interface", default=config.get("interface", "eth0"), help="監視するNIC (例: eth0)")
+    parser.add_argument("--drive-id",
+                        default=config.get("drive_id", GDRIVE_FOLDER_ID),
+                        help="取得するGoogle DriveフォルダID")
+    parser.add_argument("--local-dir",      default="./ai_data", help="ローカルデータ保存先")
+    parser.add_argument("--update-interval", default=config.get("update_interval", 300), type=int, help="ローカル更新チェック間隔(秒)")
+    parser.add_argument("--max-memory-mb", "--ram-limit", dest="max_memory_mb", default=config.get("ram_limit", 500), type=int,
+                        help="メモリ監視基準(MB)。OSレベルの強制上限ではありません")
+    parser.add_argument("--validation-only", action="store_true", help="小規模データ変換とHead B学習を検証して終了")
+    parser.add_argument("--max-samples", default=32, type=int, help="検証モードで処理する最大サンプル数")
+    parser.add_argument("--ignore-model-hash", action=argparse.BooleanOptionalAction,
+                        default=config.get("ignore_model_hash", False),
+                        help="開発用: cloud_base_model.pth のハッシュ照合をスキップ")
+    parser.add_argument("--compact-log", action=argparse.BooleanOptionalAction,
+                        default=config.get("compact_log", False),
+                        help="通常ログを抑えて1行ステータスを表示")
+    parser.add_argument("--rsi", action="store_true", help="Recursive Self-ImprovementをGoogle Colabへ委託")
+    parser.add_argument("--mode", choices=("normal", "RSI", "rsi"), default=config.get("mode", "normal"), help="実行モード")
+    parser.add_argument("--install-deps", action="store_true", help="起動前に不足している依存ライブラリを自動インストールします")
+    parser.add_argument("--no-dry-run",     action="store_true", help="指定すると実際にNICをダウンさせます(危険！)")
+    return parser
+
+
+def _format_compact_status(ram_mb: float, ram_limit_mb: int, swap_mb: float,
+                           score: float, colab_status: str, mode: str, dry_run: bool) -> str:
+    mode_label = f"{mode}" + (" (Dry-Run)" if dry_run else "")
+    return (
+        f"[STATUS] RAM: {ram_mb:.0f}MB/{ram_limit_mb}MB | Swap: {swap_mb:.1f}MB"
+        f" | Score: {score:.2f} | Colab: {colab_status}"
+        f" | Model: {_MODEL_SYNC_STATUS} | Mode: {mode_label}"
+    )
+
+
+def _render_compact_status(mem_mgr: MemoryManager, ram_limit_mb: int, mode: str, dry_run: bool) -> None:
+    ram_mb = mem_mgr.process.memory_info().rss / (1024 * 1024)
+    swap_mb = getattr(mem_mgr, "_offset", 0) / (1024 * 1024)
+    score = max(_LAST_THREAT_SCORE, _BACKDOOR_RISK_SCORE)
+    status = _format_compact_status(
+        ram_mb, ram_limit_mb, swap_mb, score, _RSI_CONNECTION_STATUS, mode, dry_run,
+    )
+    sys.stdout.write("\r\033[2K" + status)
+    sys.stdout.flush()
 
 
 # =====================================================================
 # メインループ (すべてを統合する中枢)
 # =====================================================================
 def main():
-    parser = argparse.ArgumentParser(description="超軽量・オールインワン エアギャップ自動遮断AI")
-    parser.add_argument("--interface",      default="eth0",  help="監視するNIC (例: eth0)")
-    parser.add_argument("--drive-id",
-                        default=GDRIVE_FOLDER_ID,
-                        help="(レガシー) データ更新監視識別子。実運用では外部接続しません。")
-    parser.add_argument("--local-dir",      default="./ai_data", help="ローカルデータ保存先")
-    parser.add_argument("--update-interval",default=300,  type=int, help="ローカル更新チェック間隔(秒)")
-    parser.add_argument("--max-memory-mb",  default=500,  type=int, help="RAM上限(MB)")
-    parser.add_argument("--no-dry-run",     action="store_true", help="指定すると実際にNICをダウンさせます(危険！)")
+    global _RSI_MODE_ACTIVE, _LAST_THREAT_SCORE
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="./ai_data/config.json")
+    pre_args, _ = pre_parser.parse_known_args()
+    runtime_config = _load_runtime_config(pre_args.config)
+    parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
-    dry_run = not args.no_dry_run
+
+    if "colab_endpoint" in runtime_config:
+        os.environ["COLAB_RSI_ENDPOINT"] = runtime_config["colab_endpoint"]
+    if args.install_deps:
+        ensure_dependencies()
+    configure_compact_logging(args.compact_log)
+
+    if args.max_memory_mb < 1:
+        parser.error("--ram-limit/--max-memory-mb は1以上で指定してください")
+    if args.max_samples < 1:
+        parser.error("--max-samples は1以上で指定してください")
+    rsi_requested = args.rsi or args.mode.upper() == "RSI"
+    rsi_token = runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")
+    _RSI_MODE_ACTIVE = rsi_requested
+    dry_run = not args.no_dry_run or rsi_requested
+    if args.validation_only:
+        os.makedirs(args.local_dir, exist_ok=True)
+        rsi_model = None
+        if rsi_requested:
+            if hasattr(torch, "set_num_threads"):
+                torch.set_num_threads(1)
+            rsi_model = LightweightMultiTaskAI(input_dim=10)
+            _start_colab_rsi_request(rsi_model, args.local_dir, wait_for_result=True, token=rsi_token)
+        result = _run_lightweight_training_validation(
+            args.local_dir,
+            args.drive_id,
+            args.max_samples,
+            model=rsi_model,
+            fetch_drive=not rsi_requested,
+        )
+        del rsi_model
+        gc.collect()
+        return result
 
     available_interfaces = discover_available_interfaces()
     monitor_interface = select_monitor_interface(args.interface, available_interfaces)
@@ -4360,7 +6156,7 @@ def main():
     log_interface_selection(monitor_interface, available_interfaces)
 
     print("\n" + "="*60)
-    print("  超軽量・オールインワン エアギャップ自動遮断AI 起動")
+    print("  MK1 起動")
     print("="*60)
     print(f"  監視NIC      : {monitor_interface}")
     print(f"  ローカルデータ保存先: {args.local_dir}")
@@ -4386,8 +6182,15 @@ def main():
     # ローカルでは Head B だけをこの端末専用にカスタマイズします。
     # ─────────────────────────────────────────────────────────────
     cloud_model_path = os.path.join(args.local_dir, "cloud_base_model.pth")
-    if not load_cloud_model(model, cloud_model_path):
+    local_checkpoint_path = os.path.join(args.local_dir, "local_adaptation.pth")
+    if not load_cloud_model(model, cloud_model_path, ignore_model_hash=args.ignore_model_hash):
         log.warning("           → ローカルに保存された .pth ファイルを配置すると防衛力が上がります！")
+    if not rsi_requested:
+        _load_local_adaptation(model, local_checkpoint_path)
+
+    if rsi_requested:
+        log.info("[RSI_CLOUD] RSIモードを検知しました。重い自己学習をColabへ委託します。")
+        _start_colab_rsi_request(model, args.local_dir, token=rsi_token)
 
     model.eval()  # 推論モードで起動（防衛最優先）
     boot_report = boot_time_auto_hardening(profile_environment())
@@ -4395,6 +6198,7 @@ def main():
     _install_self_protection_handlers()
     threading.Thread(target=_self_protection_monitor, daemon=True).start()
 
+    _prepare_packet_inspection_log()
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         _ensure_privileged_agent(monitor_interface, args.max_memory_mb, args.local_dir, dry_run)
     _drop_privileges_if_possible()
@@ -4404,21 +6208,52 @@ def main():
 
     # ── スレッド起動 ──
     threads = [
-        threading.Thread(target=_training_worker,        args=(model, optimizer),        daemon=True),
+        threading.Thread(target=_training_worker,        args=(model, optimizer, local_checkpoint_path), daemon=True),
         threading.Thread(target=_gdrive_update_worker,
-                         args=(model, optimizer, args.drive_id, args.local_dir, args.update_interval),
+                         args=(model, optimizer, args.drive_id, args.local_dir, args.update_interval, local_checkpoint_path),
                          daemon=True),
         threading.Thread(target=_backdoor_scan_worker,   args=(10,), daemon=True),
         threading.Thread(target=_mtd_worker,            args=(monitor_interface, 20), daemon=True),
     ]
+    if rsi_requested:
+        model_urls = None
+        if runtime_config.get("model_url") and runtime_config.get("model_hash_url"):
+            model_urls = (runtime_config["model_url"], runtime_config["model_hash_url"])
+        else:
+            model_urls = _derive_cloud_model_urls(os.environ.get("COLAB_RSI_ENDPOINT", ""))
+        if model_urls:
+            model_token = runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")
+            sync_interval = runtime_config.get("model_sync_interval", 300)
+            threads.append(threading.Thread(
+                target=_cloud_model_sync_worker,
+                args=(
+                    model_urls[0], model_urls[1], cloud_model_path,
+                    model_token, sync_interval,
+                ),
+                daemon=True,
+            ))
+            log.info("[MODEL_SYNC] Colab最新モデルの定期確認を有効にしました。")
+        else:
+            log.info("[MODEL_SYNC] model_url/model_hash_urlを設定するか、/rsi形式のColab endpointを指定してください。")
     for t in threads:
         t.start()
+
+    reviewed_feedback_path = os.path.join(args.local_dir, "curated", "reviewed_feedback.jsonl")
+    if os.path.isfile(reviewed_feedback_path):
+        reviewed_batches = load_raw_data_from_files(
+            [reviewed_feedback_path], batch_size=_DATA_BATCH_SIZE,
+            max_samples=2048, preserve_labels=True,
+        )
+        for reviewed_batch in reviewed_batches:
+            _enqueue_training_batch(reviewed_batch)
 
     update_gdrive_ips()
     log.info("[メインループ] 開始！ Ctrl+C で終了")
 
     try:
+        next_status_update = 0.0
         while True:
+            _apply_pending_cloud_model(model, local_checkpoint_path=local_checkpoint_path)
             # ── 司令塔: メモリ監視 ──
             mem_ratio = mem_mgr.check()
             if mem_mgr.is_critical:
@@ -4426,18 +6261,34 @@ def main():
                 mem_mgr.evict_buffer(whitelist_buf)
                 whitelist_buf.clear()
 
+            if args.compact_log and time.monotonic() >= next_status_update:
+                _render_compact_status(
+                    mem_mgr,
+                    args.max_memory_mb,
+                    "RSI" if rsi_requested else "Normal",
+                    dry_run,
+                )
+                next_status_update = time.monotonic() + 1.0
+
             # ── パケット取得 ──
             try:
                 payload = _packet_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
-            feat, pkt = payload
+            if not _validate_packet_queue_item(payload):
+                log.warning("[IPC] 受信したキューアイテムのスキーマ検証に失敗しました。破棄します。")
+                continue
+            if isinstance(payload, PacketQueueItem):
+                feat, pkt = payload.feature_vector, payload.packet_bytes
+            else:
+                feat, pkt = payload
 
             maybe_log_crypto_markers(pkt, monitor_interface, time.time())
 
             dpi_result = analyze_dpi_payload(pkt)
             pipeline = inspect_packet_pipeline(pkt, monitor_interface, model=model, feature_vector=feat, dpi_result=dpi_result)
             if pipeline.get("block"):
+                _LAST_THREAT_SCORE = max(_LAST_THREAT_SCORE, float(pipeline.get("score", 0.0)))
                 evaluate_threat_state(monitor_interface, dry_run, score_a=min(0.99, pipeline.get("score", 0.0)),
                                      backdoor_detected=True, backdoor_boost=max(0.1, pipeline.get("score", 0.0)))
                 time.sleep(5)
@@ -4445,9 +6296,11 @@ def main():
 
             # ── AIによる超高速推論 (no_grad = 勾配なし = 最速・最省メモリ) ──
             x = torch.tensor([feat], dtype=torch.float32)
-            with torch.no_grad():
+            with _MODEL_ACCESS_LOCK, torch.no_grad():
                 score_a, score_b, score_c = model(x)
             a, b, c = score_a.item(), score_b.item(), score_c.item()
+            effective_score = _combine_threat_scores(a, pipeline.get("score", 0.0))
+            _LAST_THREAT_SCORE = effective_score
 
             mem_ratio = mem_mgr.check(head_c_score=c)
             if mem_mgr.is_critical:
@@ -4460,7 +6313,7 @@ def main():
             # ================================================================
 
             # 【最優先】バックドア/高スコア検知時は即時キルスイッチ
-            if evaluate_threat_state(monitor_interface, dry_run, score_a=a,
+            if evaluate_threat_state(monitor_interface, dry_run, score_a=effective_score,
                                      backdoor_detected=_BACKDOOR_RISK_SCORE > 0.0,
                                      backdoor_boost=_BACKDOOR_RISK_SCORE):
                 time.sleep(5)  # 遮断後の冷却時間
@@ -4471,21 +6324,21 @@ def main():
                 mem_mgr.evict_buffer(whitelist_buf)
                 whitelist_buf.clear()
 
-            # 【優先3】Head B > 0.7 → 正常な通信としてバッファに追加
-            if b > 0.7:
-                whitelist_buf.append({"features": feat, "label": 0})
-                if len(whitelist_buf) >= 100:
-                    # 防衛ループをブロックしないよう学習キューへ投げる
-                    _train_queue.put(list(whitelist_buf))
-                    whitelist_buf.clear()
-                    log.info("[学習役] → バックグラウンド学習へ投入！")
+            # パケット由来の候補は監視中の一時バッファに留め、学習へは投入しない。
+            _buffer_monitor_candidate(whitelist_buf, feat, b)
 
     except KeyboardInterrupt:
+        if args.compact_log:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         log.info("\n[終了] ユーザー割り込み受信。クリーンアップ中...")
     finally:
+        whitelist_buf.clear()
         _train_queue.put(None)  # 学習スレッドを正常終了
+        _shutdown_privileged_agent()
+        _close_packet_inspection_log()
         mem_mgr.cleanup()
-        log.info("[終了] すべてのスレッドを終了しました")
+        log.info("[終了] ")
 
 
 if __name__ == "__main__":

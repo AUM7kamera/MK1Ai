@@ -1,15 +1,20 @@
 import hashlib
 import importlib.util
+import io
 import json
+import logging
 import os
 import pathlib
 import queue
+import runpy
 import shutil
 import socket
 import struct
 import tempfile
 import time
 import unittest
+import warnings
+from typing import Any
 from unittest import mock
 
 
@@ -17,11 +22,737 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "airgap_ai_defender.py"
 
 spec = importlib.util.spec_from_file_location("airgap_ai_defender", MODULE_PATH)
-module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None, "Failed to load spec or loader"
+module: Any = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
 class AirgapSecurityHelpersTest(unittest.TestCase):
+    def test_runtime_config_sets_parser_defaults_and_cli_can_override(self):
+        config = {
+            "interface": "wg0",
+            "ram_limit": 1500,
+            "drive_id": "local-folder",
+            "colab_endpoint": "https://colab.example.test/rsi",
+            "ignore_model_hash": True,
+            "compact_log": True,
+            "mode": "RSI",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = module._load_runtime_config(str(config_path))
+
+        args = module._build_argument_parser(loaded).parse_args([])
+        self.assertEqual(args.interface, "wg0")
+        self.assertEqual(args.max_memory_mb, 1500)
+        self.assertEqual(args.drive_id, "local-folder")
+        self.assertTrue(args.ignore_model_hash)
+        self.assertTrue(args.compact_log)
+        self.assertEqual(args.mode, "RSI")
+
+        overridden = module._build_argument_parser(loaded).parse_args([
+            "--interface", "eth0", "--ram-limit", "900",
+            "--no-ignore-model-hash", "--no-compact-log", "--mode", "normal",
+        ])
+        self.assertEqual(overridden.interface, "eth0")
+        self.assertEqual(overridden.max_memory_mb, 900)
+        self.assertFalse(overridden.ignore_model_hash)
+        self.assertFalse(overridden.compact_log)
+
+    def test_root_privilege_drop_uses_sudo_invoking_user(self):
+        passwd_entry = mock.Mock(pw_name="workspace-user")
+        with mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.object(module.pwd, "getpwuid", return_value=passwd_entry), \
+             mock.patch.dict(module.os.environ, {"SUDO_UID": "1000"}, clear=False), \
+             mock.patch.object(module, "_drop_to_user", return_value=True) as drop_user:
+            self.assertTrue(module._drop_privileges_if_possible())
+
+        drop_user.assert_called_once_with("workspace-user", preserve_caps=None)
+
+    def test_compact_log_filter_hides_routine_warnings_and_keeps_high_scores(self):
+        compact_filter = module.CompactLogFilter()
+        routine = logging.LogRecord("test", logging.WARNING, "test.py", 1, "routine warning", (), None)
+        high_score = logging.LogRecord("test", logging.WARNING, "test.py", 1, "anomaly score=0.91", (), None)
+        error = logging.LogRecord("test", logging.ERROR, "test.py", 1, "request failed", (), None)
+        self.assertFalse(compact_filter.filter(routine))
+        self.assertTrue(compact_filter.filter(high_score))
+        self.assertTrue(compact_filter.filter(error))
+
+    def test_compact_logging_is_enabled_by_default_for_imported_module(self):
+        root_logger = logging.getLogger()
+        filter_found = any(isinstance(item, module.CompactLogFilter) for handler in root_logger.handlers for item in handler.filters)
+        self.assertTrue(filter_found)
+
+    def test_compact_status_contains_resource_risk_and_connection_state(self):
+        status = module._format_compact_status(252, 1500, 4.5, 0.05, "Connected", "RSI", True)
+        self.assertEqual(
+            status,
+            "[STATUS] RAM: 252MB/1500MB | Swap: 4.5MB | Score: 0.05 | Colab: Connected | Model: Disabled | Mode: RSI (Dry-Run)",
+        )
+
+    def test_derive_cloud_model_urls_from_rsi_endpoint(self):
+        self.assertEqual(
+            module._derive_cloud_model_urls("https://colab.example.test/api/rsi"),
+            (
+                "https://colab.example.test/api/model",
+                "https://colab.example.test/api/model.sha256",
+            ),
+        )
+        self.assertIsNone(module._derive_cloud_model_urls("http://colab.example.test/rsi"))
+
+    def test_sync_cloud_model_verifies_hash_replaces_atomically_and_queues_state(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        artifact = io.BytesIO()
+        module.torch.save(model.state_dict(), artifact)
+        model_bytes = artifact.getvalue()
+        expected_hash = hashlib.sha256(model_bytes).hexdigest()
+        hash_response = mock.Mock(text=f"{expected_hash} cloud_base_model.pth")
+        model_response = mock.Mock(
+            headers={"Content-Length": str(len(model_bytes))},
+            iter_content=mock.Mock(return_value=[model_bytes[:128], model_bytes[128:]]),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
+            with mock.patch.object(module.requests, "get", side_effect=[hash_response, model_response]) as get:
+                result = module.sync_cloud_model(
+                    "https://colab.example.test/model",
+                    "https://colab.example.test/model.sha256",
+                    str(model_path),
+                    token="test-token",
+                )
+
+            self.assertTrue(result["updated"])
+            self.assertEqual(hashlib.sha256(model_path.read_bytes()).hexdigest(), expected_hash)
+            sidecar_path = pathlib.Path(str(model_path) + ".sha256")
+            self.assertEqual(sidecar_path.read_text(encoding="utf-8").split()[0], expected_hash)
+            self.assertEqual(get.call_count, 2)
+            self.assertEqual(get.call_args_list[0].kwargs["timeout"], (30, 120))
+            self.assertEqual(get.call_args_list[1].kwargs["timeout"], (30, 300))
+            self.assertEqual(get.call_args_list[0].kwargs["headers"]["Authorization"], "Bearer test-token")
+            self.assertEqual(module._MODEL_SYNC_STATUS, "Updated")
+            with module._MODEL_RELOAD_LOCK:
+                self.assertIsNotNone(module._PENDING_CLOUD_STATE)
+            applied_model = module.LightweightMultiTaskAI(input_dim=10)
+            self.assertTrue(module._apply_pending_cloud_model(applied_model))
+            self.assertEqual(module._MODEL_SYNC_STATUS, "Loaded")
+            self.assertEqual(list(pathlib.Path(temp_dir).glob("*.tmp")), [])
+            self.assertEqual(list(pathlib.Path(temp_dir).glob(".model-hash-*.tmp")), [])
+            hash_response.close.assert_called_once()
+            model_response.close.assert_called_once()
+
+    def test_sync_cloud_model_rejects_hash_mismatch_without_replacing_existing(self):
+        hash_response = mock.Mock(text=f"{'0' * 64} cloud_base_model.pth")
+        model_response = mock.Mock(
+            headers={"Content-Length": "10"},
+            iter_content=mock.Mock(return_value=[b"not-a-model"]),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
+            model_path.write_bytes(b"existing-model")
+            with mock.patch.object(module.requests, "get", side_effect=[hash_response, model_response]):
+                result = module.sync_cloud_model(
+                    "https://colab.example.test/model",
+                    "https://colab.example.test/model.sha256",
+                    str(model_path),
+                )
+
+            self.assertFalse(result["updated"])
+            self.assertEqual(model_path.read_bytes(), b"existing-model")
+            self.assertEqual(module._MODEL_SYNC_STATUS, "Failed")
+            self.assertEqual(list(pathlib.Path(temp_dir).glob(".cloud-model-*.tmp")), [])
+
+    def test_sync_cloud_model_queues_matching_local_model_for_application(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        artifact = io.BytesIO()
+        module.torch.save(model.state_dict(), artifact)
+        model_bytes = artifact.getvalue()
+        expected_hash = hashlib.sha256(model_bytes).hexdigest()
+        hash_response = mock.Mock(text=f"{expected_hash} cloud_base_model.pth")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
+            model_path.write_bytes(model_bytes)
+            with mock.patch.object(module.requests, "get", return_value=hash_response) as get:
+                result = module.sync_cloud_model(
+                    "https://colab.example.test/model",
+                    "https://colab.example.test/model.sha256",
+                    str(model_path),
+                )
+
+            self.assertFalse(result["updated"])
+            self.assertEqual(result["reason"], "already current")
+            self.assertEqual(get.call_count, 1)
+            hash_response.close.assert_called_once()
+            with module._MODEL_RELOAD_LOCK:
+                self.assertIsNone(module._PENDING_CLOUD_STATE)
+
+    def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
+        targets, weights = module._head_b_targets([0, 0, 0, 1])
+
+        torch = module.torch
+        torch.testing.assert_close(
+            targets.reshape(-1), torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            weights.reshape(-1), torch.tensor([2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 2.0]),
+        )
+
+    def test_reviewed_benign_feedback_only_softens_soft_ai_score(self):
+        self.assertEqual(module._adjust_soft_ai_score(0.90, 1.0, reviewed=False), 0.90)
+        self.assertAlmostEqual(module._adjust_soft_ai_score(0.90, 1.0, reviewed=True), 0.675)
+        self.assertEqual(module._adjust_soft_ai_score(0.96, 1.0, reviewed=True), 0.96)
+
+    def test_reviewed_head_b_can_clear_borderline_ai_only_detection(self):
+        class Model:
+            def __call__(self, _inputs):
+                torch = module.torch
+                return torch.zeros((1, 2)), torch.tensor([[0.99]]), torch.zeros((1, 1))
+
+        features = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5]
+        with mock.patch.object(module, "_HEAD_B_REVIEWED", True), \
+             mock.patch.object(module, "parse_packet_transport", return_value=None), \
+             mock.patch.object(module, "analyze_packet_security_markers", return_value=[]), \
+             mock.patch.object(module, "_compute_behavioral_signature_score", return_value=0.0), \
+             mock.patch.object(module, "_compute_unknown_behavior_score", return_value=0.0):
+            result = module.inspect_packet_pipeline(
+                b"x" * 64, "lo", model=Model(), feature_vector=features,
+                dpi_result={"suspicious": False, "findings": []},
+            )
+
+        self.assertFalse(result["block"])
+        self.assertNotEqual(result["stage"], "ai")
+
+    def test_selected_feature_capture_is_bounded_atomic_and_feature_only(self):
+        record = {"features": [0.25] * 10, "label": 0}
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "_MAX_LOCAL_CAPTURE_BYTES", 180):
+            written = module._append_selected_feature_records(
+                temp_dir,
+                [record, {"features": [2.0] * 10}, {"packet_bytes": b"must-not-save"}],
+            )
+            written_again = module._append_selected_feature_records(temp_dir, [record] * 8)
+            capture_path = pathlib.Path(temp_dir) / "curated" / "selected_features.jsonl"
+            content = capture_path.read_bytes()
+            lines = content.decode("utf-8").splitlines()
+            loaded = [json.loads(line) for line in lines]
+
+        self.assertEqual(written, 1)
+        self.assertEqual(written_again, 8)
+        self.assertLessEqual(len(content), 180)
+        self.assertTrue(loaded)
+        self.assertTrue(all(set(item) == {"features", "label"} for item in loaded))
+        self.assertNotIn(b"must-not-save", content)
+        self.assertEqual(list(capture_path.parent.glob("*.tmp")), [])
+
+    def test_rsi_payload_includes_selected_feature_capture_but_not_raw_packet_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            curated_dir = pathlib.Path(temp_dir) / "curated"
+            curated_dir.mkdir()
+            (curated_dir / "selected_features.jsonl").write_text(
+                json.dumps({"features": [0.1] * 10, "label": 0}) + "\n",
+                encoding="utf-8",
+            )
+            payload = module._build_rsi_payload(module.LightweightMultiTaskAI(input_dim=10), temp_dir)
+
+        self.assertEqual(payload["curated_data"]["records"], [{"features": [0.1] * 10, "label": 0}])
+        self.assertTrue(payload["curated_data"]["contents_uploaded"])
+        self.assertNotIn("packet_bytes", json.dumps(payload))
+        self.assertEqual(set(payload), {"task", "curated_data", "training", "submitted_at"})
+        self.assertEqual(set(payload["curated_data"]), {"records", "contents_uploaded"})
+
+    def test_rsi_payload_includes_only_explicit_reviewed_labels_from_feedback_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            curated_dir = pathlib.Path(temp_dir) / "curated"
+            curated_dir.mkdir()
+            feedback_path = curated_dir / "reviewed_feedback.jsonl"
+            feedback_path.write_text("\n".join([
+                json.dumps({"features": [0.1] * 10, "label": 0}),
+                json.dumps({"features": [0.9] * 10, "label": 1}),
+            ]) + "\n", encoding="utf-8")
+            payload = module._build_rsi_payload(module.LightweightMultiTaskAI(input_dim=10), temp_dir)
+
+        self.assertEqual(
+            [record["label"] for record in payload["curated_data"]["records"]],
+            [0, 1],
+        )
+
+    def test_module_import_does_not_autoinstall_dependencies(self):
+        with mock.patch.object(module.importlib.util, "find_spec", return_value=None), \
+             mock.patch.object(module.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+            runpy.run_path(str(MODULE_PATH), run_name="airgap_ai_defender_autoinstall_regression")
+
+        self.assertEqual(run.call_count, 0)
+
+    def test_ensure_dependencies_uses_cpu_torch_and_continues_when_install_fails(self):
+        with mock.patch.object(module.importlib.util, "find_spec", return_value=None), \
+             mock.patch.object(module.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+            available = module.ensure_dependencies()
+
+        self.assertEqual(available, {"torch": False, "psutil": False, "cryptography": False})
+        torch_command = run.call_args_list[0].args[0]
+        self.assertIn("--extra-index-url", torch_command)
+        self.assertIn("https://download.pytorch.org/whl/cpu", torch_command)
+        self.assertIn("300", torch_command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 1800)
+
+    def test_load_raw_data_from_files_yields_bounded_json_and_jsonl_batches(self):
+        records = [
+            {"features": [str(value) for value in range(10)] + [99]}
+            for _ in range(5)
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            json_path = pathlib.Path(temp_dir) / "records.json"
+            jsonl_path = pathlib.Path(temp_dir) / "records.jsonl"
+            json_path.write_text(json.dumps(records[:3]), encoding="utf-8")
+            jsonl_path.write_text("".join(json.dumps(item) + "\n" for item in records[3:]), encoding="utf-8")
+
+            batches = list(module.load_raw_data_from_files([json_path, jsonl_path], batch_size=2))
+
+        self.assertEqual([len(batch) for batch in batches], [2, 2, 1])
+        self.assertEqual(batches[0][0]["features"], [float(value) for value in range(10)])
+
+    def test_load_raw_data_from_files_stops_at_sample_limit(self):
+        records = [{"features": [float(value)] * 10} for value in range(6)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jsonl_path = pathlib.Path(temp_dir) / "records.jsonl"
+            jsonl_path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+            batches = list(module.load_raw_data_from_files([jsonl_path], batch_size=2, max_samples=3))
+
+        self.assertEqual([len(batch) for batch in batches], [2, 1])
+
+    def test_load_raw_data_preserves_labels_only_for_reviewed_sources(self):
+        record = {"features": [0.2] * 10, "label": 1}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jsonl_path = pathlib.Path(temp_dir) / "reviewed.jsonl"
+            jsonl_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            untrusted = list(module.load_raw_data_from_files([jsonl_path], batch_size=1))
+            reviewed = list(module.load_raw_data_from_files(
+                [jsonl_path], batch_size=1, preserve_labels=True,
+            ))
+
+        self.assertEqual(untrusted, [[{"features": [0.2] * 10}]])
+        self.assertEqual(reviewed, [[{"features": [0.2] * 10, "label": 1}]])
+
+    def test_download_from_gdrive_folder_downloads_only_size_verified_data(self):
+        payload = json.dumps({"features": [0.0] * 10}) + "\n"
+        candidate = mock.Mock(id="file-id", path="dataset/sample.jsonl")
+        response = mock.Mock(status_code=200, headers={
+            "Content-Length": str(len(payload.encode("utf-8"))),
+            "Content-Type": "application/json",
+        })
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "GDOWN_AVAILABLE", True), \
+             mock.patch.object(module.gdown, "download_folder", return_value=[candidate]) as list_folder, \
+             mock.patch.object(module.requests, "head", return_value=response) as head_request, \
+             mock.patch.object(
+                 module.gdown,
+                 "download",
+                 side_effect=lambda id, output, **kwargs: pathlib.Path(output).write_text(payload, encoding="utf-8"),
+             ) as download_file:
+            downloaded = module.download_from_gdrive_folder("folder-id", temp_dir)
+            list_folder.assert_called_once()
+            self.assertTrue(list_folder.call_args.kwargs["skip_download"])
+            self.assertEqual(list_folder.call_args.kwargs["timeout"], (30, 120))
+            self.assertEqual(list_folder.call_args.kwargs["retries"], 4)
+            self.assertEqual(head_request.call_args.kwargs["timeout"], (30, 120))
+            download_file.assert_called_once()
+            self.assertEqual(download_file.call_args.kwargs["timeout"], (30, 300))
+            self.assertEqual(download_file.call_args.kwargs["retries"], 4)
+            self.assertEqual(len(downloaded), 1)
+            self.assertEqual(pathlib.Path(downloaded[0]).read_text(encoding="utf-8"), payload)
+
+    def test_drive_size_check_timeout_is_skipped_safely(self):
+        candidate = mock.Mock(id="slow-file", path="dataset/slow.jsonl")
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "GDOWN_AVAILABLE", True), \
+             mock.patch.object(module.gdown, "download_folder", return_value=[candidate]), \
+             mock.patch.object(module.requests, "head", side_effect=module.requests.ReadTimeout("slow response")) as head_request, \
+             mock.patch.object(module.gdown, "download") as download:
+            result = module.download_from_gdrive_folder("folder-id", temp_dir)
+
+        self.assertEqual(result, [])
+        self.assertEqual(head_request.call_count, 3)
+        download.assert_not_called()
+
+    def test_gdrive_retries_temporary_head_timeout(self):
+        payload = json.dumps({"features": [0.0] * 10}) + "\n"
+        candidate = mock.Mock(id="retry-file", path="dataset/retry.jsonl")
+        response = mock.Mock(status_code=200, headers={
+            "Content-Length": str(len(payload.encode("utf-8"))),
+            "Content-Type": "application/json",
+        })
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "GDOWN_AVAILABLE", True), \
+             mock.patch.object(module.gdown, "download_folder", return_value=[candidate]), \
+             mock.patch.object(
+                 module.requests,
+                 "head",
+                 side_effect=[module.requests.ReadTimeout("temporary delay"), response],
+             ) as head_request, \
+             mock.patch.object(
+                 module.gdown,
+                 "download",
+                 side_effect=lambda id, output, **kwargs: pathlib.Path(output).write_text(payload, encoding="utf-8"),
+             ):
+            downloaded = module.download_from_gdrive_folder("folder-id", temp_dir)
+
+        self.assertEqual(head_request.call_count, 2)
+        self.assertEqual(len(downloaded), 1)
+
+    def test_gdrive_worker_uses_curated_data_when_drive_and_raw_data_are_unavailable(self):
+        record = {"features": [0.0] * 10, "label": 0}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_dir = pathlib.Path(temp_dir) / "gdrive_raw"
+            curated_dir = pathlib.Path(temp_dir) / "curated"
+            raw_dir.mkdir()
+            curated_dir.mkdir()
+            curated_path = curated_dir / "curated_data.jsonl"
+            curated_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with mock.patch.object(module, "ONI_MODE", False), \
+                 mock.patch.object(module, "download_from_gdrive_folder", return_value=[]), \
+                 mock.patch.object(module, "enter_maintenance_mode"), \
+                 mock.patch.object(module, "exit_maintenance_mode"), \
+                 mock.patch.object(module, "load_raw_data_from_files", return_value=iter([[record]])) as load_data, \
+                 mock.patch.object(module, "_enqueue_training_batch") as enqueue, \
+                 mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    module._gdrive_update_worker(None, None, "folder-id", temp_dir, 300)
+
+        load_data.assert_called_once_with([str(curated_path)], batch_size=module._DATA_BATCH_SIZE)
+        enqueue.assert_called_once_with([record])
+
+    def test_process_names_do_not_change_behavior_score(self):
+        info = {
+            "name": "code",
+            "exe": "/usr/share/code/code",
+            "cmdline": ["code", "--type=renderer"],
+            "cpu_percent": 30.0,
+            "memory_percent": 10.0,
+            "num_threads": 8,
+        }
+        features, score = module._vectorize_process_behavior(info)
+        other_features, other_score = module._vectorize_process_behavior(dict(info, name="codecave"))
+        self.assertEqual(features, other_features)
+        self.assertEqual(score, other_score)
+
+    def test_backdoor_scan_exempts_only_benign_development_connections(self):
+        connections = [
+            mock.Mock(status=module.psutil.CONN_ESTABLISHED, raddr=("127.0.0.1", 9222), laddr=("127.0.0.1", 50000)),
+            mock.Mock(status=module.psutil.CONN_ESTABLISHED, raddr=("203.0.113.10", 443), laddr=("192.0.2.2", 50001)),
+            mock.Mock(status=module.psutil.CONN_ESTABLISHED, raddr=("203.0.113.20", 4444), laddr=("192.0.2.2", 50002)),
+        ]
+        proc = mock.Mock()
+        proc.info = {
+            "pid": 42,
+            "name": "code",
+            "exe": "/usr/share/code/code",
+            "cmdline": ["code", "curl | sh"],
+            "cpu_percent": 30.0,
+            "memory_percent": 10.0,
+            "num_threads": 8,
+        }
+        proc.parent.return_value = None
+        proc.net_connections.return_value = connections
+        proc.connections = mock.Mock(side_effect=AssertionError("deprecated API must not be used"))
+        with mock.patch.object(module.psutil, "process_iter", return_value=[proc]):
+            findings = module.scan_for_backdoors()
+
+        proc.net_connections.assert_called_once_with(kind="inet")
+        proc.connections.assert_not_called()
+        self.assertEqual(
+            [finding["remote"] for finding in findings],
+            ["203.0.113.20:4444"],
+        )
+
+    def test_vectorizer_reduces_score_for_development_process_with_only_benign_connections(self):
+        info = {
+            "name": "code",
+            "cmdline": ["code", "curl | sh"],
+            "cpu_percent": 30.0,
+            "memory_percent": 10.0,
+            "num_threads": 8,
+        }
+        _, baseline_score = module._vectorize_process_behavior(info)
+        _, development_score = module._vectorize_process_behavior(dict(
+            info,
+            _connections=[
+                mock.Mock(raddr=("127.0.0.1", 9222)),
+                mock.Mock(raddr=("203.0.113.10", 443)),
+            ],
+        ))
+        self.assertGreater(baseline_score, development_score)
+        self.assertLess(development_score, 0.35)
+
+    def test_process_connections_falls_back_without_deprecation_warning(self):
+        proc = mock.Mock()
+        proc.net_connections = None
+        proc.connections.return_value = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = module._process_connections(proc)
+
+        self.assertEqual(result, [])
+        self.assertFalse(any(issubclass(item.category, DeprecationWarning) for item in caught))
+
+    def test_parent_command_detection_uses_token_boundaries(self):
+        self.assertFalse(module._is_suspicious_parent_command(
+            "code --utility-sub-type=node.mojom.NodeService shellIntegration-bash.sh"
+        ))
+        self.assertFalse(module._is_suspicious_parent_command("bash --init-file /tmp/bashrc"))
+        self.assertTrue(module._is_suspicious_parent_command("bash -c 'nc -l 9000'"))
+        self.assertTrue(module._is_suspicious_parent_command("powershell.exe -EncodedCommand abc"))
+
+    def test_process_event_monitor_does_not_whitelist_python_inline_code(self):
+        with mock.patch.object(module, "_resolve_proc_executable", return_value="/usr/bin/python3"), \
+             mock.patch.object(module, "_is_suspicious_executable_path", return_value=False):
+            self.assertTrue(module._is_suspicious_process_command(1234, "python3 -c print('ready')"))
+
+    def test_rsi_without_endpoint_completes_as_simulation(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": ""}), \
+             mock.patch.object(module, "log") as log_mock:
+            worker, completion, result = module._start_colab_rsi_request(model, ".", wait_for_result=True)
+
+        self.assertIsNone(worker)
+        self.assertTrue(completion.is_set())
+        self.assertTrue(result["simulated"])
+        self.assertTrue(any(
+            call.args and "送信を完了しました" in call.args[0]
+            for call in log_mock.info.call_args_list
+        ))
+
+    def test_rsi_posts_only_selected_features_in_colab_api_schema(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        sent_payload = {}
+        records = [
+            {"features": [0.1] * 10, "label": 0, "packet_bytes": b"never-send"},
+            {"features": [0.9] * 10, "label": 1},
+        ]
+        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi"}), \
+           mock.patch.object(
+              module.requests,
+              "post",
+              side_effect=lambda *args, **kwargs: (sent_payload.update(kwargs["json"]) or response),
+           ) as post:
+            worker, completion, result = module._start_colab_rsi_request(
+                model, ".", wait_for_result=True, records=records, token="config-token",
+            )
+
+        self.assertTrue(completion.is_set())
+        self.assertTrue(result["sent"])
+        self.assertEqual(module._RSI_CONNECTION_STATUS, "Connected")
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        post.assert_called_once()
+        self.assertEqual(sent_payload["task"], "recursive_self_improvement")
+        self.assertEqual(set(sent_payload), {"task", "curated_data", "training", "submitted_at"})
+        self.assertEqual(set(sent_payload["curated_data"]), {"records", "contents_uploaded"})
+        self.assertEqual(sent_payload["curated_data"]["records"], [
+            {"features": [0.1] * 10, "label": 0},
+            {"features": [0.9] * 10, "label": 1},
+        ])
+        self.assertEqual(sent_payload["training"]["epochs"], 1)
+        self.assertTrue(sent_payload["curated_data"]["contents_uploaded"])
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer config-token")
+        self.assertEqual(post.call_args.kwargs["timeout"], (60, 300))
+        self.assertNotIn("never-send", str(sent_payload))
+        response.close.assert_called_once()
+
+    def test_rsi_refuses_to_send_single_class_feedback(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        records = [{"features": [0.1] * 10, "label": 0}]
+        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi"}), \
+             mock.patch.object(module.requests, "post") as post, \
+             mock.patch.object(module, "log") as log_mock:
+            worker, completion, result = module._start_colab_rsi_request(
+                model, ".", wait_for_result=True, records=records,
+            )
+
+        self.assertIsNone(worker)
+        self.assertTrue(completion.is_set())
+        self.assertTrue(result["rejected"])
+        post.assert_not_called()
+        log_mock.warning.assert_called_once()
+
+    def test_rsi_connection_failure_returns_local_fallback(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        records = [
+            {"features": [0.1] * 10, "label": 0},
+            {"features": [0.9] * 10, "label": 1},
+        ]
+        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi"}), \
+             mock.patch.object(module.requests, "post", side_effect=module.requests.ConnectionError("offline")), \
+             mock.patch.object(module, "log") as log_mock:
+            worker, completion, result = module._start_colab_rsi_request(
+                model, ".", wait_for_result=True, records=records,
+            )
+            worker.join(timeout=1)
+
+        self.assertTrue(completion.is_set())
+        self.assertFalse(result["sent"])
+        self.assertEqual(module._RSI_CONNECTION_STATUS, "Failed")
+        self.assertTrue(any("ローカル軽量処理を継続します" in call.args[0] for call in log_mock.error.call_args_list))
+
+    def test_rsi_validation_uses_local_data_without_drive_fetch(self):
+        record = {"features": [0.1] * 10}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            curated_dir = pathlib.Path(temp_dir) / "curated"
+            curated_dir.mkdir()
+            (curated_dir / "curated_data.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+            feedback_path = curated_dir / "reviewed_feedback.jsonl"
+            feedback_path.write_text("\n".join([
+                json.dumps({"features": [0.2] * 10, "label": 0}),
+                json.dumps({"features": [0.8] * 10, "label": 1}),
+            ]) + "\n", encoding="utf-8")
+            with mock.patch.object(module, "download_from_gdrive_folder") as download, \
+                 mock.patch.object(module, "train_local_whitelist") as train:
+                result = module._run_lightweight_training_validation(
+                    temp_dir,
+                    "folder-id",
+                    max_samples=3,
+                    model=module.LightweightMultiTaskAI(input_dim=10),
+                    fetch_drive=False,
+                )
+
+        self.assertEqual(result, 0)
+        download.assert_not_called()
+        self.assertEqual(train.call_count, 2)
+        self.assertEqual(train.call_args_list[1].args[2][0]["label"], 0)
+        self.assertEqual(train.call_args_list[1].args[2][1]["label"], 1)
+
+    def test_training_queue_is_bounded(self):
+        self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
+        self.assertGreater(module._train_queue.maxsize, 0)
+
+    def test_local_training_persists_and_restores_only_head_b(self):
+        torch = module.torch
+        with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
+             mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
+            model = module.LightweightMultiTaskAI(input_dim=10)
+            original_shared = model.shared_layer[0].weight.detach().clone()
+            original_head_b = model.head_b[0].weight.detach().clone()
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+            module.train_local_whitelist(
+                model,
+                optimizer,
+                [{"features": [0.2] * 10}, {"features": [0.8] * 10}],
+                checkpoint_path=checkpoint_path,
+            )
+
+            self.assertTrue(pathlib.Path(checkpoint_path).is_file())
+            self.assertTrue(pathlib.Path(checkpoint_path + ".sha256").is_file())
+            self.assertFalse(torch.equal(model.head_b[0].weight, original_head_b))
+
+            restored_model = module.LightweightMultiTaskAI(input_dim=10)
+            baseline_shared = restored_model.shared_layer[0].weight.detach().clone()
+            self.assertTrue(module._load_local_adaptation(restored_model, checkpoint_path))
+            torch.testing.assert_close(restored_model.head_b[0].weight, model.head_b[0].weight)
+            torch.testing.assert_close(restored_model.head_b[0].bias, model.head_b[0].bias)
+            torch.testing.assert_close(restored_model.shared_layer[0].weight, baseline_shared)
+            torch.testing.assert_close(model.shared_layer[0].weight, original_shared)
+
+    def test_local_feedback_checkpoint_marks_both_reviewed_classes(self):
+        with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
+             mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
+            model = module.LightweightMultiTaskAI(input_dim=10)
+            optimizer = module.torch.optim.SGD(model.parameters(), lr=0.01)
+            module.train_local_whitelist(model, optimizer, [
+                {"features": [0.2] * 10, "label": 0},
+                {"features": [0.8] * 10, "label": 1},
+            ], checkpoint_path=checkpoint_path)
+
+            restored_model = module.LightweightMultiTaskAI(input_dim=10)
+            self.assertTrue(module._load_local_adaptation(restored_model, checkpoint_path))
+            self.assertTrue(module._HEAD_B_REVIEWED)
+            self.assertEqual(module._HEAD_B_REVIEWED_LABELS, {0, 1})
+
+    def test_training_enqueue_retries_when_queue_is_full(self):
+        original_queue = module._train_queue
+        full_queue = mock.Mock()
+        full_queue.put.side_effect = [queue.Full, None]
+        try:
+            module._train_queue = full_queue
+            self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
+            self.assertEqual(full_queue.put.call_count, 2)
+        finally:
+            module._train_queue = original_queue
+
+    def test_monitor_candidates_never_enqueue_training_batches(self):
+        candidates = []
+        duplicate_features = [0.5] * 10
+        with mock.patch.object(module, "_enqueue_training_batch") as enqueue, \
+             mock.patch.object(module, "_append_selected_feature_records") as persist:
+            for _ in range(100):
+                module._buffer_monitor_candidate(candidates, duplicate_features, 0.8)
+
+        self.assertEqual(len(candidates), 100)
+        self.assertTrue(all(item["features"] == duplicate_features for item in candidates))
+        enqueue.assert_not_called()
+        persist.assert_not_called()
+
+    def test_curate_and_save_streams_training_batches(self):
+        class Score:
+            def __init__(self, value):
+                self.value = value
+            def item(self):
+                return self.value
+
+        class DummyModel:
+            def eval(self):
+                pass
+            def __call__(self, features):
+                return Score(0.5), Score(0.7), Score(0.1)
+
+        raw_records = [{"features": [float(index)] * 10} for index in range(205)]
+        received_batches = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            curated_path = module.curate_and_save(
+                DummyModel(),
+                (raw_records[index:index + 37] for index in range(0, len(raw_records), 37)),
+                temp_dir,
+                batch_callback=lambda batch: received_batches.append(list(batch)),
+                batch_size=100,
+            )
+            with open(curated_path, encoding="utf-8") as handle:
+                saved_count = sum(1 for _ in handle)
+
+        self.assertEqual([len(batch) for batch in received_batches], [100, 100, 5])
+        self.assertEqual(saved_count, 205)
+
+    def test_memory_manager_skips_disk_eviction_without_aesgcm(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "AESGCM", None):
+            manager = module.MemoryManager(max_memory_mb=1, swap_dir=temp_dir)
+            try:
+                self.assertEqual(manager.evict_buffer([{"secret": "value"}]), 0)
+                self.assertEqual(manager._offset, 0)
+            finally:
+                manager.cleanup()
+
+    def test_memory_manager_falls_back_when_swap_dir_is_not_writable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            real_mkstemp = tempfile.mkstemp
+
+            def mkstemp_with_permission_error(*args, **kwargs):
+                if kwargs.get("dir") == temp_dir:
+                    raise PermissionError("swap directory is not writable")
+                return real_mkstemp(*args, **kwargs)
+
+            with mock.patch.object(module.tempfile, "mkstemp", side_effect=mkstemp_with_permission_error):
+                manager = module.MemoryManager(max_memory_mb=1, swap_dir=temp_dir)
+            try:
+                self.assertNotEqual(os.path.dirname(manager._swap_path), temp_dir)
+                self.assertTrue(os.path.exists(manager._swap_path))
+            finally:
+                manager.cleanup()
+
     def test_select_monitor_interface_prefers_wg0(self):
         self.assertEqual(module.select_monitor_interface(["eth0", "wg0"]), "wg0")
         self.assertEqual(module.select_monitor_interface(["eth0", "wlan0"]), "eth0")
@@ -90,10 +821,13 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         class DummySocket:
             def __init__(self):
                 self.calls = 0
+                self.closed = False
             def settimeout(self, timeout):
                 pass
             def bind(self, *args, **kwargs):
                 return None
+            def close(self):
+                self.closed = True
             def recvfrom(self, *args, **kwargs):
                 self.calls += 1
                 if self.calls == 1:
@@ -125,6 +859,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 return 0.25
 
         q = queue.Queue(maxsize=10)
+        dummy_socket = DummySocket()
         original_queue = module._packet_queue
         original_last_pkt_time = module._last_pkt_time
         original_ema_delta = module._ema_delta
@@ -132,54 +867,389 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             module._packet_queue = q
             module._last_pkt_time = 100.0
             module._ema_delta = 0.1
-            with mock.patch.object(module.socket, "socket", return_value=DummySocket()), \
+            with mock.patch.object(module.socket, "socket", return_value=dummy_socket), \
                  mock.patch.object(module, "handle_packet_event"), \
                  mock.patch.object(module.time, "time", side_effect=[100.2, 100.2]):
                 module._packet_capture_worker("eth0", DummyMemMgr(), True)
             feat, _ = q.get_nowait()
             self.assertAlmostEqual(feat[1], 0.11, places=5)
+            self.assertTrue(dummy_socket.closed)
         finally:
             module._packet_queue = original_queue
             module._last_pkt_time = original_last_pkt_time
             module._ema_delta = original_ema_delta
 
-    def test_maintenance_mode_forces_dry_run_on_threat_state(self):
+    def test_non_linux_capture_uses_simulation_without_opening_raw_socket(self):
+        class StopAfterOnePacket:
+            def __init__(self):
+                self.waits = 0
+
+            def is_set(self):
+                return self.waits > 0
+
+            def wait(self, timeout):
+                self.waits += 1
+                return False
+
+        class DummyMemMgr:
+            @staticmethod
+            def get_usage_ratio():
+                return 0.25
+
+        capture_queue = queue.Queue(maxsize=4)
+        original_queue = module._packet_queue
+        try:
+            module._packet_queue = capture_queue
+            with mock.patch.object(module.platform, "system", return_value="Darwin"), \
+                 mock.patch.object(module.socket, "socket", side_effect=AssertionError("raw socket must not be opened")), \
+                 mock.patch.object(module, "analyze_dpi_payload", return_value={"suspicious": False}) as analyze, \
+                 mock.patch.object(module, "handle_packet_event") as handle_event:
+                module._packet_capture_worker("en0", DummyMemMgr(), False, StopAfterOnePacket())
+
+            item = capture_queue.get_nowait()
+            self.assertEqual(item.packet_bytes[12:14], struct.pack("!H", 0x0806))
+            self.assertEqual(len(item.feature_vector), 10)
+            self.assertEqual(item.feature_vector[9], 0.25)
+            self.assertEqual(analyze.call_count, 1)
+            self.assertTrue(handle_event.call_args.args[2])
+        finally:
+            module._packet_queue = original_queue
+
+    def test_behavioral_score_uses_encrypted_traffic_histories_without_zero_division(self):
+        originals = (
+            list(module._TRAFFIC_ACTIVITY_HISTORY),
+            list(module._PACKET_LENGTH_HISTORY),
+            list(module._PACKET_INTERARRIVAL_HISTORY),
+        )
+        try:
+            module._TRAFFIC_ACTIVITY_HISTORY.clear()
+            module._TRAFFIC_ACTIVITY_HISTORY.extend([128] * 16)
+            module._PACKET_LENGTH_HISTORY.clear()
+            module._PACKET_LENGTH_HISTORY.extend([128] * 16)
+            module._PACKET_INTERARRIVAL_HISTORY.clear()
+            module._PACKET_INTERARRIVAL_HISTORY.extend([0.5] * 8)
+
+            score = module._compute_behavioral_signature_score(
+                b"\x00" * 128,
+                {"dst_port": 443},
+                {"protocols": ["TLS/SSL"]},
+            )
+
+            self.assertGreaterEqual(score, 0.35)
+        finally:
+            for history, values in zip(
+                (module._TRAFFIC_ACTIVITY_HISTORY, module._PACKET_LENGTH_HISTORY, module._PACKET_INTERARRIVAL_HISTORY),
+                originals,
+            ):
+                history.clear()
+                history.extend(values)
+
+    def test_composite_anomaly_score_weights_behavioral_metadata_highest(self):
+        score = module._compute_composite_anomaly_score(
+            rule_score=0.4,
+            ai_score=0.4,
+            math_score=0.4,
+            unknown_score=0.4,
+            behavior_score=0.8,
+        )
+
+        self.assertAlmostEqual(score, 0.62)
+
+    def test_maintenance_mode_skips_threat_trigger_and_kill_switch_log(self):
         original_maintenance = module._MAINTENANCE_ACTIVE
         original_triggered = module._KILL_SWITCH_TRIGGERED
         original_last_trigger = module._LAST_KILL_SWITCH_TRIGGER
         original_counter = module._anomaly_counter
+        original_learning_alert_time = module._LAST_LEARNING_ALERT_TIME
         try:
             module._MAINTENANCE_ACTIVE = True
             module._KILL_SWITCH_TRIGGERED = False
             module._LAST_KILL_SWITCH_TRIGGER = 0.0
             module._anomaly_counter = 0
-            with mock.patch.object(module, "execute_kill_switch") as kill_switch:
-                module.evaluate_threat_state("eth0", dry_run=False, score_a=0.99, backdoor_detected=True)
-                kill_switch.assert_called_once_with("eth0", True)
+            module._LAST_LEARNING_ALERT_TIME = 0.0
+            with mock.patch.object(module, "execute_kill_switch") as kill_switch, \
+                 mock.patch.object(module, "log") as log_mock, \
+                 mock.patch.object(module.time, "monotonic", return_value=100.0):
+                self.assertFalse(module.evaluate_threat_state("eth0", dry_run=False, score_a=0.99, backdoor_detected=True))
+                kill_switch.assert_not_called()
+                log_mock.critical.assert_not_called()
+                log_mock.warning.assert_called_once()
+                self.assertEqual(module._anomaly_counter, 0)
         finally:
             module._MAINTENANCE_ACTIVE = original_maintenance
             module._KILL_SWITCH_TRIGGERED = original_triggered
             module._LAST_KILL_SWITCH_TRIGGER = original_last_trigger
             module._anomaly_counter = original_counter
+            module._LAST_LEARNING_ALERT_TIME = original_learning_alert_time
+
+    def test_rsi_learning_mode_does_not_promote_backdoor_findings(self):
+        original_rsi = module._RSI_MODE_ACTIVE
+        original_risk = module._BACKDOOR_RISK_SCORE
+        original_learning_alert_time = module._LAST_LEARNING_ALERT_TIME
+        try:
+            module._RSI_MODE_ACTIVE = True
+            module._BACKDOOR_RISK_SCORE = 0.0
+            module._LAST_LEARNING_ALERT_TIME = 0.0
+            finding = {
+                    "type": "external_connection",
+                    "pid": 1,
+                    "name": "code",
+                    "remote": "127.0.0.1:9222",
+                }
+            with mock.patch.object(module, "evaluate_threat_state") as evaluate, \
+                 mock.patch.object(module, "log") as log_mock, \
+                 mock.patch.object(module.time, "monotonic", return_value=100.0):
+                boost = module.apply_backdoor_findings([finding])
+                module.apply_backdoor_findings([finding])
+            self.assertEqual(boost, 0.0)
+            self.assertEqual(module._BACKDOOR_RISK_SCORE, 0.0)
+            evaluate.assert_not_called()
+            log_mock.warning.assert_called_once()
+        finally:
+            module._RSI_MODE_ACTIVE = original_rsi
+            module._BACKDOOR_RISK_SCORE = original_risk
+            module._LAST_LEARNING_ALERT_TIME = original_learning_alert_time
+
+    def test_self_protection_signal_requests_graceful_shutdown(self):
+        handlers = {}
+        with mock.patch.object(
+            module._signal_module,
+            "signal",
+            side_effect=lambda signum, handler: handlers.setdefault(signum, handler),
+        ):
+            module._install_self_protection_handlers()
+
+        with mock.patch.object(module, "evaluate_threat_state") as evaluate:
+            with self.assertRaises(KeyboardInterrupt):
+                handlers[module._signal_module.SIGINT](module._signal_module.SIGINT, None)
+
+        evaluate.assert_not_called()
+
+    def test_privileged_agent_survives_monitor_thread_start_failure(self):
+        packet_thread = mock.Mock()
+        monitor_thread = mock.Mock()
+        monitor_thread.start.side_effect = RuntimeError("can't start new thread")
+        manager = mock.Mock()
+        stop_event = mock.Mock()
+        stop_event.wait.side_effect = KeyboardInterrupt
+        with (
+            mock.patch.object(module._signal_module, "signal"),
+            mock.patch.object(module.platform, "system", return_value="Linux"),
+            mock.patch.object(module, "_drop_to_user"),
+            mock.patch.object(module, "_PRIVILEGED_STOP_EVENT", stop_event),
+            mock.patch.object(module, "MemoryManager", return_value=manager) as memory_manager_class,
+            mock.patch.object(module.threading, "Thread", side_effect=[packet_thread, monitor_thread]),
+            mock.patch.object(module, "log") as log_mock,
+        ):
+            module._privileged_agent_main("eth0", 128, "/tmp", True)
+
+        packet_thread.start.assert_called_once()
+        monitor_thread.start.assert_called_once()
+        manager.cleanup.assert_called_once()
+        swap_dir = memory_manager_class.call_args.kwargs["swap_dir"]
+        self.assertTrue(swap_dir.startswith(tempfile.gettempdir()))
+        self.assertFalse(os.path.exists(swap_dir))
+        self.assertTrue(any("監視スレッドを開始できません" in str(call) for call in log_mock.warning.call_args_list))
+
+    def test_privileged_agent_shutdown_is_cooperative(self):
+        stop_event = mock.Mock()
+        command_queue = mock.Mock()
+        command_process = mock.Mock()
+        capture_process = mock.Mock()
+        command_process.is_alive.return_value = False
+        capture_process.is_alive.return_value = False
+        with mock.patch.object(module, "_PRIVILEGED_STOP_EVENT", stop_event, create=True), \
+             mock.patch.object(module, "_command_queue", command_queue), \
+             mock.patch.object(module, "_PRIVILEGED_COMMAND_PROCESS", command_process), \
+             mock.patch.object(module, "_PRIVILEGED_CAPTURE_PROCESS", capture_process), \
+             mock.patch.object(module, "_PRIVILEGED_AGENT_ACTIVE", True):
+            module._shutdown_privileged_agent()
+
+        stop_event.set.assert_called_once_with()
+        command_queue.put.assert_called_once_with(None)
+        command_process.join.assert_called_once()
+        capture_process.join.assert_called_once()
+        command_process.terminate.assert_not_called()
+        capture_process.terminate.assert_not_called()
+
+    def test_privileged_shutdown_swallows_permission_errors(self):
+        stop_event = mock.Mock()
+        command_queue = mock.Mock()
+        command_process = mock.Mock()
+        capture_process = mock.Mock()
+        command_process.join.side_effect = PermissionError("operation not permitted")
+        capture_process.join.side_effect = PermissionError("operation not permitted")
+        command_process.is_alive.return_value = False
+        capture_process.is_alive.return_value = False
+        with mock.patch.object(module, "_PRIVILEGED_STOP_EVENT", stop_event), \
+             mock.patch.object(module, "_command_queue", command_queue), \
+             mock.patch.object(module, "_PRIVILEGED_COMMAND_PROCESS", command_process), \
+             mock.patch.object(module, "_PRIVILEGED_CAPTURE_PROCESS", capture_process), \
+             mock.patch.object(module, "_PRIVILEGED_AGENT_ACTIVE", True):
+            module._shutdown_privileged_agent()
+
+        stop_event.set.assert_called_once_with()
+        command_process.join.assert_called_once_with(timeout=15.0)
+        capture_process.join.assert_called_once_with(timeout=15.0)
+        command_process.terminate.assert_not_called()
+        capture_process.terminate.assert_not_called()
+
+    def test_privileged_process_terminate_guard_swallows_permission_error(self):
+        process = mock.Mock()
+        original_terminate = process._popen.terminate
+        original_terminate.side_effect = PermissionError("operation not permitted")
+
+        module._guard_process_terminate_permission(process)
+
+        process._popen.terminate()
+        original_terminate.assert_called_once_with()
+
+    def test_privileged_command_worker_exits_when_stop_event_is_set(self):
+        stop_event = mock.Mock()
+        stop_event.is_set.side_effect = [False, True]
+        command_queue = mock.Mock()
+        command_queue.get.side_effect = module.queue.Empty
+        with mock.patch.object(module, "_PRIVILEGED_STOP_EVENT", stop_event), \
+             mock.patch.object(module, "_command_queue", command_queue), \
+             mock.patch.object(module._signal_module, "signal"), \
+             mock.patch.object(module, "log"):
+            module._privileged_command_process_main(stop_event)
+
+        command_queue.get.assert_called_once_with(timeout=0.25)
+
+    def test_packet_inspection_log_uses_private_appendable_permissions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "packet_logs", "inspection.log")
+            result = {
+                "suspicious": True,
+                "findings": [],
+                "attack_signatures": [],
+                "protocols": [],
+                "entropy": 0.0,
+            }
+            module.log_full_packet_inspection(b"first", "lo", result, "test", "one", log_path)
+            module.log_full_packet_inspection(b"second", "lo", result, "test", "two", log_path)
+
+            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(os.path.dirname(log_path)).st_mode & 0o777, 0o700)
+            with open(log_path, encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle]
+            self.assertEqual([record["reason"] for record in records], ["one", "two"])
+
+    def test_packet_inspection_log_preparation_assigns_drop_target(self):
+        target = mock.Mock(pw_uid=1234, pw_gid=2345, pw_name="workspace-user")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "ai_data", "packet_logs", "inspection.log")
+            with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path), \
+                 mock.patch.object(module.os, "geteuid", return_value=0), \
+                  mock.patch.dict(module.os.environ, {"SUDO_UID": "1234"}, clear=False), \
+                 mock.patch.object(module.pwd, "getpwuid", return_value=target), \
+                 mock.patch.object(module.os, "chown") as chown, \
+                 mock.patch.object(module.os, "fchown") as fchown, \
+                 mock.patch.object(module.os, "chmod") as chmod:
+                module._prepare_packet_inspection_log()
+
+            chown.assert_called_once_with(
+                os.path.join(temp_dir, "ai_data", "packet_logs"),
+                1234,
+                2345,
+                follow_symlinks=False,
+            )
+            fchown.assert_called_once_with(mock.ANY, 1234, 2345)
+            chmod.assert_called_once_with(os.path.join(temp_dir, "ai_data", "packet_logs"), 0o700)
+            module._close_packet_inspection_log()
+
+    def test_prepared_packet_log_fd_survives_directory_permission_drop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "packet_logs", "inspection.log")
+            directory = os.path.dirname(log_path)
+            result = {
+                "suspicious": True,
+                "findings": [],
+                "attack_signatures": [],
+                "protocols": [],
+                "entropy": 0.0,
+            }
+            with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path):
+                module._prepare_packet_inspection_log()
+                try:
+                    os.chmod(directory, 0)
+                    module.log_full_packet_inspection(b"packet", "lo", result, "test", "fd-write")
+                finally:
+                    os.chmod(directory, 0o700)
+                    module._close_packet_inspection_log()
+
+            with open(log_path, encoding="utf-8") as handle:
+                record = json.loads(handle.readline())
+            self.assertEqual(record["reason"], "fd-write")
+
+    def test_privileged_command_worker_resets_inherited_signal_handlers(self):
+        with mock.patch.object(module, "_command_queue") as command_queue, \
+             mock.patch.object(module._signal_module, "signal") as signal_mock, \
+             mock.patch.object(module, "log"):
+            command_queue.get.return_value = None
+            module._privileged_command_process_main()
+
+        signal_mock.assert_has_calls([
+            mock.call(module._signal_module.SIGINT, module._signal_module.SIG_IGN),
+            mock.call(module._signal_module.SIGTERM, module._signal_module.SIG_DFL),
+        ])
 
     def test_load_cloud_model_uses_cpu_map_location(self):
-        class DummyModel:
-            def __init__(self):
-                self.loaded_state = None
-            def load_state_dict(self, state_dict):
-                self.loaded_state = state_dict
-
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        valid_state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
         with mock.patch.object(module.os.path, "exists", return_value=True), \
-             mock.patch.object(module.torch, "load", return_value={"weights": [1, 2, 3]}) as load_mock, \
+             mock.patch.object(module.torch, "load", return_value=valid_state_dict) as load_mock, \
              mock.patch.object(module, "log") as log_mock, \
              mock.patch.dict(module.os.environ, {"AIRGAP_MODEL_HASH": "deadbeef"}, clear=False), \
              mock.patch.object(module, "_verify_model_hash", return_value=True):
-            model = DummyModel()
             self.assertTrue(module.load_cloud_model(model, "/tmp/cloud_base_model.pth"))
             self.assertEqual(load_mock.call_args.kwargs["map_location"], module.torch.device("cpu"))
             self.assertTrue(load_mock.call_args.kwargs.get("weights_only", False))
-            self.assertEqual(model.loaded_state, {"weights": [1, 2, 3]})
             self.assertTrue(log_mock.info.called or log_mock.warning.called)
+
+    def test_load_cloud_model_migrates_legacy_checkpoint_without_changing_outputs(self):
+        if module.torch is None:
+            self.skipTest("PyTorch is not installed")
+
+        torch = module.torch
+        legacy_state = {
+            "shared_layer.0.weight": torch.randn(32, 10),
+            "shared_layer.0.bias": torch.randn(32),
+            "shared_layer.2.weight": torch.randn(16, 32),
+            "shared_layer.2.bias": torch.randn(16),
+            "head_a.0.weight": torch.randn(1, 16),
+            "head_a.0.bias": torch.randn(1),
+            "head_b.0.weight": torch.randn(1, 16),
+            "head_b.0.bias": torch.randn(1),
+            "head_c.0.weight": torch.randn(1, 16),
+            "head_c.0.bias": torch.randn(1),
+        }
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        with mock.patch.object(module.os.path, "exists", return_value=True), \
+             mock.patch.object(module.torch, "load", return_value=legacy_state), \
+             mock.patch.object(module, "_verify_model_hash", return_value=True), \
+             mock.patch.dict(module.os.environ, {"AIRGAP_MODEL_HASH": "legacy-checkpoint"}, clear=False):
+            self.assertTrue(module.load_cloud_model(model, "/tmp/legacy_model.pth"))
+
+        inputs = torch.rand(8, 10)
+        functional = torch.nn.functional
+        with torch.no_grad():
+            legacy_shared = functional.relu(functional.linear(
+                inputs, legacy_state["shared_layer.0.weight"], legacy_state["shared_layer.0.bias"],
+            ))
+            legacy_shared = functional.relu(functional.linear(
+                legacy_shared, legacy_state["shared_layer.2.weight"], legacy_state["shared_layer.2.bias"],
+            ))
+            expected_outputs = (
+                torch.sigmoid(functional.linear(legacy_shared, legacy_state["head_a.0.weight"], legacy_state["head_a.0.bias"])),
+                torch.sigmoid(functional.linear(legacy_shared, legacy_state["head_b.0.weight"], legacy_state["head_b.0.bias"])),
+                torch.sigmoid(functional.linear(legacy_shared, legacy_state["head_c.0.weight"], legacy_state["head_c.0.bias"])),
+            )
+            actual_outputs = model(inputs)
+
+        for expected_output, actual_output in zip(expected_outputs, actual_outputs):
+            torch.testing.assert_close(actual_output, expected_output)
 
     def test_load_cloud_model_rejects_mismatched_hash(self):
         class DummyModel:
@@ -198,6 +1268,18 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 load_mock.assert_not_called()
         finally:
             pathlib.Path(temp_path).unlink(missing_ok=True)
+
+    def test_load_cloud_model_can_skip_hash_check_for_development(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        valid_state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        with mock.patch.object(module.os.path, "exists", return_value=True), \
+             mock.patch.object(module.torch, "load", return_value=valid_state_dict), \
+             mock.patch.object(module, "_verify_model_hash") as verify_hash, \
+             mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertTrue(module.load_cloud_model(
+                model, "/tmp/cloud_base_model.pth", ignore_model_hash=True,
+            ))
+        verify_hash.assert_not_called()
 
     def test_run_command_with_sudo_dispatches_to_privileged_worker_on_non_root(self):
         with mock.patch.object(module.os, "geteuid", return_value=1000), \
@@ -277,11 +1359,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
              mock.patch("shutil.which", return_value="/usr/bin/mocked_path"):
             module._KILL_SWITCH_TRIGGERED = False
             module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0"])
-            self.assertGreaterEqual(run_cmd.call_count, 6)
+            self.assertEqual(run_cmd.call_count, 3)
 
             executed_commands = [call.args[0] for call in run_cmd.call_args_list]
-            self.assertIn(["ip", "route", "replace", "default", "unreachable"], executed_commands)
-            self.assertIn(["ip", "route", "add", "default", "unreachable"], executed_commands)
+            self.assertEqual(executed_commands, [
+                ["iptables", "-I", "INPUT", "-j", "DROP"],
+                ["iptables", "-I", "OUTPUT", "-j", "DROP"],
+                ["iptables", "-I", "FORWARD", "-j", "DROP"],
+            ])
 
     def test_build_containment_plan_preserves_management_sessions(self):
         plan = module.build_containment_plan(
@@ -336,6 +1421,32 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         result = module.boot_time_auto_hardening(profile)
         self.assertIn("missing_root", result["failures"])
 
+    def test_kernel_hardening_keeps_linux_overcommit_heuristic_for_fork(self):
+        report = {"applied": [], "failures": []}
+        with mock.patch.object(module.os.path, "exists", return_value=True), \
+             mock.patch.object(module, "_write_sysctl_value", return_value=True) as write_value:
+            module._apply_kernel_hardening({}, report)
+
+        write_value.assert_any_call("/proc/sys/vm/overcommit_memory", "0")
+
+    def test_privileged_agent_start_failure_cleans_up_command_worker(self):
+        command_process = mock.Mock(pid=123)
+        capture_process = mock.Mock(pid=None)
+        capture_process.start.side_effect = OSError(12, "Cannot allocate memory")
+        with mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module.os, "geteuid", return_value=0), \
+               mock.patch.object(module.multiprocessing, "Process", side_effect=[command_process, capture_process]) as process_factory:
+            module._PRIVILEGED_AGENT_ACTIVE = False
+            result = module._ensure_privileged_agent("eth0", 512, "/tmp", True)
+
+        self.assertIsNone(result)
+        self.assertTrue(all(not call.kwargs.get("daemon", False) for call in process_factory.call_args_list))
+        command_process.terminate.assert_called_once()
+        command_process.join.assert_called_once_with(timeout=1)
+        self.assertIsNone(module._PRIVILEGED_COMMAND_PROCESS)
+        self.assertIsNone(module._PRIVILEGED_CAPTURE_PROCESS)
+        self.assertFalse(module._PRIVILEGED_AGENT_ACTIVE)
+
     def test_generate_optimal_kill_payload_includes_nft_flush_when_available(self):
         profile = {
             "os": {"system": "Linux"},
@@ -345,7 +1456,12 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             "network_layers": ["physical"],
         }
         payload = module.generate_optimal_kill_payload(profile, learning_data=["vpn"])
-        self.assertTrue(any(cmd[:2] == ["nft", "flush"] for cmd in payload["commands"]))
+        self.assertFalse(any(cmd[:2] == ["nft", "flush"] for cmd in payload["commands"]))
+        self.assertTrue(any(
+            cmd[:2] == ["nft", "flush"]
+            for fallback in payload["fallback_payloads"]
+            for cmd in fallback["commands"]
+        ))
 
     def test_memory_manager_check_considers_head_c_score(self):
         temp_swap_dir = "./test_swap"
@@ -356,6 +1472,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 ratio = mgr.check(head_c_score=0.9)
                 self.assertTrue(mgr.is_critical)
                 self.assertGreater(ratio, 1.0)
+                mgr.check(head_c_score=[0.1, 0.9])
+                self.assertTrue(mgr.is_critical)
         finally:
             mgr.cleanup()
             if os.path.exists(temp_swap_dir):
@@ -519,6 +1637,20 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertTrue(result["block"])
         self.assertEqual(result["stage"], "dpi")
 
+    def test_untrained_model_keeps_independent_packet_risk_score(self):
+        packet = self._build_ipv4_tcp_packet("1.1.1.1", "2.2.2.2", 443)
+        dpi_result = {"suspicious": False, "score": 0.0, "findings": [], "protocols": []}
+
+        pipeline = module.inspect_packet_pipeline(
+            packet, "eth0", model=None, feature_vector=None, dpi_result=dpi_result,
+        )
+        effective_score = module._combine_threat_scores(0.0, pipeline["score"])
+
+        self.assertFalse(pipeline["block"])
+        self.assertGreater(pipeline["score"], 0.0)
+        self.assertEqual(effective_score, pipeline["score"])
+        self.assertEqual(module._combine_threat_scores(float("nan"), float("inf")), 0.0)
+
     def test_memory_manager_circular_buffer(self):
         temp_swap_dir = "./test_swap"
         mgr = module.MemoryManager(max_memory_mb=10, swap_dir=temp_swap_dir)
@@ -532,7 +1664,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             mgr._offset = len(mgr._mmap) - 5
             count2 = mgr.evict_buffer(data)
             self.assertEqual(count2, 1)
-            self.assertEqual(mgr._offset, len((json.dumps(data) + "\n").encode()))
+            plaintext_size = len((json.dumps(data) + "\n").encode())
+            encrypted_record_overhead = 4 + mgr._nonce_size + 16
+            self.assertEqual(mgr._offset, plaintext_size + encrypted_record_overhead)
         finally:
             mgr.cleanup()
             if os.path.exists(temp_swap_dir):
