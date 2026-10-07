@@ -39,6 +39,11 @@ from typing import Any, Iterable, cast
 from urllib.parse import urlparse
 
 try:
+    import mk1_secure_transport
+except ImportError:
+    mk1_secure_transport = None
+
+try:
     import pwd
 except ImportError:  # pragma: no cover - platform-agnostic fallback
     pwd = None
@@ -523,6 +528,8 @@ _FULL_PACKET_INSPECTION_LOG_LOCK = threading.Lock()
 _MAINTENANCE_ACTIVE = False
 _MAINTENANCE_REASON = ""
 _MAINTENANCE_LOCK = threading.Lock()
+_PANEL_PARENT_PID = 0
+_PANEL_FULL_ISOLATION = False
 _RSI_MODE_ACTIVE = False
 _RSI_CONNECTION_STATUS = "Not configured"
 _MODEL_SYNC_STATUS = "Disabled"
@@ -3527,7 +3534,7 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
     fallback_payloads = payload.get("fallback_payloads", [])
     profile = payload.get("profile", {})
 
-    log.critical("[DYNAMIC_EXECUTION] 環境特化型遮断ロジックを JIT 的に実行します。")
+    log.info("[DYNAMIC_EXECUTION] 遮断処理を実行します。")
     if dry_run:
         for cmd in commands:
             log.critical(f"    - 予定: {' '.join(cmd)}")
@@ -3535,7 +3542,7 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
 
     success_count = 0
     for cmd in commands:
-        log.critical(f"    - 実行: {' '.join(cmd)}")
+        log.info(f"    - 実行: {' '.join(cmd)}")
         if _run_command_with_sudo(cmd, dry_run=False):
             success_count += 1
             log.critical("    → 遮断コマンド成功")
@@ -4316,6 +4323,13 @@ def download_from_gdrive_folder(folder_id: str, dest_dir: str) -> list:
     if not folder_id:
         log.info("[Google Drive] フォルダID未指定のため取得をスキップします。")
         return []
+    if mk1_secure_transport is None:
+        raise RuntimeError("Secure transport dependencies are required for Google Drive access")
+    try:
+        mk1_secure_transport.require_wireguard_full_tunnel()
+    except mk1_secure_transport.SecureTransportError as exc:
+        log.error("[Google Drive] WireGuard full-tunnelを確認できず、取得を拒否しました (%s)", exc)
+        raise
     if not GDOWN_AVAILABLE or requests is None:
         log.warning("[Google Drive] gdown または requests がないため取得をスキップします。")
         return []
@@ -5162,7 +5176,7 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
         if should_trigger:
             if effective_dry_run:
                 log.warning("[MAINTENANCE] メンテナンス状態のため、遮断処理は Dry-Run として扱います。")
-            log.critical(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
+            log.info(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
             _KILL_SWITCH_EVENT.set()
             if not _dispatch_privileged_command("kill_switch", interface=interface, dry_run=effective_dry_run):
                 execute_kill_switch(interface, effective_dry_run)
@@ -5499,11 +5513,19 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
 
 def execute_kill_switch(interface: str | None, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
     """
-    異常検知時にOSコマンドでネットワークを物理的に切断します。
+    異常検知時にOSのファイアウォール/ネットワーク機能による隔離を試みます。
     失敗しても次のコマンドを続ける fail-safe 方式です。
     """
     if available_interfaces is None:
         available_interfaces = discover_available_interfaces()
+
+    if _PANEL_FULL_ISOLATION and not dry_run:
+        if _disable_all_network_interfaces(available_interfaces):
+            log.critical("[AIRGAP] 全ネットワークインターフェースの停止を確認しました。")
+            _close_panel_after_airgap()
+        else:
+            log.error("[AIRGAP] 全インターフェースの停止を確認できませんでした。隔離完了とは扱いません。")
+        return
 
     containment_plan = build_containment_plan(
         interface,
@@ -5514,7 +5536,7 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
     profile = profile_environment()
     payload = generate_optimal_kill_payload(profile, learning_data=["bridge", "vpn", "unreachable", "iptables", "dbus"])
 
-    log.critical("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] 隔離プロトコルを起動します。")
+    log.info("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] 隔離処理を実行します。")
     log.info(f"[CONTAINMENT_PLAN] {json.dumps(containment_plan, sort_keys=True)}")
     if dry_run:
         log.critical("    → Dry-Runモードのため実際の遮断はスキップ (安全モード)")
@@ -5531,6 +5553,61 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
                 log.warning(f"\033[1;33m  - sudo ip link set {iface} up\033[0m")
     else:
         log.error("    → すべての遮断コマンドが失敗しました。sudo 権限またはコマンドの有無を確認してください。")
+
+
+def _disable_all_network_interfaces(available_interfaces: list[str] | None = None) -> bool:
+    interfaces = [
+        name for name in (available_interfaces or discover_available_interfaces())
+        if isinstance(name, str) and name and name != "lo"
+    ]
+    if not interfaces:
+        log.error("[AIRGAP] 遮断対象のネットワークインターフェースを確認できません。")
+        return False
+
+    system = platform.system().lower()
+    if system == "linux":
+        commands = [["ip", "link", "set", "dev", name, "down"] for name in interfaces]
+    elif system == "darwin":
+        commands = [["ifconfig", name, "down"] for name in interfaces]
+    elif system == "windows":
+        commands = [
+            ["netsh", "interface", "set", "interface", f'name="{name}"', "admin=disabled"]
+            for name in interfaces
+        ]
+    else:
+        log.error(f"[AIRGAP] 未対応OSでは全NIC遮断を実行できません: {system}")
+        return False
+
+    results = []
+    for interface_name, command in zip(interfaces, commands):
+        if _run_command_with_sudo(command, dry_run=False):
+            results.append(True)
+            log.critical(f"[AIRGAP] ネットワークインターフェースを停止しました: {interface_name}")
+        else:
+            results.append(False)
+            log.error(f"[AIRGAP] NIC停止に失敗しました: {' '.join(command)}")
+    return all(results)
+
+
+def _close_panel_after_airgap() -> None:
+    if _PANEL_PARENT_PID <= 0:
+        return
+    try:
+        ancestors = psutil.Process(os.getpid()).parents()
+    except (
+        AttributeError, OSError,
+        psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess,
+    ) as exc:
+        log.error(f"[PANEL] 隔離後に親画面を確認できません ({exc})")
+        return
+    if not any(process.pid == _PANEL_PARENT_PID for process in ancestors):
+        log.error("[PANEL] 隔離後の画面終了を拒否しました。指定PIDが親プロセスではありません。")
+        return
+    try:
+        os.kill(_PANEL_PARENT_PID, _signal_module.SIGTERM)
+        log.critical("[PANEL] 隔離後の遠隔操作画面を終了しました。復旧は端末の前で行ってください。")
+    except OSError as exc:
+        log.error(f"[PANEL] 隔離後に親画面を終了できません ({exc})")
 
 
 # =====================================================================
@@ -5603,29 +5680,40 @@ def _run_lightweight_training_validation(
         torch.set_num_threads(1)
 
     raw_dir = os.path.join(local_dir, "gdrive_raw")
-    if fetch_drive:
-        download_from_gdrive_folder(drive_id, raw_dir)
-    else:
-        log.info("[検証] RSIモードのため追加のDrive取得を行わず、ローカルデータを使います。")
-    data_files = []
-    if os.path.isdir(raw_dir):
-        for root, dirs, files in os.walk(raw_dir):
-            dirs[:] = [name for name in dirs if not name.startswith(".")]
-            data_files.extend(
-                os.path.join(root, name)
-                for name in files
-                if name.lower().endswith((".json", ".jsonl", ".csv"))
-            )
-
-    if not data_files:
-        curated_path = os.path.join(local_dir, "curated", "curated_data.jsonl")
-        if os.path.isfile(curated_path):
-            data_files = [curated_path]
-            log.info("[検証] 生データがないため既存の curated_data.jsonl を使用します。")
     reviewed_feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
+    curated_path = os.path.join(local_dir, "curated", "curated_data.jsonl")
+
+    def find_raw_data_files() -> list[str]:
+        found = []
+        if os.path.isdir(raw_dir):
+            for root, dirs, files in os.walk(raw_dir):
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                found.extend(
+                    os.path.join(root, name)
+                    for name in files
+                    if name.lower().endswith((".json", ".jsonl", ".csv"))
+                )
+        return found
+
+    data_files = find_raw_data_files()
+    if not data_files and os.path.isfile(curated_path):
+        data_files = [curated_path]
+        log.info("[検証] 生データがないため既存の curated_data.jsonl を使用します。")
+
     training_sources = [(data_files, False)] if data_files else []
     if os.path.isfile(reviewed_feedback_path):
         training_sources.append(([reviewed_feedback_path], True))
+
+    if not training_sources and fetch_drive:
+        download_from_gdrive_folder(drive_id, raw_dir)
+        data_files = find_raw_data_files()
+        if data_files:
+            training_sources.append((data_files, False))
+    elif training_sources and fetch_drive:
+        log.info("[検証] ローカルデータを使用するためGoogle Drive取得をスキップします。")
+    elif not fetch_drive:
+        log.info("[検証] Google Drive取得を行わず、ローカルデータを使用します。")
+
     if not training_sources:
         log.error("[検証] 読み込み可能なJSON/JSONL/CSVデータがありません。")
         return 2
@@ -5816,26 +5904,27 @@ def _cloud_checkpoint_has_reviewed_labels(model_path: str) -> bool:
 
 
 def sync_cloud_model(model_url: str, hash_url: str, model_path: str, token: str = "") -> dict:
-    """HTTPSモデルとSHA-256を検証し、正常なstate_dictのみ原子的に配置する。"""
+    """Fetch pinned ML-KEM/AES-GCM encrypted artifacts and atomically install a valid state_dict."""
     global _MODEL_SYNC_STATUS, _PENDING_CLOUD_STATE, _PENDING_CLOUD_REVIEWED
-    if requests is None:
+    expected_fingerprint = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip().lower()
+    if requests is None or mk1_secure_transport is None:
         _MODEL_SYNC_STATUS = "Unavailable"
-        return {"updated": False, "state_dict": None, "reason": "requests unavailable"}
+        return {"updated": False, "state_dict": None, "reason": "secure transport unavailable"}
+    if not mk1_secure_transport.validate_public_key_pin(expected_fingerprint):
+        _MODEL_SYNC_STATUS = "Rejected"
+        return {"updated": False, "state_dict": None, "reason": "PQC public-key pin required"}
     if any(urlparse(url).scheme != "https" for url in (model_url, hash_url)):
         _MODEL_SYNC_STATUS = "Rejected"
         return {"updated": False, "state_dict": None, "reason": "HTTPS required"}
 
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
     os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
     temporary_path = None
     _MODEL_SYNC_STATUS = "Downloading"
     try:
-        hash_response = requests.get(hash_url, headers=headers, timeout=(30, 120))
-        try:
-            hash_response.raise_for_status()
-            expected_hash = (hash_response.text or "").strip().split()[0].lower()
-        finally:
-            hash_response.close()
+        hash_content = mk1_secure_transport.encrypted_request(
+            requests, hash_url, {"action": "model_hash"}, token, expected_fingerprint,
+        )
+        expected_hash = hash_content.decode("ascii").strip().split()[0].lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("model SHA-256 response is invalid")
 
@@ -5844,31 +5933,22 @@ def sync_cloud_model(model_url: str, hash_url: str, model_path: str, token: str 
             _MODEL_SYNC_STATUS = "Current"
             return {"updated": False, "state_dict": None, "reason": "already current"}
 
-        model_response = requests.get(model_url, headers=headers, timeout=(30, 300), stream=True)
-        try:
-            model_response.raise_for_status()
-            content_length = model_response.headers.get("Content-Length")
-            if content_length and int(content_length) > _MAX_CLOUD_MODEL_BYTES:
-                raise ValueError("model artifact exceeds the configured size limit")
-            with tempfile.NamedTemporaryFile(
-                prefix=".cloud-model-", suffix=".tmp",
-                dir=os.path.dirname(os.path.abspath(model_path)), delete=False,
-            ) as temporary_file:
-                temporary_path = temporary_file.name
-                digest = hashlib.sha256()
-                total_bytes = 0
-                for chunk in model_response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    total_bytes += len(chunk)
-                    if total_bytes > _MAX_CLOUD_MODEL_BYTES:
-                        raise ValueError("model artifact exceeds the configured size limit")
-                    digest.update(chunk)
-                    temporary_file.write(chunk)
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-        finally:
-            model_response.close()
+        model_bytes = mk1_secure_transport.encrypted_request(
+            requests, model_url, {"action": "model"}, token, expected_fingerprint,
+            max_response_bytes=_MAX_CLOUD_MODEL_BYTES + 28,
+        )
+        if len(model_bytes) > _MAX_CLOUD_MODEL_BYTES:
+            raise ValueError("model artifact exceeds the configured size limit")
+        with tempfile.NamedTemporaryFile(
+            prefix=".cloud-model-", suffix=".tmp",
+            dir=os.path.dirname(os.path.abspath(model_path)), delete=False,
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+            digest = hashlib.sha256()
+            digest.update(model_bytes)
+            temporary_file.write(model_bytes)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
 
         if digest.hexdigest() != expected_hash:
             raise ValueError("downloaded model SHA-256 does not match")
@@ -5969,6 +6049,19 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
         log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (送信不可・ローカル継続)")
         completion.set()
         return None, completion, result
+    expected_fingerprint = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip()
+    if mk1_secure_transport is None or not mk1_secure_transport.validate_public_key_pin(expected_fingerprint):
+        _RSI_CONNECTION_STATUS = "Rejected"
+        result["rejected"] = True
+        completion.set()
+        log.error("[RSI_CLOUD] PQC公開鍵pinが未設定または不正のため、送信を拒否しました。")
+        return None, completion, result
+    if not (token or os.environ.get("COLAB_RSI_TOKEN", "")):
+        _RSI_CONNECTION_STATUS = "Rejected"
+        result["rejected"] = True
+        completion.set()
+        log.error("[RSI_CLOUD] 認証tokenが未設定のため、送信を拒否しました。")
+        return None, completion, result
 
     payload = _build_rsi_payload(model, local_dir, records=records)
     label_set = {record["label"] for record in payload["curated_data"]["records"]}
@@ -5982,12 +6075,14 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
 
     def send_request():
         global _RSI_CONNECTION_STATUS
-        response = None
         try:
             auth_token = token or os.environ.get("COLAB_RSI_TOKEN", "")
-            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-            response = requests.post(endpoint, json=payload, headers=headers, timeout=(60, 300))
-            response.raise_for_status()
+            encrypted_response = mk1_secure_transport.encrypted_request(
+                requests, endpoint, payload, auth_token, expected_fingerprint,
+            )
+            reply = json.loads(encrypted_response.decode("utf-8"))
+            if reply.get("accepted") is not True:
+                raise ValueError("Colab did not acknowledge the encrypted RSI request")
             result["sent"] = True
             _RSI_CONNECTION_STATUS = "Connected"
             log.info("[RSI_CLOUD] Colab endpointが学習指示を受理しました。")
@@ -5995,8 +6090,6 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
             _RSI_CONNECTION_STATUS = "Failed"
             log.error(f"[RSI_CLOUD] Colabへの送信に失敗しました。ローカル軽量処理を継続します ({exc})")
         finally:
-            if response is not None:
-                response.close()
             payload.clear()
             completion.set()
             if not result.get("timed_out"):
@@ -6034,6 +6127,8 @@ def _load_runtime_config(config_path: str) -> dict:
         "ram_limit": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
         "drive_id": lambda value: isinstance(value, str),
         "colab_endpoint": lambda value: isinstance(value, str),
+        "colab_pq_public_key_sha256": lambda value: isinstance(value, str)
+        and bool(re.fullmatch(r"[0-9a-fA-F]{64}", value.strip())),
         "model_url": lambda value: isinstance(value, str),
         "model_hash_url": lambda value: isinstance(value, str),
         "model_sync_token": lambda value: isinstance(value, str),
@@ -6055,10 +6150,19 @@ def _load_runtime_config(config_path: str) -> dict:
     return validated
 
 
+def _merge_runtime_config(config_path: str, panel_config_path: str | None = None) -> dict:
+    config = _load_runtime_config(config_path)
+    if panel_config_path:
+        config.update(_load_runtime_config(panel_config_path))
+    return config
+
+
 def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_data/config.json"):
     config = config or {}
     parser = argparse.ArgumentParser(description="MK1")
     parser.add_argument("--config", default=config_path, help="JSON設定ファイルのパス")
+    parser.add_argument("--panel-config", help="操作パネル専用のJSON設定ファイル")
+    parser.add_argument("--panel-parent-pid", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--interface", default=config.get("interface", "eth0"), help="監視するNIC (例: eth0)")
     parser.add_argument("--drive-id",
                         default=config.get("drive_id", GDRIVE_FOLDER_ID),
@@ -6068,6 +6172,7 @@ def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_
     parser.add_argument("--max-memory-mb", "--ram-limit", dest="max_memory_mb", default=config.get("ram_limit", 500), type=int,
                         help="メモリ監視基準(MB)。OSレベルの強制上限ではありません")
     parser.add_argument("--validation-only", action="store_true", help="小規模データ変換とHead B学習を検証して終了")
+    parser.add_argument("--no-drive-fetch", action="store_true", help="検証時にGoogle Driveへ接続せず、ローカルデータのみを使用")
     parser.add_argument("--max-samples", default=32, type=int, help="検証モードで処理する最大サンプル数")
     parser.add_argument("--ignore-model-hash", action=argparse.BooleanOptionalAction,
                         default=config.get("ignore_model_hash", False),
@@ -6103,20 +6208,93 @@ def _render_compact_status(mem_mgr: MemoryManager, ram_limit_mb: int, mode: str,
     sys.stdout.flush()
 
 
+def _write_panel_status(
+    local_dir: str,
+    packets_per_second: float,
+    packets_total: int,
+    mode: str,
+    dry_run: bool,
+    state: str = "RUNNING",
+    ram_used_mb: float | None = None,
+    ram_limit_mb: int | None = None,
+    swap_used_mb: float | None = None,
+) -> None:
+    backdoor_score = max(0.0, min(1.0, float(_BACKDOOR_RISK_SCORE)))
+    threat_score = max(0.0, min(1.0, float(_LAST_THREAT_SCORE)))
+    if _KILL_SWITCH_TRIGGERED:
+        alert = "AIRGAP"
+    elif backdoor_score >= 0.35:
+        alert = "BACKDOOR"
+    elif threat_score >= 0.75:
+        alert = "THREAT"
+    else:
+        alert = "NONE"
+    status = (
+        f"state={state}\n"
+        f"packets_per_second={max(0.0, packets_per_second):.2f}\n"
+        f"packets_total={max(0, packets_total)}\n"
+        f"threat_score={threat_score:.3f}\n"
+        f"backdoor_score={backdoor_score:.3f}\n"
+        f"isolation_active={int(bool(_KILL_SWITCH_TRIGGERED))}\n"
+        f"mode={mode}\n"
+        f"dry_run={int(bool(dry_run))}\n"
+        f"alert={alert}\n"
+        f"interface={_MONITOR_INTERFACE}\n"
+        f"model_sync_status={_MODEL_SYNC_STATUS}\n"
+        f"rsi_connection_status={_RSI_CONNECTION_STATUS}\n"
+        f"training_queue_batches={_train_queue.qsize()}\n"
+        f"learning_mode={int(bool(is_learning_mode()))}\n"
+        f"ram_used_mb={max(0.0, ram_used_mb or 0.0):.1f}\n"
+        f"ram_limit_mb={max(0, ram_limit_mb or 0)}\n"
+        f"swap_used_mb={max(0.0, swap_used_mb or 0.0):.1f}\n"
+    )
+    status_path = os.path.join(local_dir, "panel-status.txt")
+    temporary_path = None
+    file_descriptor = None
+    try:
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".panel-status.", suffix=".tmp", dir=local_dir,
+        )
+        temporary_path = temporary_name
+        os.fchmod(file_descriptor, 0o600)
+        handle = os.fdopen(file_descriptor, "w", encoding="ascii")
+        file_descriptor = None
+        with handle:
+            handle.write(status)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, status_path)
+    except OSError as exc:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+        log.error(f"[PANEL] 状態ファイルを書き込めません ({status_path}: {exc})")
+
+
 # =====================================================================
 # メインループ (すべてを統合する中枢)
 # =====================================================================
 def main():
-    global _RSI_MODE_ACTIVE, _LAST_THREAT_SCORE
+    global _RSI_MODE_ACTIVE, _LAST_THREAT_SCORE, _PANEL_PARENT_PID, _PANEL_FULL_ISOLATION
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default="./ai_data/config.json")
+    pre_parser.add_argument("--panel-config")
     pre_args, _ = pre_parser.parse_known_args()
-    runtime_config = _load_runtime_config(pre_args.config)
+    runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
 
+    if args.panel_parent_pid < 0:
+        parser.error("--panel-parent-pid は0以上で指定してください")
+    _PANEL_PARENT_PID = args.panel_parent_pid
     if "colab_endpoint" in runtime_config:
         os.environ["COLAB_RSI_ENDPOINT"] = runtime_config["colab_endpoint"]
+    if "colab_pq_public_key_sha256" in runtime_config:
+        os.environ["COLAB_RSI_PQ_PUBLIC_KEY_SHA256"] = runtime_config["colab_pq_public_key_sha256"]
     if args.install_deps:
         ensure_dependencies()
     configure_compact_logging(args.compact_log)
@@ -6126,9 +6304,21 @@ def main():
     if args.max_samples < 1:
         parser.error("--max-samples は1以上で指定してください")
     rsi_requested = args.rsi or args.mode.upper() == "RSI"
+    configured_endpoint = os.environ.get("COLAB_RSI_ENDPOINT", "").strip()
+    if rsi_requested and configured_endpoint:
+        public_key_pin = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip()
+        if mk1_secure_transport is None or not mk1_secure_transport.validate_public_key_pin(public_key_pin):
+            parser.error("RSI通信にはCOLAB_RSI_PQ_PUBLIC_KEY_SHA256の64桁SHA-256 pinが必要です")
+        if not (runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")):
+            parser.error("RSI通信にはCOLAB_RSI_TOKENまたは設定ファイルのmodel_sync_tokenが必要です")
+        try:
+            mk1_secure_transport.require_wireguard_full_tunnel()
+        except mk1_secure_transport.SecureTransportError as exc:
+            parser.error(f"RSI通信を開始できません。WireGuard full-tunnelが必要です: {exc}")
     rsi_token = runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")
     _RSI_MODE_ACTIVE = rsi_requested
     dry_run = not args.no_dry_run or rsi_requested
+    _PANEL_FULL_ISOLATION = bool(args.panel_parent_pid > 0 and not dry_run)
     if args.validation_only:
         os.makedirs(args.local_dir, exist_ok=True)
         rsi_model = None
@@ -6142,7 +6332,7 @@ def main():
             args.drive_id,
             args.max_samples,
             model=rsi_model,
-            fetch_drive=not rsi_requested,
+            fetch_drive=not rsi_requested and not args.no_drive_fetch,
         )
         del rsi_model
         gc.collect()
@@ -6250,8 +6440,13 @@ def main():
     update_gdrive_ips()
     log.info("[メインループ] 開始！ Ctrl+C で終了")
 
+    panel_packets_total = 0
     try:
         next_status_update = 0.0
+        next_panel_update = 0.0
+        panel_rate_sample_time = time.monotonic()
+        panel_rate_sample_total = 0
+        panel_packets_per_second = 0.0
         while True:
             _apply_pending_cloud_model(model, local_checkpoint_path=local_checkpoint_path)
             # ── 司令塔: メモリ監視 ──
@@ -6270,6 +6465,26 @@ def main():
                 )
                 next_status_update = time.monotonic() + 1.0
 
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_panel_update:
+                elapsed = max(now_monotonic - panel_rate_sample_time, 0.001)
+                panel_packets_per_second = (
+                    panel_packets_total - panel_rate_sample_total
+                ) / elapsed
+                panel_rate_sample_time = now_monotonic
+                panel_rate_sample_total = panel_packets_total
+                _write_panel_status(
+                    args.local_dir,
+                    panel_packets_per_second,
+                    panel_packets_total,
+                    "RSI" if rsi_requested else "Normal",
+                    dry_run,
+                    ram_used_mb=mem_mgr.process.memory_info().rss / (1024 * 1024),
+                    ram_limit_mb=args.max_memory_mb,
+                    swap_used_mb=getattr(mem_mgr, "_offset", 0) / (1024 * 1024),
+                )
+                next_panel_update = now_monotonic + 1.0
+
             # ── パケット取得 ──
             try:
                 payload = _packet_queue.get(timeout=0.01)
@@ -6278,6 +6493,7 @@ def main():
             if not _validate_packet_queue_item(payload):
                 log.warning("[IPC] 受信したキューアイテムのスキーマ検証に失敗しました。破棄します。")
                 continue
+            panel_packets_total += 1
             if isinstance(payload, PacketQueueItem):
                 feat, pkt = payload.feature_vector, payload.packet_bytes
             else:
@@ -6333,6 +6549,17 @@ def main():
             sys.stdout.flush()
         log.info("\n[終了] ユーザー割り込み受信。クリーンアップ中...")
     finally:
+        _write_panel_status(
+            args.local_dir,
+            0.0,
+            panel_packets_total,
+            "RSI" if rsi_requested else "Normal",
+            dry_run,
+            state="STOPPED",
+            ram_used_mb=mem_mgr.process.memory_info().rss / (1024 * 1024),
+            ram_limit_mb=args.max_memory_mb,
+            swap_used_mb=getattr(mem_mgr, "_offset", 0) / (1024 * 1024),
+        )
         whitelist_buf.clear()
         _train_queue.put(None)  # 学習スレッドを正常終了
         _shutdown_privileged_agent()

@@ -1,0 +1,2 @@
+webauthn==2.8.0
+pqcrypto==1.0.0

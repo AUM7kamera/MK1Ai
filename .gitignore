@@ -1,8 +1,14 @@
 ai_data/gdrive_raw/
+ai_data/wireguard/
+ai_data/config.json
 __pycache__/
 *.pyc
 .venv/
 .venv-*/
 ai_data/vm_swap_*.bin
+ai_data/remote-dashboard.sqlite3*
+ai_data/remote-bootstrap.token
+ai_data/remote-session.key
+ai_data/owner_profile.dat
 *.log
 java_error_in_studio_*.log

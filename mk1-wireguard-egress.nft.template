@@ -1,0 +1,12 @@
+table inet mk1ai_egress {
+    chain output {
+        type filter hook output priority 0;
+        policy drop;
+
+        oifname "lo" accept
+        oifname "WG_INTERFACE" accept
+
+        ip daddr WG_ENDPOINT_IPV4 udp dport WG_ENDPOINT_PORT accept
+        ip6 daddr WG_ENDPOINT_IPV6 udp dport WG_ENDPOINT_PORT accept
+    }
+}

@@ -7,7 +7,7 @@
 ## 重要な注意
 
 - このプログラムはネットワーク監視と OS の隔離操作を行う実験的な防御プロトタイプです。誤検知や設定ミスで通信が切断される可能性があり、実環境での防御性能や安全性は保証されていません。
-- まず使い捨ての Linux 仮想マシンで試してください。業務端末、サーバー、リモート接続中の端末では実行しないでください。
+- まず使い捨ての Linux 仮想マシンで試してください。業務端末、サーバー、リモート接続中の端末では実行しないでください。実遮断は誤検知でもSSHを含む全通信を失わせ、遠隔復旧できなくなる場合があります。
 - 標準の Dry-Run は脅威検知時のネットワーク遮断コマンドを実行しないモードです。しかし、起動時の `boot_time_auto_hardening()` は別に呼び出され、root で実行すると sysctl やプロセス上限を変更します。Dry-Run でもシステム設定への変更があり得ます。
 - `--no-dry-run` を指定すると、検知時にネットワークインターフェース停止やファイアウォール変更を実行します。ネットワークや SSH が切断され、手動復旧が必要になる場合があります。挙動を確認していない状態で指定しないでください。
 - Python からのパケット取得には Linux の `AF_PACKET` raw socket と適切な権限が必要です。OS によっては利用できず、このガイドの手順は Linux を前提とします。
@@ -21,6 +21,12 @@ Python 3.10 以降の 64-bit Linux 環境を用意します。作業ディレク
 ```bash
 cd ~/MK1\ Ai
 python3 -m venv .venv-mk1
+```
+
+For Colab RSI/PQC transport, install the pinned ML-KEM implementation before starting:
+
+```bash
+.venv-mk1/bin/python -m pip install -r requirements-secure-transport.txt
 ```
 
 通常版は起動時に `torch`、`psutil`、`cryptography` の有無を確認し、不足していれば現在の Python (`sys.executable`) から pip で導入を試みます。PyTorch はCPU版wheel indexを追加して取得します。インストールにはネットワーク接続と書き込み可能なPython環境が必要です。仮想環境を使うと、システムPythonを汚さずに導入できます。
@@ -81,6 +87,82 @@ COLAB_RSI_ENDPOINT="https://<your-authenticated-endpoint>/rsi" \
 
 `./run.sh` はColab URLを尋ね、前回値がある場合はプロンプトに表示します。空のままEnterを押すと前回値を保持し、新しいURLを入力すると更新します。設定は一時ファイル経由で原子的に `ai_data/config.json` へ保存してから、RSI/1500MB/compact-log設定で起動します。URL入力時にCtrl+CまたはCtrl+Dを押すと、設定を変更せず終了します。`--compact-log` は通常のINFO/WARNINGを抑え、RAM・swap・脅威スコア・Colab状態を1行で更新します。エラーと高スコアの警告は通常ログとして表示します。
 
+### C言語操作パネル
+
+明示的な起動コマンドを実行したときだけ、C/ncursesのローカル操作パネルが起動します。自動起動やバックグラウンド起動は登録しません。
+
+```bash
+bash ./mk1-panel.sh
+```
+
+- ChromebookはLinux開発環境 (Crostini) の端末で起動します。macOSはTerminalで起動します。WindowsはWSLとLinuxディストリビューションを用意し、コマンドプロンプトから `mk1-gui.cmd` を実行します (Windowsネイティブ版ではありません)。各環境にCコンパイラとncurses開発ファイルが必要です。
+- `[1]` は起動前警告に同意した後にDry-Run監視を起動します。Dry-Runは異常を検知しても通信を切断しないため、実際の遮断を提供しません。
+- `[3]` は監視開始前に全通信遮断の警告を表示し、続行には `y` と管理者認証が必要です。監視中は検知前の警告待ちやユーザー確認を挟まず、検知後すぐ全ネットワークインターフェースの停止を試行します。停止成功後に操作パネルとリモート画面サーバーを終了します。SSHや遠隔アクセスも例外なく切断する方針で、遠隔復旧経路は提供しません。誤検知やOSの権限・ファイアウォール・カーネルの制限により、遮断に失敗する可能性があります。ハードウェア・カーネルを迂回不能にする「絶対保証」ではありません。
+- `[4]` でNIC、RAM監視基準、通常/RSIモード、Colab HTTPS URLを編集できます。`[5]` はNIC一覧、`[6]` はGoogle Driveへ接続しないローカル検証です。監視中は処理パケット/秒、累計、脅威・バックドアリスク、隔離状態、RAM・swapを表示します。設定は `ai_data/panel-config.json` に権限 `0600` で保存し、ログは `ai_data/panel.log` に追記します。
+- `[7]` は閲覧専用ダッシュボードを起動し、`[8]` は停止します。依存を `.venv-mk1/bin/python -m pip install -r requirements-remote.txt` で導入します。アプリはloopbackにだけHTTP bindし、外部接続はNginxがWireGuard IP上でTLSを終端します。スマートフォンを含むクライアントもWireGuardへ接続しなければ到達できません。
+
+```bash
+export MK1_REMOTE_ROLE="login"
+export MK1_REMOTE_HOST="127.0.0.1"
+export MK1_REMOTE_PORT="8080"
+export MK1_WIREGUARD_INTERFACE="wg0"
+export MK1_WIREGUARD_BIND_ADDRESS="10.77.0.1"
+export MK1_REMOTE_ORIGIN="https://security.example.com:8443"
+export MK1_REMOTE_RP_ID="security.example.com"
+export MK1_ADMIN_EMAIL="admin@example.com"
+export MK1_EMAIL_FROM="security@example.com"
+export MK1_SMTP_USERNAME="admin@example.com"
+export MK1_SMTP_APP_PASSWORD="<Gmail-app-password>"
+export MK1_ADMIN_PHONE="+819012345678"
+export MK1_TWILIO_ACCOUNT_SID="<Twilio-account-SID>"
+export MK1_TWILIO_AUTH_TOKEN="<Twilio-auth-token>"
+export MK1_TWILIO_FROM_NUMBER="+15555550123"
+bash ./mk1-panel.sh
+```
+
+Passkey登録と本番ログインは別コンテナ・別モードです。登録サーバーでは `MK1_REMOTE_ROLE=enrollment` とし、`https://<RPドメイン>/register` で一度だけPasskeyを登録します。登録専用サービスにはメール/SMS資格情報を渡しません。登録後に生成される `owner_profile.dat` はWebAuthn公開鍵など公開情報だけを含む `0400` ファイルです。Proxmoxホストで本番コンテナを停止し、次の移行スクリプトを実行します:
+
+```bash
+sudo bash ./proxmox-transfer-registration.sh 101 100
+```
+
+このスクリプトはプロフィール形式を検証して本番コンテナの `/etc/mk1ai/owner_profile.dat` へ移し、本番サービス起動を確認した後に登録コンテナの自動起動を無効化して停止します。本番の環境ファイル `/etc/mk1ai/remote-dashboard.env` は `MK1_REMOTE_ROLE=login`、`MK1_DATA_DIR=/var/lib/mk1ai`、`MK1_OWNER_PROFILE=/etc/mk1ai/owner_profile.dat` を設定してください。認証DBとカウンターは更新が必要なので、プロフィールの `0400` と異なり `/var/lib/mk1ai` 内の専用DBをサービスユーザーだけが書き込める状態で保持します。`0400` はrootからの変更を防ぐものではありません。登録コンテナの通信をファイアウォールでも遮断し、停止後に再起動できない運用にしてください。
+
+本番サインインはPasskeyに加えて、GmailとSMSへ並行送信する別々の6桁コードを両方要求します。メールまたはSMSの送信に失敗した場合はログインできません。メール/SMSは同一端末で閲覧可能な場合があり、暗号学的に独立した物理要素とは限りません。ブラウザー内に追加の2桁コードを表示しても独立要素にならないため、追加MFA因子としては実装していません。成功後の画面/APIは状態・検知アラートの読み取り専用です。設定変更、停止/起動、任意コマンド実行のAPIはありません。セッションは15分無操作または最大2時間で失効します。
+
+systemdで起動する場合は [mk1-remote-dashboard.service](./mk1-remote-dashboard.service) を両コンテナに配置し、各コンテナの `/etc/mk1ai/remote-dashboard.env` に個別のロール・WireGuardアドレス・URLを設定します。サービスは `mk1ai` 非rootユーザー、`ProtectSystem=strict`、`NoNewPrivileges` で動作します。Pythonアプリはloopbackだけにbindし、NginxのみWireGuardアドレスへbindします。
+
+外部HTTPSは [mk1-remote-nginx.conf.template](./mk1-remote-nginx.conf.template) を実環境用に設定して使います。NginxをOpenSSL 3.5以降で構築し、TLS 1.3の `TLS_AES_256_GCM_SHA384` とハイブリッドPQC鍵交換 `X25519MLKEM768` だけを許可します。対応していないNginx/OpenSSLやクライアントでは接続が成立しません。古い鍵交換へのフォールバックを有効にしないでください。Passkey登録・リモートUIもこのHTTPS終端を通るため、TLSが成立しなければ画面/APIを使用できません。
+
+WireGuardの完全なegress kill switchは各Proxmox/LXCの権限・トポロジーに合わせてファイアウォール側で設定します。[egressルールのテンプレート](./mk1-wireguard-egress.nft.template)は、許可したWireGuard UDP peer宛ての外側パケットと `wg0` 内の通信以外を遮断するための例です。peer endpoint IP/portとinterface名を確定し、ホスト上で適用前にルールを監査してください。アプリは起動時にIPv4/IPv6フルトンネルrouteとbind IPを検査し、Gmail/Twilio送信の直前にもrouteを再確認しますが、route検査だけでは競合状態や後日の設定変更を防げません。
+
+例としてテンプレートからNginx設定を作る場合は、プレースホルダーを実環境のVPNアドレスとRPドメインへ置換し、TLS証明書パスも合わせます。その後 `nginx -t` と `openssl list -tls-groups` で設定・hybrid groupを確認し、実際のTLS handshakeでもsuite/groupを検証してください。Nginx/OpenSSLやiPhone側ブラウザーがPQC groupに対応しない場合は接続が失敗します。互換性目的の古典鍵交換fallbackは追加しません。
+
+```bash
+sed -e 's/WG_BIND_ADDRESS/10.77.0.1/g' \
+    -e 's/RP_DOMAIN/security.example.com/g' \
+    mk1-remote-nginx.conf.template \
+    > /etc/nginx/conf.d/mk1-remote.conf
+nginx -t
+```
+
+両コンテナへアプリと仮想環境を配置した後、`mk1ai` ユーザーと状態ディレクトリを準備します。環境ファイルはroot所有 `0600` とし、NginxはコンテナのWireGuard IPにだけbindします。クライアント側もWireGuard peerとして構成し、RPドメインがそのVPN内アドレスへ解決されるようにしてください。
+
+```bash
+install -d -o mk1ai -g mk1ai -m 0700 /var/lib/mk1ai
+install -d -o root -g mk1ai -m 0750 /etc/mk1ai
+install -o root -g root -m 0600 remote-dashboard.env /etc/mk1ai/remote-dashboard.env
+systemctl enable --now mk1-remote-dashboard.service
+```
+
+登録用 `/etc/mk1ai/remote-dashboard.env` では `MK1_REMOTE_ROLE=enrollment` とし、SMTP/Twilioの秘密情報は設定しません。登録が成功すると `/var/lib/mk1ai/owner_profile.dat` が作成されます。本番側は `MK1_REMOTE_ROLE=login`、`MK1_DATA_DIR=/var/lib/mk1ai`、`MK1_OWNER_PROFILE=/etc/mk1ai/owner_profile.dat` とし、Gmail SMTP/Twilioを設定します。両方のコンテナで `MK1_REMOTE_ORIGIN` と `MK1_REMOTE_RP_ID` を一致させてください。移行スクリプトは本番サービスが正常起動したことを確認できなければ登録コンテナを停止しません。
+
+**WebAuthnのUser VerificationはFace ID/指紋を保証しません。** Safari/Chrome/OSは端末PINやパスコード等を代替に選ぶことがあり、サーバーは生体方式とPIN方式を確実に識別できません。TLSとPasskeyは必要ですが、外部公開は使い捨て環境で検証してから行い、管理者のGmail/Twilioアカウント・電話番号も保護してください。エアギャップ後は全NIC停止とともにローカルパネルおよびリモートダッシュボードを停止します。ネットワーク断中にスマートフォンから閲覧できる保証はありません。
+
+Passkey登録・リモートUI・WebAuthn/MFA APIは、WireGuard内のNginx TLS終端を通し、TLS 1.3 `TLS_AES_256_GCM_SHA384` とML-KEM-768 hybrid group `X25519MLKEM768` に限定します。学習APIはこれに加え、制御可能なRSI payloadをML-KEM-768＋AES-256-GCMでアプリケーション暗号化します。Google Drive/Colabのmount・Google API通信はGoogle管理TLSであり、この暗号スイートを指定できません。Gmail SMTP/Twilio APIへの接続はWireGuard route/egress firewallと各事業者TLSを使いますが、各事業者TLS suiteはMK1Aiから固定できず、Twilio以降のSMS通信も事業者・携帯網に依存します。したがって全外部リンクで同一暗号suiteを強制した、あるいは永久に解読不能とは保証しません。
+
+生体方式は強制できず、公開URL・DNS・証明書・SMTP/Twilioの実接続は管理者が構成する必要があります。C UIの複数OS対応は起動環境の対応であり、Pythonの実パケットキャプチャはLinuxの `AF_PACKET` が前提です。Linux以外ではキャプチャがシミュレーション動作となる場合があるため、実ネットワークの監視・隔離機能が動作したとみなさないでください。実環境へ投入する前に、OS別の隔離コマンドを使い捨て環境で個別に検証してください。
+
 この例は Dry-Run です。root 権限は raw socket の利用や起動時ハードニングのために使われます。既知の旧形式（共有層 `10→32→16`、Head A `16→1`）は、出力を保つ形で現在のモデル構造へ自動変換して読み込みます。それ以外の形式、破損したファイル、未設定または不一致のハッシュは安全のためロードを拒否し、未学習状態で起動します。起動ログで `旧形式チェックポイントを現行モデル構造へ互換変換します` またはロード結果を確認してください。
 
 ### 4. 最初は Dry-Run で起動する
@@ -107,23 +189,30 @@ Dry-Run は既定で有効です。停止するには `Ctrl+C` を押します�
 | `--rsi`, `--mode RSI` | 無効 | RSI学習指示をColabエンドポイントへ非同期送信 |
 | `--no-dry-run` | 無効 | 指定すると検知時の実遮断を許可します。ネットワーク断の危険があります |
 
-RSI連携には、Colabノートブックで起動するHTTPS受信エンドポイントを設定します。[Colab連携ノートブック](colab_training.ipynb) は選別済みの10次元特徴量だけを受け取り、Head BをGPUで追加学習してGoogle DriveへモデルとSHA-256を保存します。公開APIにはBearer認証が必須です。ノートブックが表示する `COLAB_RSI_ENDPOINT` と同じトークンを `COLAB_RSI_TOKEN` に設定してください。
+RSI連携には、Colabノートブックで起動するHTTPS受信エンドポイントを設定します。[Colab連携ノートブック](colab_training.ipynb) は選別済みの10次元特徴量だけを受け取り、Head BをGPUで追加学習してGoogle DriveへモデルとSHA-256を保存します。制御可能なMK1Ai↔Colab API通信では、ML-KEM-768公開鍵のSHA-256 pinning、ML-KEM共有秘密から導出した鍵、AES-256-GCMを使い、認証token・RSI要求/応答・モデルとハッシュをアプリケーション層で暗号化します。tokenはBearer HTTP headerではなく暗号化payloadに含みます。endpoint、token、公開鍵fingerprintのいずれかが不足すれば実送信しません。
 
-このリポジトリのノートブックは空いているloopback portを選び、`cloudflared` で公開して `https://<random>.trycloudflare.com/rsi` を表示します。Colabの出力がLocalTunnel (`*.loca.lt`) やport `5000` を示す場合は、別のノートブックまたは古いランタイムが動いています。設定URLを取り違えないよう、Colab runtimeを再起動してこのリポジトリのnotebookを上から順に実行してください。認証確認では、tokenなしの `POST /rsi` が `401` になることが期待値です。tokenなしの空JSONが `200` になるendpointには、tokenや学習データを送らないでください。
+WireGuardは各実行環境で利用者が用意・起動し、`wg0` に `0.0.0.0/0` と `::/0` の両方を設定してください。アプリは両方の外向きrouteが `wg0` を使うことを確認し、検証できなければColab/Drive通信を拒否します。ColabノートブックもDrive mount前に同じ確認を行い、`MK1_WIREGUARD_INTERFACE` で別名を指定できます。トンネル設定、peer鍵、秘密鍵は利用者側で安全に管理してください。
+
+WireGuardの標準プロトコル自体はCurve25519とChaCha20-Poly1305を使い、AES/PQCへ置き換えることはできません。ここではWireGuardを外側トンネルとして使い、その上に制御可能なMK1Ai↔Colab API向けのML-KEM-768/AES-256-GCM暗号化を重ねます。Google Colab `drive.mount`、Google Drive API、Google/CloudflareのTLS暗号選択は各サービスが管理しており、MK1AiからPQC鍵交換やTLS cipher suiteを強制できません。Drive通信はWireGuard経由に制限しますが、Google管理のTLSは別途維持されます。ルート確認は通信直前の検査であり、VPN切断後のOS全体に対する完全なkill-switch保証ではありません。実運用ではWireGuard設定と併せてOS firewallのegress kill switchを構成してください。
+
+このリポジトリのノートブックは空いているloopback portを選び、`cloudflared` で公開して `https://<random>.trycloudflare.com/rsi` を表示します。Colabの出力がLocalTunnel (`*.loca.lt`) やport `5000` を示す場合は、別のノートブックまたは古いランタイムが動いています。設定URLを取り違えないよう、Colab runtimeを再起動してこのリポジトリのnotebookを上から順に実行してください。トンネル確認では公開鍵pin、ML-KEM/AES-GCMの暗号要求・応答、認証拒否を検証します。
 
 ```bash
 export COLAB_RSI_ENDPOINT="https://<your-authenticated-endpoint>/rsi"
 export COLAB_RSI_TOKEN="<endpoint-token>"
+export COLAB_RSI_PQ_PUBLIC_KEY_SHA256="<Colab-notebook-fingerprint>"
 python airgap_ai_defender.py --rsi --ram-limit 1500
 ```
 
 モデル同期では `--mode RSI` 起動時に `/model.sha256` と `/model` をHTTPSで定期取得します。URLはRSI endpointの `/rsi` をそれぞれ `/model.sha256` と `/model` に置き換えて自動構成します。別ホストやパスを使う場合は `ai_data/config.json` に `model_url` と `model_hash_url` を指定できます。`model_sync_interval` は秒単位（最小30秒）、`model_sync_token` は任意のBearer tokenです。SHA-256とモデル構造の検証に通らないファイルは配置せず、成功時のみ一時ファイルから原子的に置換します。上記の既知の旧形式はロード時に現行構造へ変換されますが、ハッシュ照合は引き続き必須です。実行中はメイン推論ループで新しい重みを適用します。
 
+実装上、`/rsi`、`/model.sha256`、`/model` はすべて暗号化POSTです。直接のcurl/平文JSONやBearer headerによるAPI接続は使用しないでください。モデル同期も同じ鍵pinとML-KEM/AES-GCM処理を通します。
+
 ローカルから送るのは `curated/curated_data.jsonl` の正常な数値特徴量（最大2048件）だけです。生パケットや通信内容は送信しません。APIはデータをキューへ入れてすぐに受理応答を返し、GPU学習はColab側で非同期に実行します。
 
 RSI endpointへ送るのはタスク名、選別済み特徴量、学習設定、送信時刻だけです。モデルのstate_dictや生パケット、通信内容、学習データのファイル名・容量は送信しません。HTTPS以外の外部URLは拒否し、接続失敗時も通常の監視と既存の小バッチ学習を継続します。`--validation-only`ではエンドポイント未設定時に送信をシミュレートし、最大`--max-samples`件で終了します。
 
-通常起動でも `COLAB_RSI_ENDPOINT` が未設定またはsudoへ引き継がれていない場合、RSI送信はシミュレーションになります。ログに `未設定のため送信をシミュレーション` と出る場合は、endpointを設定し、`sudo --preserve-env=COLAB_RSI_ENDPOINT,COLAB_RSI_TOKEN` で起動してください。
+通常起動でも `COLAB_RSI_ENDPOINT` が未設定またはsudoへ引き継がれていない場合、RSI送信はシミュレーションになります。ログに `未設定のため送信をシミュレーション` と出る場合は、endpointを設定し、`sudo --preserve-env=COLAB_RSI_ENDPOINT,COLAB_RSI_TOKEN,COLAB_RSI_PQ_PUBLIC_KEY_SHA256` で起動してください。
 
 RSIモードでは`--no-dry-run`を同時指定してもDry-Runを維持し、脅威検知を遮断アクションへ昇格させません。検知結果自体は捨てず、監査用WARNINGを最大30秒に1回記録します。プロセス監査では `code`、`code-server`、`node`、`python3` 等の名前だけで免除せず、親プロセスに不審な兆候がなく、接続先がloopbackまたはHTTPSの443番ポートに限られる場合だけリスクを下げます。この扱いはパケット検査の許可リストではなく、通常通信は引き続き検査され、Head Bの正常学習判定にも進みます。
 
@@ -177,7 +266,7 @@ printf '%s\n' \
   --local-dir "$TEST_DIR/normal" --validation-only --max-samples 2
 ```
 
-成功時は終了コード `0` と `Head B のオンライン適合学習を 2 件で完了しました` のログを確認します。`--validation-only` はパケット監視を起動しません。実際の教材をDriveから確認するときは、`--drive-id ""` を設定ファイルのDrive IDまたは実際のIDに置き換えてください。通常起動はデータ更新ワーカーがバックグラウンドで学習キューへデータを送ります。
+成功時は終了コード `0` と `Head B のオンライン適合学習を 2 件で完了しました` のログを確認します。`--validation-only` はパケット監視を起動しません。検証はローカルデータを優先し、利用可能なデータがない場合にだけDriveから取得します。Drive上の教材を使う場合は、`--drive-id ""` を設定ファイルのDrive IDまたは実際のIDに置き換えてください。通常起動はデータ更新ワーカーがバックグラウンドで学習キューへデータを送ります。
 
 ### RSI学習
 
@@ -232,7 +321,7 @@ export COLAB_RSI_ENDPOINT="https://<tunnel-host>/rsi"
 read -rsp "Colab Bearer token: " COLAB_RSI_TOKEN
 printf '\n'
 export COLAB_RSI_TOKEN
-sudo --preserve-env=COLAB_RSI_ENDPOINT,COLAB_RSI_TOKEN \
+sudo --preserve-env=COLAB_RSI_ENDPOINT,COLAB_RSI_TOKEN,COLAB_RSI_PQ_PUBLIC_KEY_SHA256 \
   .venv-mk1/bin/python airgap_ai_defender.py \
   --config ai_data/config.rsi.json --mode RSI \
   --interface <監視インターフェース> --local-dir ./ai_data
@@ -315,10 +404,12 @@ Driveに接続できない場合は既存の `ai_data/gdrive_raw/` データ、�
 
 ## テスト
 
-リポジトリのテストを実行するには、仮想環境を有効にしたうえで次を実行します。
+テストではPyTorch、NumPy、gdown、requests、psutil、cryptographyを使用します。アプリ本体は一部依存がない場合にstubへフォールバックしますが、その状態では学習・モデル・Drive連携などのテストは実行できません。まだ仮想環境を作成していない場合は、次のように依存を導入してからテストを実行してください。
 
 ```bash
+python3 -m venv .venv-mk1
+.venv-mk1/bin/python -m pip install torch numpy psutil requests gdown cryptography
 .venv-mk1/bin/python -m unittest discover -s tests -v
 ```
 
-テストの成功は、特定の補助関数の動作確認です。本番ネットワークでの検知精度、安全性、処理性能を保証するものではありません。
+すでに仮想環境と依存を準備済みの場合は、最後のテストコマンドだけを実行します。テストの成功は、特定の補助関数の動作確認です。本番ネットワークでの検知精度、安全性、処理性能を保証するものではありません。
