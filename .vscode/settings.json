@@ -1,0 +1,40 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 - <<'PY'\nimport importlib\\.util\nfor name in \\('torch', 'requests', 'gdown', 'psutil', 'cryptography', 'numpy'\\):\n    print\\(f'\\{name\\}: \\{importlib\\.util\\.find_spec\\(name\\) is not None\\}'\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python3\\.12 -m venv /tmp/mk1ai-test-venv && /tmp/mk1ai-test-venv/bin/python -m pip install --disable-pip-version-check --retries 1 --timeout 30 --extra-index-url https://download\\.pytorch\\.org/whl/cpu torch requests gdown cryptography$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^bash \\./mk1-panel\\.sh --check$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^bash -n mk1-panel\\.sh && \\.venv-mk1/bin/python -m py_compile airgap_ai_defender\\.py tests/test_airgap_ai_defender\\.py && git --no-pager diff --check && git status --short$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^\\.venv-mk1/bin/python -m unittest discover -s tests$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^git fetch --prune origin && git --no-pager log -1 --oneline --decorate origin/main && git rev-list --left-right --count HEAD\\.\\.\\.origin/main && git status --short$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^bash \\./mk1-panel\\.sh --check && bash -n mk1-panel\\.sh && \\.venv-mk1/bin/python -m py_compile airgap_ai_defender\\.py mk1_remote_dashboard\\.py tests/test_remote_dashboard\\.py tests/test_airgap_ai_defender\\.py && git --no-pager diff --check$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^\\.venv-mk1/bin/python -m unittest tests\\.test_remote_dashboard$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^if test -e /workspaces/MK1Ai-project\\.zip; then printf 'EXISTS\\\\n'; else printf 'AVAILABLE\\\\n'; fi; du -sh \\. --exclude=\\.git --exclude='\\.venv\\*' --exclude=ai_data 2>/dev/null$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
