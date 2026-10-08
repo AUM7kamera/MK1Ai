@@ -28,6 +28,29 @@ spec.loader.exec_module(module)
 
 
 class AirgapSecurityHelpersTest(unittest.TestCase):
+    def test_capset_rejects_ids_outside_its_v3_abi(self):
+        with mock.patch.object(module.platform, "system", return_value="Linux"):
+            self.assertFalse(module._set_linux_capabilities(permitted={64}))
+
+    def test_privilege_drop_stops_when_capability_restriction_fails(self):
+        account = mock.Mock(pw_uid=65534, pw_gid=65534)
+        with mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module.pwd, "getpwnam", return_value=account), \
+             mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.object(module.os, "setgroups"), \
+             mock.patch.object(module.os, "setgid"), \
+             mock.patch.object(module.os, "setuid"), \
+             mock.patch.object(module, "_call_prctl", return_value=0) as prctl, \
+             mock.patch.object(
+                 module, "_set_linux_capabilities", side_effect=[False, True],
+             ) as capset:
+            self.assertFalse(
+                module._drop_to_user("nobody", preserve_caps={module._CAP_NET_RAW}),
+            )
+
+        self.assertEqual(capset.call_count, 2)
+        self.assertEqual(prctl.call_args_list[-1], mock.call(8, 0, 0, 0, 0))
+
     def test_runtime_config_sets_parser_defaults_and_cli_can_override(self):
         config = {
             "interface": "wg0",
@@ -81,11 +104,139 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(config["drive_id"], "folder-id")
         self.assertEqual(config["colab_endpoint"], "https://colab.example.test/rsi")
 
+    def test_map_mode_config_accepts_only_the_three_supported_modes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for mode in (0, 1, 2):
+                config_path.write_text(json.dumps({"map_mode": mode}), encoding="utf-8")
+                self.assertEqual(module._load_runtime_config(str(config_path))["map_mode"], mode)
+
+            config_path.write_text(json.dumps({"map_mode": True}), encoding="utf-8")
+            self.assertNotIn("map_mode", module._load_runtime_config(str(config_path)))
+
+    def test_usb_guard_config_accepts_only_integer_toggle_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for enabled in (0, 1):
+                config_path.write_text(json.dumps({"usb_guard_enabled": enabled}), encoding="utf-8")
+                self.assertEqual(
+                    module._load_runtime_config(str(config_path))["usb_guard_enabled"],
+                    enabled,
+                )
+
+            for invalid in (True, 2, "1"):
+                config_path.write_text(json.dumps({"usb_guard_enabled": invalid}), encoding="utf-8")
+                self.assertNotIn(
+                    "usb_guard_enabled",
+                    module._load_runtime_config(str(config_path)),
+                )
+
+    def test_secure_tunnel_config_accepts_only_integer_toggle_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for enabled in (0, 1):
+                config_path.write_text(
+                    json.dumps({"secure_tunnel_enabled": enabled}), encoding="utf-8",
+                )
+                self.assertEqual(
+                    module._load_runtime_config(str(config_path))["secure_tunnel_enabled"],
+                    enabled,
+                )
+
+            for invalid in (True, 2, "1"):
+                config_path.write_text(
+                    json.dumps({"secure_tunnel_enabled": invalid}), encoding="utf-8",
+                )
+                self.assertNotIn(
+                    "secure_tunnel_enabled",
+                    module._load_runtime_config(str(config_path)),
+                )
+
+    def test_memory_guard_config_accepts_only_integer_toggle_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for enabled in (0, 1):
+                config_path.write_text(
+                    json.dumps({"memory_guard_enabled": enabled}), encoding="utf-8",
+                )
+                self.assertEqual(
+                    module._load_runtime_config(str(config_path))["memory_guard_enabled"],
+                    enabled,
+                )
+
+            for invalid in (True, 2, "1"):
+                config_path.write_text(
+                    json.dumps({"memory_guard_enabled": invalid}), encoding="utf-8",
+                )
+                self.assertNotIn(
+                    "memory_guard_enabled",
+                    module._load_runtime_config(str(config_path)),
+                )
+
+    def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
+        device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
+        interfaces = ["eth0", "wlan0"]
+        with mock.patch.object(module, "discover_available_interfaces", return_value=interfaces), \
+             mock.patch.object(module, "disable_network_interfaces", return_value=True) as barrier, \
+             mock.patch.object(
+                 module.mk1_secure_transport, "request_transport_state", return_value=True,
+             ) as key_wipe:
+            module._usb_scan_threat_response(device, "error", interfaces)
+            barrier.assert_not_called()
+
+            module._usb_scan_threat_response(device, "threat", interfaces, "/tmp/tunnel.sock")
+
+        barrier.assert_called_once_with(interfaces)
+        key_wipe.assert_called_once_with("/tmp/tunnel.sock", False)
+
+    def test_usb_guard_is_a_separate_privileged_worker_only_in_full_isolation(self):
+        processes = [mock.Mock(), mock.Mock(), mock.Mock()]
+        with mock.patch.object(module, "_PRIVILEGED_AGENT_ACTIVE", False), \
+             mock.patch.object(module, "_PRIVILEGED_STOP_EVENT", mock.Mock()), \
+             mock.patch.object(module, "_PRIVILEGED_COMMAND_PROCESS", None), \
+             mock.patch.object(module, "_PRIVILEGED_CAPTURE_PROCESS", None), \
+             mock.patch.object(module, "_PRIVILEGED_USB_PROCESS", None), \
+             mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
+             mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.object(module, "discover_available_interfaces", return_value=["eth0"]), \
+             mock.patch.object(module.multiprocessing, "Process", side_effect=processes) as process_factory:
+            module._ensure_privileged_agent(
+                "eth0", 500, "/tmp/mk1", False, panel_config_path="ai_data/panel-config.json",
+            )
+
+        self.assertEqual(process_factory.call_count, 3)
+        self.assertIs(process_factory.call_args_list[2].kwargs["target"], module._usb_guard_process_main)
+        self.assertEqual(processes[2].start.call_count, 1)
+
+    def test_threat_map_telemetry_runs_after_the_defense_decision(self):
+        call_order = []
+        with mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", False), \
+             mock.patch.object(module, "_BACKDOOR_RISK_SCORE", 0.0), \
+             mock.patch.object(module, "maybe_log_crypto_markers"), \
+             mock.patch.object(module, "inspect_packet_pipeline", return_value={
+                 "block": True, "stage": "dpi", "score": 0.9,
+             }), \
+             mock.patch.object(
+                 module, "evaluate_threat_state",
+                 side_effect=lambda *args, **kwargs: call_order.append("defense") or True,
+             ), \
+             mock.patch.object(
+                 module, "_publish_threat_map_event",
+                 side_effect=lambda *args, **kwargs: call_order.append("map"),
+             ):
+            module.handle_packet_event(
+                b"packet", "eth0", dry_run=True, dpi_result={"suspicious": True},
+            )
+
+        self.assertEqual(call_order, ["defense", "map"])
+
     def test_panel_status_is_atomic_private_and_reports_isolation_alert(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
              mock.patch.object(module, "_BACKDOOR_RISK_SCORE", 0.8), \
              mock.patch.object(module, "_LAST_THREAT_SCORE", 0.99), \
-             mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", True):
+             mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", True), \
+             mock.patch.object(module.mk1_memory_guard, "is_enabled", return_value=True):
             module._write_panel_status(
                 temp_dir, 12.5, 42, "Normal", True, state="STOPPED",
             )
@@ -98,6 +249,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertIn("packets_per_second=12.50\n", content)
         self.assertIn("packets_total=42\n", content)
         self.assertIn("isolation_active=1\n", content)
+        self.assertIn("memory_guard_active=1\n", content)
         self.assertIn("alert=AIRGAP\n", content)
         self.assertEqual(status_mode, 0o600)
         self.assertEqual(remaining_temporary_files, [])

@@ -1,7 +1,11 @@
 import base64
 import hashlib
 import json
+import pathlib
+import socket
 import subprocess
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -12,6 +16,12 @@ import mk1_secure_transport as secure_transport
 
 
 class SecureTransportTest(unittest.TestCase):
+    def setUp(self):
+        with secure_transport._TRANSPORT_STATE_LOCK:
+            for envelope in tuple(secure_transport._ACTIVE_ENVELOPES):
+                envelope.destroy()
+            secure_transport._TRANSPORT_ENABLED = True
+
     def test_ml_kem_aes_gcm_request_response_round_trip(self):
         public_key, private_key = keygen()
         fingerprint = hashlib.sha256(public_key).hexdigest()
@@ -37,6 +47,163 @@ class SecureTransportTest(unittest.TestCase):
         )
         with self.assertRaises(InvalidTag):
             secure_transport.decrypt_server_response(envelope, response[:-1] + b"\x00")
+        envelope.destroy()
+        self.assertEqual(envelope.key, bytearray(32))
+
+    def test_disabling_transport_wipes_active_keys_and_rejects_decryption(self):
+        public_key, private_key = keygen()
+        fingerprint = hashlib.sha256(public_key).hexdigest()
+        envelope = secure_transport.create_encrypted_request(
+            public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+        )
+        response = secure_transport.encrypt_server_response(
+            private_key, envelope.kem_ciphertext, b"response", "POST", "/rsi", fingerprint,
+        )
+
+        secure_transport.set_transport_enabled(False)
+
+        self.assertFalse(secure_transport.transport_is_enabled())
+        self.assertEqual(envelope.key, bytearray(32))
+        with self.assertRaisesRegex(secure_transport.SecureTransportError, "key was destroyed"):
+            secure_transport.decrypt_server_response(envelope, response)
+        with self.assertRaisesRegex(secure_transport.SecureTransportError, "disabled"):
+            secure_transport.create_encrypted_request(
+                public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+            )
+
+    def test_enabling_transport_requires_verified_wireguard_routes(self):
+        with mock.patch.object(
+            secure_transport, "_verify_wireguard_full_tunnel", return_value="wg0",
+        ) as verify:
+            secure_transport.set_transport_enabled(True)
+
+        verify.assert_called_once_with()
+        self.assertTrue(secure_transport.transport_is_enabled())
+
+    def test_tunnel_control_socket_synchronously_disables_and_reenables_transport(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "tunnel-control.sock"
+            server = secure_transport.TunnelControlServer(str(path))
+            server.start()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(str(path))
+                    client.sendall(b"T0")
+                    self.assertEqual(client.recv(1), b"1")
+                self.assertFalse(secure_transport.transport_is_enabled())
+
+                with mock.patch.object(
+                    secure_transport, "_verify_wireguard_full_tunnel", return_value="wg0",
+                ):
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(str(path))
+                        client.sendall(b"T1")
+                        self.assertEqual(client.recv(1), b"1")
+                self.assertTrue(secure_transport.transport_is_enabled())
+
+                with mock.patch.object(
+                    secure_transport, "set_memory_guard_enabled",
+                ) as set_guard:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(str(path))
+                        client.sendall(b"M1")
+                        self.assertEqual(client.recv(1), b"1")
+                set_guard.assert_called_once_with(True)
+                self.assertTrue(secure_transport.request_transport_state(str(path), False))
+                self.assertFalse(secure_transport.transport_is_enabled())
+            finally:
+                server.close()
+
+    def test_secret_buffers_are_locked_when_memory_guard_is_enabled(self):
+        public_key, _ = keygen()
+        fingerprint = hashlib.sha256(public_key).hexdigest()
+        with mock.patch.object(
+            secure_transport.mk1_memory_guard, "is_enabled", return_value=True,
+        ), mock.patch.object(
+            secure_transport.mk1_memory_guard, "lock_buffer",
+        ) as lock_buffer:
+            envelope = secure_transport.create_encrypted_request(
+                public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+            )
+        self.assertEqual(lock_buffer.call_count, 2)
+        envelope.destroy()
+
+    def test_memory_guard_toggle_protects_and_releases_live_session_keys(self):
+        public_key, _ = keygen()
+        fingerprint = hashlib.sha256(public_key).hexdigest()
+        envelope = secure_transport.create_encrypted_request(
+            public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+        )
+        with mock.patch.object(
+            secure_transport.mk1_memory_guard, "set_enabled",
+        ), mock.patch.object(
+            secure_transport.mk1_memory_guard, "lock_buffer",
+        ) as lock_buffer, mock.patch.object(
+            secure_transport.mk1_memory_guard, "unlock_buffer",
+        ) as unlock_buffer:
+            secure_transport.set_memory_guard_enabled(True)
+            lock_buffer.assert_called_once_with(envelope.key)
+            secure_transport.set_memory_guard_enabled(False)
+            unlock_buffer.assert_called_once_with(envelope.key)
+        envelope.destroy()
+
+    def test_memory_guard_toggle_rolls_back_if_live_key_locking_fails(self):
+        public_key, _ = keygen()
+        fingerprint = hashlib.sha256(public_key).hexdigest()
+        envelope = secure_transport.create_encrypted_request(
+            public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+        )
+        with mock.patch.object(
+            secure_transport.mk1_memory_guard, "set_enabled",
+        ) as set_enabled, mock.patch.object(
+            secure_transport.mk1_memory_guard, "lock_buffer", side_effect=OSError("mlock failed"),
+        ), mock.patch.object(
+            secure_transport.mk1_memory_guard, "unlock_buffer",
+        ) as unlock_buffer:
+            with self.assertRaisesRegex(OSError, "mlock failed"):
+                secure_transport.set_memory_guard_enabled(True)
+
+        self.assertEqual(
+            [call.args for call in set_enabled.call_args_list],
+            [(True,), (False,)],
+        )
+        unlock_buffer.assert_called_once_with(envelope.key)
+        envelope.destroy()
+
+    def test_concurrent_disable_cannot_be_overridden_by_a_stale_enable(self):
+        verification_started = threading.Event()
+        finish_verification = threading.Event()
+        errors = []
+
+        def verify_routes():
+            verification_started.set()
+            finish_verification.wait(2)
+            return "wg0"
+
+        secure_transport.set_transport_enabled(False)
+        with mock.patch.object(
+            secure_transport, "_verify_wireguard_full_tunnel", side_effect=verify_routes,
+        ):
+            enabling = threading.Thread(
+                target=lambda: self._capture_enable_error(errors),
+            )
+            enabling.start()
+            self.assertTrue(verification_started.wait(2))
+            secure_transport.set_transport_enabled(False)
+            finish_verification.set()
+            enabling.join(2)
+
+        self.assertFalse(enabling.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], secure_transport.SecureTransportError)
+        self.assertFalse(secure_transport.transport_is_enabled())
+
+    @staticmethod
+    def _capture_enable_error(errors):
+        try:
+            secure_transport.set_transport_enabled(True)
+        except secure_transport.SecureTransportError as exc:
+            errors.append(exc)
 
     def test_encrypted_request_pins_server_key_and_keeps_token_inside_ciphertext(self):
         public_key, private_key = keygen()

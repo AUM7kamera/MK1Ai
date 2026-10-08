@@ -33,10 +33,23 @@ if ! command -v cc >/dev/null 2>&1; then
     printf 'Cコンパイラが必要です。\n' >&2
     exit 1
 fi
+if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists openssl; then
+    printf 'OpenSSL開発パッケージとpkg-configが必要です。\n' >&2
+    exit 1
+fi
+read -r -a openssl_flags <<<"$(pkg-config --cflags --libs openssl)"
+oqs_flags=()
+oqs_sources=()
+if pkg-config --exists liboqs; then
+    read -r -a oqs_flags <<<"$(pkg-config --cflags --libs liboqs)"
+    oqs_sources=(mk1_tunnel_oqs.c)
+fi
 
 temporary_binary="$(mktemp "${TMPDIR:-/tmp}/mk1-panel.XXXXXX")"
 trap 'rm -f "$temporary_binary"' EXIT
-cc -std=c11 -O2 -Wall -Wextra -Werror mk1_panel.c "${compile_flags[@]}" -o "$temporary_binary"
+cc -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+    mk1_panel.c mk1_memory_guard.c mk1_tunnel.c "${oqs_sources[@]}" \
+    "${compile_flags[@]}" "${openssl_flags[@]}" "${oqs_flags[@]}" -o "$temporary_binary"
 chmod 700 "$temporary_binary"
 
 if [[ "${1:-}" == "--check" ]]; then

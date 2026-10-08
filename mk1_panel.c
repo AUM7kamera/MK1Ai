@@ -10,15 +10,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "mk1_memory_guard.h"
+#include "mk1_tunnel.h"
 
 #define CONFIG_PATH "ai_data/panel-config.json"
 #define STATUS_PATH "ai_data/panel-status.txt"
 #define LOG_PATH "ai_data/panel.log"
+#define TUNNEL_CONTROL_PATH "ai_data/tunnel-control.sock"
 #define VALUE_SIZE 512
 
 typedef struct {
@@ -26,6 +31,10 @@ typedef struct {
     char mode[16];
     char colab_endpoint[VALUE_SIZE];
     int ram_limit;
+    int map_mode;
+    int usb_guard_enabled;
+    int secure_tunnel_enabled;
+    int memory_guard_enabled;
 } PanelConfig;
 
 typedef struct {
@@ -40,6 +49,8 @@ typedef struct {
     long long packets_total;
     int isolation_active;
     int dry_run;
+    int secure_tunnel_active;
+    int memory_guard_active;
 } PanelStatus;
 
 static pid_t monitor_pid = -1;
@@ -47,6 +58,7 @@ static pid_t dashboard_pid = -1;
 static volatile sig_atomic_t close_requested = 0;
 static volatile sig_atomic_t isolation_closed = 0;
 static char message[256] = "準備完了";
+static void set_message(const char *text);
 
 static void handle_shutdown_signal(int signal_number) {
     if (signal_number == SIGTERM) {
@@ -88,7 +100,13 @@ static bool read_json_string(const char *json, const char *key, char *output, si
     return true;
 }
 
-static bool read_json_integer(const char *json, const char *key, int *output) {
+static bool read_json_integer_range(
+    const char *json,
+    const char *key,
+    int minimum,
+    int maximum,
+    int *output
+) {
     char key_pattern[64];
     snprintf(key_pattern, sizeof(key_pattern), "\"%s\"", key);
     const char *position = strstr(json, key_pattern);
@@ -99,9 +117,13 @@ static bool read_json_integer(const char *json, const char *key, int *output) {
     char *end = NULL;
     errno = 0;
     long value = strtol(position, &end, 10);
-    if (errno != 0 || end == position || value < 1 || value > 1048576) return false;
+    if (errno != 0 || end == position || value < minimum || value > maximum) return false;
     *output = (int)value;
     return true;
+}
+
+static bool read_json_integer(const char *json, const char *key, int *output) {
+    return read_json_integer_range(json, key, 1, 1048576, output);
 }
 
 static void load_config_file(const char *path, PanelConfig *config) {
@@ -115,6 +137,10 @@ static void load_config_file(const char *path, PanelConfig *config) {
     read_json_string(content, "mode", config->mode, sizeof(config->mode));
     read_json_string(content, "colab_endpoint", config->colab_endpoint, sizeof(config->colab_endpoint));
     read_json_integer(content, "ram_limit", &config->ram_limit);
+    read_json_integer_range(content, "map_mode", 0, 2, &config->map_mode);
+    read_json_integer_range(content, "usb_guard_enabled", 0, 1, &config->usb_guard_enabled);
+    read_json_integer_range(content, "secure_tunnel_enabled", 0, 1, &config->secure_tunnel_enabled);
+    read_json_integer_range(content, "memory_guard_enabled", 0, 1, &config->memory_guard_enabled);
 }
 
 static void load_config(PanelConfig *config) {
@@ -122,6 +148,10 @@ static void load_config(PanelConfig *config) {
     copy_value(config->mode, sizeof(config->mode), "normal");
     config->colab_endpoint[0] = '\0';
     config->ram_limit = 500;
+    config->map_mode = 0;
+    config->usb_guard_enabled = 0;
+    config->secure_tunnel_enabled = 1;
+    config->memory_guard_enabled = 0;
     load_config_file("ai_data/config.json", config);
     load_config_file(CONFIG_PATH, config);
 }
@@ -132,6 +162,79 @@ static bool valid_interface(const char *value) {
         if (!isalnum(*character) && strchr("_.:@-", *character) == NULL) return false;
     }
     return true;
+}
+
+static bool valid_wireguard_interface(const char *value) {
+    size_t length = strlen(value);
+    if (length == 0 || length > 15) return false;
+    for (const unsigned char *character = (const unsigned char *)value; *character; character++) {
+        if (!((*character >= 'a' && *character <= 'z')
+              || (*character >= 'A' && *character <= 'Z')
+              || (*character >= '0' && *character <= '9')
+              || strchr("_.-", *character) != NULL)) return false;
+    }
+    return true;
+}
+
+static bool run_wireguard_link_state(const char *interface, bool enabled) {
+    pid_t child = fork();
+    if (child < 0) {
+        snprintf(message, sizeof(message), "WireGuard制御を起動できません: %s", strerror(errno));
+        return false;
+    }
+    if (child == 0) {
+        execlp("sudo", "sudo", "-n", "ip", "link", "set", "dev", interface,
+               enabled ? "up" : "down", (char *)NULL);
+        _exit(127);
+    }
+    int status = -1;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        snprintf(message, sizeof(message), "WireGuard制御の結果を取得できません: %s", strerror(errno));
+        return false;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        set_message("WireGuard操作に失敗しました。sudo権限とインターフェース名を確認してください");
+        return false;
+    }
+    return true;
+}
+
+static bool request_local_guard_state(char guard, bool enabled) {
+    int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (descriptor < 0) return false;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    if (strlen(TUNNEL_CONTROL_PATH) >= sizeof(address.sun_path)) {
+        close(descriptor);
+        return false;
+    }
+    copy_value(address.sun_path, sizeof(address.sun_path), TUNNEL_CONTROL_PATH);
+    if (connect(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(descriptor);
+        return false;
+    }
+    char command[2] = {guard, enabled ? '1' : '0'};
+    ssize_t sent;
+    do {
+        sent = send(descriptor, command, sizeof(command), 0);
+    } while (sent < 0 && errno == EINTR);
+    char response = '\0';
+    ssize_t received = -1;
+    if (sent == (ssize_t)sizeof(command)) {
+        do {
+            received = recv(descriptor, &response, 1, 0);
+        } while (received < 0 && errno == EINTR);
+    }
+    close(descriptor);
+    return received == 1 && response == '1';
+}
+
+static bool request_secure_transport_state(bool enabled) {
+    return request_local_guard_state('T', enabled);
+}
+
+static bool request_memory_guard_state(bool enabled) {
+    return request_local_guard_state('M', enabled);
 }
 
 static bool valid_endpoint(const char *value) {
@@ -174,7 +277,9 @@ static bool save_config(const PanelConfig *config) {
     }
     fputs("{\n  \"interface\": ", file);
     write_json_string(file, config->interface);
-    fprintf(file, ",\n  \"ram_limit\": %d,\n  \"mode\": ", config->ram_limit);
+    fprintf(file, ",\n  \"ram_limit\": %d,\n  \"map_mode\": %d,\n  \"usb_guard_enabled\": %d,\n  \"secure_tunnel_enabled\": %d,\n  \"memory_guard_enabled\": %d,\n  \"mode\": ",
+            config->ram_limit, config->map_mode, config->usb_guard_enabled,
+            config->secure_tunnel_enabled, config->memory_guard_enabled);
     write_json_string(file, config->mode);
     fputs(",\n  \"colab_endpoint\": ", file);
     write_json_string(file, config->colab_endpoint);
@@ -213,6 +318,8 @@ static bool read_status(PanelStatus *status) {
         if (sscanf(line, "ram_limit_mb=%lf", &status->ram_limit_mb) == 1) continue;
         if (sscanf(line, "swap_used_mb=%lf", &status->swap_used_mb) == 1) continue;
         if (sscanf(line, "isolation_active=%d", &status->isolation_active) == 1) continue;
+        if (sscanf(line, "secure_tunnel_active=%d", &status->secure_tunnel_active) == 1) continue;
+        if (sscanf(line, "memory_guard_active=%d", &status->memory_guard_active) == 1) continue;
         sscanf(line, "dry_run=%d", &status->dry_run);
     }
     fclose(file);
@@ -338,6 +445,142 @@ static bool authorize_admin(void) {
         return false;
     }
     return true;
+}
+
+static bool confirm_wireguard_change(const char *interface, bool enabled) {
+    erase();
+    attron(A_BOLD);
+    mvprintw(2, 2, "WireGuard制御の確認");
+    attroff(A_BOLD);
+    mvprintw(4, 2, "%s のリンクを %s にします。",
+             interface, enabled ? "有効" : "無効");
+    mvprintw(5, 2, "無効化すると、このWireGuard経由の通信が切断されます。");
+    mvprintw(6, 2, "有効化は既存リンクのip link upのみで、wg-quick設定は起動しません。");
+    mvprintw(7, 2, "カーネルのWireGuard秘密鍵をユーザー空間から消去する操作ではありません。");
+    mvprintw(9, 2, "続行しますか? [y]=続行 / その他のキー=キャンセル");
+    refresh();
+    nodelay(stdscr, FALSE);
+    int answer = getch();
+    nodelay(stdscr, TRUE);
+    return answer == 'y' || answer == 'Y';
+}
+
+static void toggle_secure_tunnel(PanelConfig *config) {
+    const char *interface = getenv("MK1_WIREGUARD_INTERFACE");
+    if (interface == NULL || interface[0] == '\0') interface = "wg0";
+    if (!valid_wireguard_interface(interface)) {
+        set_message("MK1_WIREGUARD_INTERFACEが不正です。英数字・_.-の15文字以内で指定してください");
+        return;
+    }
+
+    bool enabled = !config->secure_tunnel_enabled;
+    int previous_state = config->secure_tunnel_enabled;
+    if (!confirm_wireguard_change(interface, enabled)) {
+        set_message("WireGuard操作をキャンセルしました");
+        return;
+    }
+    if (!authorize_admin()) return;
+
+    bool transport_acknowledged = monitor_pid <= 0;
+    bool local_key_wiped = true;
+    if (!enabled) {
+        local_key_wiped = mk1_secure_key_wipe() == 0;
+        if (monitor_pid > 0) {
+            transport_acknowledged = request_secure_transport_state(false);
+        }
+        config->secure_tunnel_enabled = 0;
+        if (!save_config(config)) {
+            config->secure_tunnel_enabled = previous_state;
+            return;
+        }
+        if (!local_key_wiped) {
+            set_message("C暗号鍵mutex取得に失敗。リンク遮断を続行しますが鍵消去を確認できません");
+        }
+    }
+    if (!run_wireguard_link_state(interface, enabled)) {
+        char operation_error[sizeof(message)];
+        copy_value(operation_error, sizeof(operation_error), message);
+        config->secure_tunnel_enabled = previous_state;
+        if (!save_config(config)) {
+            set_message("WireGuard操作失敗後、設定の復元にも失敗しました");
+        } else {
+            copy_value(message, sizeof(message), operation_error);
+        }
+        if (!enabled && monitor_pid > 0 && previous_state) {
+            bool restored = request_secure_transport_state(true);
+            if (restored && mk1_tunnel_set_enabled(true) != 0) {
+                (void)mk1_secure_key_wipe();
+                (void)request_secure_transport_state(false);
+            }
+        }
+        return;
+    }
+    if (enabled) {
+        config->secure_tunnel_enabled = 1;
+        if (!save_config(config)) {
+            config->secure_tunnel_enabled = previous_state;
+            if (!run_wireguard_link_state(interface, false)) {
+                set_message("設定保存失敗。WireGuardの復旧遮断にも失敗しました");
+            } else {
+                set_message("設定保存失敗のためWireGuardを再び無効化しました");
+            }
+            return;
+        }
+    }
+    if (enabled && monitor_pid > 0) {
+        transport_acknowledged = request_secure_transport_state(true);
+    }
+    if (enabled && transport_acknowledged && monitor_pid > 0) {
+        if (mk1_tunnel_set_enabled(true) != 0) {
+            (void)mk1_secure_key_wipe();
+            transport_acknowledged = false;
+            (void)request_secure_transport_state(false);
+        }
+    }
+    if (enabled && !transport_acknowledged && mk1_secure_key_wipe() != 0) {
+        set_message("経路検証失敗に加えC暗号鍵mutex取得にも失敗しました");
+        return;
+    }
+    if (enabled && monitor_pid > 0 && !transport_acknowledged) {
+        set_message("リンクはupですがPQC経路検証に失敗。暗号送信ゲートは遮断のままです");
+    } else if (!enabled && monitor_pid > 0 && !transport_acknowledged) {
+        set_message("WireGuard停止済み。鍵消去IPC未確認のため設定監視による反映を待っています");
+    } else if (!enabled) {
+        set_message("WireGuardリンクを停止し、稼働中のPQC鍵を消去・送信拒否しました");
+    } else if (monitor_pid > 0) {
+        set_message("WireGuardリンクとフルトンネル経路を検証し、PQC送信を許可しました");
+    } else {
+        set_message("WireGuardリンクをupにしました。監視起動時にフルトンネル経路を検証します");
+    }
+    if (!enabled && !local_key_wiped) {
+        set_message("C暗号鍵mutex取得に失敗。リンクは遮断しましたが鍵消去を確認できません");
+    }
+}
+
+static void toggle_memory_guard(PanelConfig *config) {
+    bool enabled = !config->memory_guard_enabled;
+    int previous_state = config->memory_guard_enabled;
+    int guard_error = mk1_memory_guard_set_enabled(enabled);
+    if (guard_error != 0) {
+        snprintf(message, sizeof(message), "メモリ保護を変更できません: %s",
+                 strerror(guard_error));
+        return;
+    }
+    config->memory_guard_enabled = enabled ? 1 : 0;
+    if (!save_config(config)) {
+        config->memory_guard_enabled = previous_state;
+        (void)mk1_memory_guard_set_enabled(previous_state != 0);
+        return;
+    }
+    bool monitor_acknowledged = monitor_pid <= 0
+        || request_memory_guard_state(enabled);
+    if (!monitor_acknowledged) {
+        set_message("パネル側は切替済み。監視プロセスへの同期IPC未確認、設定監視へフォールバックします");
+    } else {
+        set_message(enabled
+            ? "メモリ保護を有効化。ダンプ抑止・ptrace制限・TracerPid監視を開始しました"
+            : "メモリ保護を無効化しました");
+    }
 }
 
 static bool start_monitor(const PanelConfig *config, bool full_isolation) {
@@ -548,6 +791,13 @@ static void show_interfaces(void) {
 }
 
 static void draw_panel(const PanelConfig *config) {
+    if (
+        mk1_memory_guard_is_enabled()
+        && mk1_memory_guard_check_tracer() != 0
+    ) {
+        (void)kill(getpid(), SIGKILL);
+        return;
+    }
     PanelStatus status;
     bool status_available = read_status(&status);
     if (monitor_pid > 0 && !isolation_closed) {
@@ -575,6 +825,10 @@ static void draw_panel(const PanelConfig *config) {
              config->interface, config->mode, config->ram_limit);
     mvprintw(4, 2, "Colab HTTPS: %s",
              config->colab_endpoint[0] ? config->colab_endpoint : "未設定");
+    const char *map_mode = config->map_mode == 1 ? "Chrome WebSocket" :
+        config->map_mode == 2 ? "Local offline cache" : "OFF";
+    mvprintw(5, 2, "地図表示: %-20s %s",
+             map_mode, config->map_mode == 1 ? "ws://127.0.0.1:9001/map" : "");
     mvprintw(6, 2, "監視状態: %s", monitor_pid > 0 ? "起動中" : "停止中");
     mvprintw(7, 2, "処理速度: %.2f packets/sec   累計: %lld",
              status_available ? status.packets_per_second : 0.0,
@@ -594,11 +848,21 @@ static void draw_panel(const PanelConfig *config) {
              status_available ? status.ram_used_mb : 0.0,
              status_available ? status.ram_limit_mb : 0.0,
              status_available ? status.swap_used_mb : 0.0);
+    mvprintw(12, 2, "USB隔離設定: %s (実遮断モード時のみ有効)",
+             config->usb_guard_enabled ? "有効" : "無効");
+    mvprintw(13, 2, "Encrypted Sandbox Tunnel: %s / PQC送信ゲート: %s",
+             config->secure_tunnel_enabled ? "ON" : "OFF",
+             !status_available ? "状態未取得" :
+             status.secure_tunnel_active ? "許可" : "遮断");
+    mvprintw(14, 2, "メモリ保護: %s / 監視プロセス: %s",
+             config->memory_guard_enabled ? "ON" : "OFF",
+             !status_available ? "状態未取得" :
+             status.memory_guard_active ? "有効" : "無効");
 
-    mvprintw(13, 2, "[1] Dry-Run起動 [2] 停止 [3] 実遮断起動 [4] 設定");
-    mvprintw(14, 2, "[5] NIC一覧 [6] ローカル検証 [7] HTTPS閲覧開始 [8] 停止");
-    mvprintw(15, 2, "リモート閲覧: %s", dashboard_pid > 0 ? "HTTPSサーバー稼働中 (認証必須)" : "停止中");
-    mvprintw(16, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
+    mvprintw(16, 2, "[1] Dry-Run [2] 停止 [3] 実遮断 [4] 設定 [m] 地図 [u] USB [e] WG [a] メモリ");
+    mvprintw(17, 2, "[5] NIC一覧 [6] ローカル検証 [7] HTTPS閲覧開始 [8] 停止");
+    mvprintw(18, 2, "リモート閲覧: %s", dashboard_pid > 0 ? "HTTPSサーバー稼働中 (閲覧専用)" : "停止中");
+    mvprintw(19, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
     mvprintw(LINES - 2, 2, "状態: %s%s", status_available ? status.state : "ステータス未出力",
              isolation_closed ? " / 隔離後ローカル復旧が必要" : "");
     refresh();
@@ -617,6 +881,14 @@ int main(void) {
     }
     PanelConfig config;
     load_config(&config);
+    if (config.memory_guard_enabled) {
+        int guard_error = mk1_memory_guard_set_enabled(true);
+        if (guard_error != 0) {
+            fprintf(stderr, "設定済みメモリ保護を有効化できません: %s\n",
+                    strerror(guard_error));
+            return 1;
+        }
+    }
 
     if (initscr() == NULL) {
         fprintf(stderr, "端末画面を初期化できません。対話端末で起動してください。\n");
@@ -627,13 +899,58 @@ int main(void) {
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
-    signal(SIGTERM, handle_shutdown_signal);
+    struct sigaction shutdown_action = {0};
+    shutdown_action.sa_handler = handle_shutdown_signal;
+    sigemptyset(&shutdown_action.sa_mask);
+    if (sigaction(SIGTERM, &shutdown_action, NULL) != 0) {
+        endwin();
+        fprintf(stderr, "SIGTERMハンドラーを設定できません: %s\n", strerror(errno));
+        return 1;
+    }
+    struct sigaction pipe_action = {0};
+    pipe_action.sa_handler = SIG_IGN;
+    sigemptyset(&pipe_action.sa_mask);
+    if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
+        endwin();
+        fprintf(stderr, "SIGPIPEハンドラーを設定できません: %s\n", strerror(errno));
+        return 1;
+    }
 
     bool running = true;
     while (running && !close_requested) {
         draw_panel(&config);
         int key = getch();
         switch (key) {
+            case 'm': {
+                int previous_mode = config.map_mode;
+                config.map_mode = (config.map_mode + 1) % 3;
+                if (!save_config(&config)) {
+                    config.map_mode = previous_mode;
+                } else {
+                    set_message("地図表示モードを保存しました。監視中は自動で反映されます");
+                }
+                break;
+            }
+            case 'u': {
+                int previous_state = config.usb_guard_enabled;
+                config.usb_guard_enabled = !config.usb_guard_enabled;
+                if (!save_config(&config)) {
+                    config.usb_guard_enabled = previous_state;
+                } else {
+                    set_message(config.usb_guard_enabled
+                        ? "USB隔離を有効にしました。実遮断監視の起動時のみ適用"
+                        : "USB隔離を無効にしました");
+                }
+                break;
+            }
+            case 'e':
+            case 'E':
+                toggle_secure_tunnel(&config);
+                break;
+            case 'a':
+            case 'A':
+                toggle_memory_guard(&config);
+                break;
             case '1':
                 start_monitor(&config, false);
                 break;
@@ -670,8 +987,14 @@ int main(void) {
         }
         napms(250);
     }
+    bool key_wiped = mk1_secure_key_wipe() == 0;
+    (void)request_secure_transport_state(false);
     if (!isolation_closed) stop_monitor();
     stop_dashboard();
     endwin();
+    if (!key_wiped) {
+        fprintf(stderr, "C暗号鍵の破棄に失敗しました。\n");
+        return 1;
+    }
     return 0;
 }

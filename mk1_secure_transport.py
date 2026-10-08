@@ -10,10 +10,15 @@ import json
 import os
 import platform
 import re
+import socket
+import stat
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+import mk1_memory_guard
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -25,16 +30,237 @@ class SecureTransportError(RuntimeError):
     """Raised when the required tunnel or pinned PQC transport is unavailable."""
 
 
-@dataclass(frozen=True)
+_TRANSPORT_STATE_LOCK = threading.RLock()
+_TRANSPORT_ENABLED = True
+_TRANSPORT_GENERATION = 0
+_ACTIVE_ENVELOPES: set["EncryptedRequest"] = set()
+
+
+class TunnelControlServer:
+    """Private local IPC endpoint for synchronous key destruction requests."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._stop_event = threading.Event()
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._socket_identity: tuple[int, int] | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        try:
+            existing = os.lstat(self.path)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.geteuid():
+                raise SecureTransportError("Refusing to replace an untrusted tunnel control path")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.2)
+            try:
+                probe.connect(self.path)
+            except ConnectionRefusedError:
+                pass
+            else:
+                raise SecureTransportError("A tunnel control server is already active")
+            finally:
+                probe.close()
+            os.unlink(self.path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(self.path)
+            sudo_uid = os.environ.get("SUDO_UID", "")
+            sudo_gid = os.environ.get("SUDO_GID", "")
+            if os.geteuid() == 0 and sudo_uid.isdigit() and sudo_gid.isdigit():
+                os.chown(self.path, int(sudo_uid), int(sudo_gid))
+            os.chmod(self.path, 0o600)
+            socket_stat = os.lstat(self.path)
+            self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
+            listener.listen(4)
+            listener.settimeout(0.2)
+        except OSError:
+            listener.close()
+            self._unlink_owned_socket()
+            raise
+        self._listener = listener
+        self._thread = threading.Thread(
+            target=self._serve, name="mk1-tunnel-control", daemon=True,
+        )
+        self._thread.start()
+
+    def _serve(self) -> None:
+        listener = self._listener
+        if listener is None:
+            return
+        while not self._stop_event.is_set():
+            try:
+                client, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._stop_event.is_set():
+                    return
+                break
+            with client:
+                try:
+                    client.settimeout(1.0)
+                    command = bytearray()
+                    while len(command) < 2:
+                        chunk = client.recv(2 - len(command))
+                        if not chunk:
+                            break
+                        command.extend(chunk)
+                    if len(command) != 2 or command[0:1] not in (b"T", b"M") or command[1:2] not in (b"0", b"1"):
+                        client.sendall(b"0")
+                        continue
+                    enabled = command[1:2] == b"1"
+                    if command[0:1] == b"T":
+                        set_transport_enabled(enabled)
+                    else:
+                        set_memory_guard_enabled(enabled)
+                    client.sendall(b"1")
+                except (OSError, SecureTransportError, RuntimeError, ValueError):
+                    try:
+                        client.sendall(b"0")
+                    except OSError:
+                        pass
+
+    def _unlink_owned_socket(self) -> None:
+        if self._socket_identity is None:
+            return
+        try:
+            current = os.lstat(self.path)
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISSOCK(current.st_mode)
+            and (current.st_dev, current.st_ino) == self._socket_identity
+        ):
+            os.unlink(self.path)
+        self._socket_identity = None
+
+    def close(self) -> None:
+        self._stop_event.set()
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            listener.close()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("Tunnel control server did not stop")
+        self._unlink_owned_socket()
+
+
+def _wipe_buffer(buffer: bytearray) -> None:
+    mk1_memory_guard.wipe_buffer(buffer)
+
+
+def _lock_secret_buffer(buffer: bytearray) -> None:
+    if mk1_memory_guard.is_enabled():
+        mk1_memory_guard.lock_buffer(buffer)
+
+
+def _protect_secret_buffers(*buffers: bytearray) -> None:
+    if not mk1_memory_guard.is_enabled():
+        return
+    for buffer in buffers:
+        _lock_secret_buffer(buffer)
+
+
+def set_memory_guard_enabled(enabled: bool) -> None:
+    """Toggle process hardening and protect every live transport key atomically."""
+    if not isinstance(enabled, bool):
+        raise ValueError("Memory guard state must be a boolean")
+    with _TRANSPORT_STATE_LOCK:
+        mk1_memory_guard.set_enabled(enabled)
+        envelopes = tuple(_ACTIVE_ENVELOPES)
+        if not enabled:
+            for envelope in envelopes:
+                mk1_memory_guard.unlock_buffer(envelope.key)
+            return
+        try:
+            for envelope in envelopes:
+                mk1_memory_guard.lock_buffer(envelope.key)
+        except OSError:
+            for envelope in envelopes:
+                mk1_memory_guard.unlock_buffer(envelope.key)
+            mk1_memory_guard.set_enabled(False)
+            raise
+
+
+@dataclass(eq=False)
 class EncryptedRequest:
     kem_ciphertext: bytes
     body: bytes
-    key: bytes
+    key: bytearray
     aad: bytes
+    _key_lock: threading.Lock
+    _destroyed: bool = False
+
+    def destroy(self) -> None:
+        with _TRANSPORT_STATE_LOCK:
+            with self._key_lock:
+                if self._destroyed:
+                    return
+                _wipe_buffer(self.key)
+                self._destroyed = True
+            _ACTIVE_ENVELOPES.discard(self)
+
+
+def transport_is_enabled() -> bool:
+    with _TRANSPORT_STATE_LOCK:
+        return _TRANSPORT_ENABLED
+
+
+def set_transport_enabled(enabled: bool) -> None:
+    """Gate PQC transport; disabling also wipes every registered session key."""
+    if not isinstance(enabled, bool):
+        raise ValueError("Transport state must be a boolean")
+    global _TRANSPORT_ENABLED, _TRANSPORT_GENERATION
+    if enabled:
+        with _TRANSPORT_STATE_LOCK:
+            generation = _TRANSPORT_GENERATION
+        _verify_wireguard_full_tunnel()
+        with _TRANSPORT_STATE_LOCK:
+            if generation != _TRANSPORT_GENERATION:
+                raise SecureTransportError("Transport state changed during WireGuard verification")
+            _TRANSPORT_ENABLED = True
+        return
+    with _TRANSPORT_STATE_LOCK:
+        _TRANSPORT_GENERATION += 1
+        _TRANSPORT_ENABLED = False
+        for envelope in tuple(_ACTIVE_ENVELOPES):
+            envelope.destroy()
+
+
+def request_transport_state(path: str, enabled: bool) -> bool:
+    """Request a synchronous local gate/key update from the active monitor."""
+    if not isinstance(enabled, bool):
+        raise ValueError("Transport state must be a boolean")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2.0)
+            client.connect(path)
+            client.sendall(b"T1" if enabled else b"T0")
+            return client.recv(1) == b"1"
+    except OSError:
+        return False
+
+
+def _require_transport_enabled() -> None:
+    if not transport_is_enabled():
+        raise SecureTransportError("Encrypted transport is disabled")
 
 
 def require_wireguard_full_tunnel(interface: str | None = None) -> str:
     """Require an active WireGuard peer and IPv4/IPv6 default routes through it."""
+    _require_transport_enabled()
+    return _verify_wireguard_full_tunnel(interface)
+
+
+def _verify_wireguard_full_tunnel(interface: str | None = None) -> str:
     interface = (interface or os.environ.get("MK1_WIREGUARD_INTERFACE", "wg0")).strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", interface):
         raise SecureTransportError("MK1_WIREGUARD_INTERFACE is invalid")
@@ -136,24 +362,49 @@ def create_encrypted_request(
     path: str,
     fingerprint: str,
 ) -> EncryptedRequest:
-    kem_ciphertext, shared_secret = encaps(public_key)
-    aad = _request_aad(method, path, fingerprint, kem_ciphertext)
-    key = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=hashlib.sha256(aad).digest(),
-        info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
-    ).derive(shared_secret)
-    nonce = os.urandom(12)
-    plaintext = json.dumps(
-        payload, separators=(",", ":"), allow_nan=False,
-    ).encode("utf-8")
-    return EncryptedRequest(
-        kem_ciphertext=kem_ciphertext,
-        body=nonce + AESGCM(key).encrypt(nonce, plaintext, aad),
-        key=key,
-        aad=aad,
-    )
+    with _TRANSPORT_STATE_LOCK:
+        _require_transport_enabled()
+        kem_ciphertext, shared_secret_bytes = encaps(public_key)
+        shared_secret = bytearray(shared_secret_bytes)
+        del shared_secret_bytes
+        key = bytearray()
+        cipher = None
+        try:
+            _protect_secret_buffers(shared_secret)
+            aad = _request_aad(method, path, fingerprint, kem_ciphertext)
+            derived_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=hashlib.sha256(aad).digest(),
+                info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
+            ).derive(shared_secret)
+            key.extend(derived_key)
+            del derived_key
+            _protect_secret_buffers(key)
+            nonce = os.urandom(12)
+            plaintext = json.dumps(
+                payload, separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")
+            cipher = AESGCM(key)
+            body = nonce + cipher.encrypt(nonce, plaintext, aad)
+            del cipher
+            cipher = None
+            envelope = EncryptedRequest(
+                kem_ciphertext=kem_ciphertext,
+                body=body,
+                key=key,
+                aad=aad,
+                _key_lock=threading.Lock(),
+            )
+            _ACTIVE_ENVELOPES.add(envelope)
+            return envelope
+        except Exception:
+            if cipher is not None:
+                del cipher
+            _wipe_buffer(key)
+            raise
+        finally:
+            _wipe_buffer(shared_secret)
 
 
 def encrypt_server_response(
@@ -165,25 +416,50 @@ def encrypt_server_response(
     fingerprint: str,
 ) -> bytes:
     aad = _request_aad(method, path, fingerprint, kem_ciphertext)
-    shared_secret = decaps(private_key, kem_ciphertext)
-    key = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=hashlib.sha256(aad).digest(),
-        info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
-    ).derive(shared_secret)
-    nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(
-        nonce, plaintext, aad + b"\0response",
-    )
+    shared_secret_bytes = decaps(private_key, kem_ciphertext)
+    shared_secret = bytearray(shared_secret_bytes)
+    del shared_secret_bytes
+    key = bytearray()
+    cipher = None
+    try:
+        _protect_secret_buffers(shared_secret)
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=hashlib.sha256(aad).digest(),
+            info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
+        ).derive(shared_secret)
+        key.extend(derived_key)
+        del derived_key
+        _protect_secret_buffers(key)
+        nonce = os.urandom(12)
+        cipher = AESGCM(key)
+        encrypted = nonce + cipher.encrypt(
+            nonce, plaintext, aad + b"\0response",
+        )
+        del cipher
+        cipher = None
+        return encrypted
+    finally:
+        if cipher is not None:
+            del cipher
+        _wipe_buffer(key)
+        _wipe_buffer(shared_secret)
 
 
 def decrypt_server_response(encrypted_request: EncryptedRequest, body: bytes) -> bytes:
     if len(body) < 12 + 16:
         raise SecureTransportError("Encrypted server response is truncated")
-    return AESGCM(encrypted_request.key).decrypt(
-        body[:12], body[12:], encrypted_request.aad + b"\0response",
-    )
+    with encrypted_request._key_lock:
+        if encrypted_request._destroyed:
+            raise SecureTransportError("Encrypted transport session key was destroyed")
+        cipher = AESGCM(encrypted_request.key)
+        try:
+            return cipher.decrypt(
+                body[:12], body[12:], encrypted_request.aad + b"\0response",
+            )
+        finally:
+            del cipher
 
 
 def pinned_server_public_key(
@@ -222,6 +498,7 @@ def encrypted_request(
     method: str = "POST",
     max_response_bytes: int = 2 * 1024 * 1024,
 ) -> bytes:
+    _require_transport_enabled()
     if not token:
         raise SecureTransportError("An API token is required for encrypted Colab requests")
     require_wireguard_full_tunnel()
@@ -236,17 +513,18 @@ def encrypted_request(
         parsed.path or "/",
         fingerprint,
     )
-    response = requests_module.post(
-        endpoint,
-        data=envelope.body,
-        headers={
-            "Content-Type": "application/octet-stream",
-            "X-MK1-KEM": base64.b64encode(envelope.kem_ciphertext).decode("ascii"),
-        },
-        timeout=(60, 300),
-        stream=True,
-    )
+    response = None
     try:
+        response = requests_module.post(
+            endpoint,
+            data=envelope.body,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-MK1-KEM": base64.b64encode(envelope.kem_ciphertext).decode("ascii"),
+            },
+            timeout=(60, 300),
+            stream=True,
+        )
         response.raise_for_status()
         content_length = response.headers.get("Content-Length")
         if content_length and int(content_length) > max_response_bytes:
@@ -262,7 +540,11 @@ def encrypted_request(
             chunks.append(chunk)
         return decrypt_server_response(envelope, b"".join(chunks))
     finally:
-        response.close()
+        try:
+            if response is not None:
+                response.close()
+        finally:
+            envelope.destroy()
 
 
 def validate_public_key_pin(value: str) -> bool:

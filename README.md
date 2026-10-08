@@ -95,11 +95,58 @@ COLAB_RSI_ENDPOINT="https://<your-authenticated-endpoint>/rsi" \
 bash ./mk1-panel.sh
 ```
 
-- ChromebookはLinux開発環境 (Crostini) の端末で起動します。macOSはTerminalで起動します。WindowsはWSLとLinuxディストリビューションを用意し、コマンドプロンプトから `mk1-gui.cmd` を実行します (Windowsネイティブ版ではありません)。各環境にCコンパイラとncurses開発ファイルが必要です。
+- ChromebookはLinux開発環境 (Crostini) の端末で起動します。macOSはTerminalで起動します。WindowsはWSLとLinuxディストリビューションを用意し、コマンドプロンプトから `mk1-gui.cmd` を実行します (Windowsネイティブ版ではありません)。各環境にCコンパイラ、ncurses、OpenSSL開発ファイルおよび `pkg-config` が必要です。
+- ネイティブCのビルドと実行安全性テストは `make check` で実行できます。Linuxのfork子プロセスで `PR_SET_DUMPABLE` によるptrace拒否を試し、OpenSSL初期化/AES-256-GCMと `OPENSSL_cleanse` のゼロ化を検証します。libsodium・libbpf・liboqsは任意依存としてロード/API可用性/初期化を検査し、未導入の場合はSKIPを明示します。liboqsの開発パッケージがある環境ではC側の実ML-KEM-768 keygen/encapsulate/decapsulateとAES-GCM往復も実行します。`make analyze` はClang静的解析を実行します。
 - `[1]` は起動前警告に同意した後にDry-Run監視を起動します。Dry-Runは異常を検知しても通信を切断しないため、実際の遮断を提供しません。
 - `[3]` は監視開始前に全通信遮断の警告を表示し、続行には `y` と管理者認証が必要です。監視中は検知前の警告待ちやユーザー確認を挟まず、検知後すぐ全ネットワークインターフェースの停止を試行します。停止成功後に操作パネルとリモート画面サーバーを終了します。SSHや遠隔アクセスも例外なく切断する方針で、遠隔復旧経路は提供しません。誤検知やOSの権限・ファイアウォール・カーネルの制限により、遮断に失敗する可能性があります。ハードウェア・カーネルを迂回不能にする「絶対保証」ではありません。
 - `[4]` でNIC、RAM監視基準、通常/RSIモード、Colab HTTPS URLを編集できます。`[5]` はNIC一覧、`[6]` はGoogle Driveへ接続しないローカル検証です。監視中は処理パケット/秒、累計、脅威・バックドアリスク、隔離状態、RAM・swapを表示します。設定は `ai_data/panel-config.json` に権限 `0600` で保存し、ログは `ai_data/panel.log` に追記します。
+- `[m]` は地図モードを `OFF` → `Chrome` → `Local` の順に切り替えます。監視中は設定ファイルの変更を監視ループが反映し、OFFでは地図ワーカーを起動しません。Chromeモードは `127.0.0.1:9001/map` のWebSocketで、Chrome拡張Originからの読み取り専用接続だけを受け付けます。Localモードは外部通信をせず、イベントを `ai_data/map-events.jsonl` に保存します (Raylib描画はこのMVPには含みません)。
+- 地図イベントは脅威判定後に上限付きの非同期キューへ投入し、配信・保存は遮断処理と別スレッドで行います。イベントにはグローバルIPのみを含め、GeoIPデータセットがない位置、RSSIがない距離、パケットから確実に判別できないOSは `null` / `unknown` のままです。日本の市区町村や海外の行政区画、実座標を推定する機能ではありません。
 - `[7]` は閲覧専用ダッシュボードを起動し、`[8]` は停止します。依存を `.venv-mk1/bin/python -m pip install -r requirements-remote.txt` で導入します。アプリはloopbackにだけHTTP bindし、外部接続はNginxがWireGuard IP上でTLSを終端します。スマートフォンを含むクライアントもWireGuardへ接続しなければ到達できません。
+- `[u]` はUSB隔離ポリシーをローカルで切り替えます。Linuxの `[3]` 実遮断モードに限り、別のrootワーカーがUSB ueventを監視します。Dry-Run、RSI、macOS、非root起動ではUSBを遮断しません。リモート画面からこの設定を変更するAPIはありません。
+- `[e]` は `MK1_WIREGUARD_INTERFACE` (未設定時 `wg0`) のリンクを `sudo -n ip link set ... up/down` で切り替え、PQC/AES-GCM送信ゲートへ設定を通知します。切断はWireGuardリンク上の全通信に影響し、起動は既存インターフェースをupにするだけで `wg-quick` の構成読込は行いません。監視中は0600のUnix domain socketでPython暗号バックエンドへ同期要求し、無効化時にはCの `mk1_secure_key_wipe()` とPython側の鍵破棄を行ってからリンクdownを試みます。RSI送信を再許可する前にアプリがWireGuard peerとIPv4/IPv6デフォルト経路を再検証します。Cの `mk1_tunnel.c` はOpenSSL EVPでAES-256-GCM/HKDF-SHA-256を実装します。liboqs開発パッケージがあれば `mk1_tunnel_oqs.c` が実ML-KEM-768 providerを接続し、なければPQC C providerを利用できません。パネルの実通信は既存の `pqcrypto`/`cryptography` Pythonバックエンドが担い、ダミーPQC実装や平文fallbackはありません。鍵wipeはアプリ所有バッファへの措置で、暗号ライブラリ内部・不変オブジェクト・allocator内の全コピーやカーネル内WireGuard秘密鍵まで消去する保証ではありません。リンク状態と暗号化送信ゲートは別々に fail-closed となり、物理NICやOS全体のegress kill-switchを保証しません。
+- `[a]` はLinuxプロセスメモリ保護を切り替えます。パネルと監視プロセスのダンプ抑止、ptrace制限、TracerPid監視に加え、保護中の暗号セッション鍵への `mlock` / `MADV_DONTDUMP` 適用を試みます。設定ONを監視プロセスへ適用できない場合はFail-Closedで起動を中止します。
+- USBスキャンが脅威を返した場合も同じローカルIPCでメイン防衛プロセスへ同期的に鍵消去を要求してから、rootワーカーがiproute2によるNIC遮断を試します。IPC確認に失敗してもNIC遮断は続行します。
+- 独自のcBPFフィルター・Netlink Connector ABI組み立て・AF_PACKET用カーネルバイパスは削除しました。パケット検査はユーザー空間で行い、プロセス監視は `psutil` による定期走査です。低遅延XDP/eBPF offloadや `SCHED_FIFO` は実装・保証していません。USB脅威時のNIC停止はroot所有の `iproute2` 実行ファイルに `ip link` netlink操作を依頼し、状態を再照会します。
+
+### Linux USB隔離 (実験的機能)
+
+これはOS上の**論理隔離**であり、USB電源を物理的に切る機能ではありません。USBのsysfs unbindに失敗すれば物理接続は維持されます。また、ソフトウェア設定だけで「軍事レベル」や侵害不能を保証することはできません。専用の電源遮断ハードウェア、Linux/KVM、USBコントローラー、udev/自動マウント構成を含め、実機での検証が必要です。
+
+有効化すると、未登録HIDと未承認のUSBデバイスはsysfs unbindで拒否します。USBストレージはホストのusb-storage/UASドライバーを外してから、USBデバイスをネットワークなしの一時QEMU/KVMゲストへ直接渡し、読み取り専用でマウントしてClamAVスキャンします。スキャン後はclean判定でもUSBをホストへ自動再認可しません。脅威判定ではUSBの論理切断を試行し、併せてrootワーカーが検証済みiproute2実行ファイル経由で全ネットワークインターフェースの停止を試します。検証鍵・署名・イメージ・QEMU/KVM・スキャン・sysfs操作のいずれかが失敗した場合、USBを未許可として切断します。ゲスト内でファイルシステムを読めない場合もclean扱いにせず、fail-closedにします。
+
+**ホストのマウント競合:** uevent監視はカーネルイベントの非同期通知です。udevルールは一般的なUDisks自動マウントを抑止し、既にマウント済みのUSBブロックデバイスはゲストへ渡さず切断します。しかし、独自の自動マウンター、別の特権プロセス、カーネル/udevのタイミングまで完全に封じるものではありません。使用するLinuxディストリビューションで自動マウントを無効化し、udevルールを配備して試験してください。
+
+1. LinuxホストにQEMU (`qemu-system-x86_64`)、KVM (`/dev/kvm`)、Docker/BuildKit、OpenSSL、`sha256sum`、ClamAVの信頼できる `main.cvd` と `daily.cvd` (または `.cld`) を準備します。Alpine base imageは完全な `sha256` digestで、APK repositoryはTLSを使う固定snapshot URLにしてください。ClamAVデータベースの内容も固定します。GNU cpioのreproducible modeと `gzip -n` を使い、同じ固定入力から同じinitramfsを生成します。
+2. ゲストをビルドします。例の `@sha256:<64桁>`、snapshot URL、database path、epochは、運用者が信頼できる値に置き換えてください。
+
+   ```bash
+   bash security/usb-scan-guest/build.sh \
+     --base-image 'alpine:VERSION@sha256:<64桁のdigest>' \
+     --apk-repository 'https://<固定snapshot>/alpine/vVERSION' \
+     --clamav-db /path/to/pinned-clamav-db \
+     --output /tmp/mk1-usb-scan-guest
+   ```
+
+3. 未署名アーティファクトをオフライン署名端末へ移し、オフライン保管するEd25519秘密鍵 (権限 `0600`) で `bash security/usb-scan-guest/sign.sh /secure/offline/signing-key.pem /path/to/mk1-usb-scan-guest` を実行します。署名端末で得た公開鍵は、別の信頼済み経路でホストへ配備してください。ゲストと同じ未信頼転送経路から入手した公開鍵をそのまま信頼してはいけません。
+4. root所有の場所へ検証済みアーティファクトを配置し、公開鍵をホストの独立した信頼根として固定します。
+
+   ```bash
+   sudo install -d -o root -g root -m 0755 /etc/mk1ai /var/lib/mk1ai/usb-scan-guest
+   sudo install -o root -g root -m 0644 /path/to/mk1-usb-scan-guest/mk1-usb-scan-signing.pub /etc/mk1ai/usb-scan-signing.pub
+   sudo install -o root -g root -m 0644 /path/to/mk1-usb-scan-guest/vmlinuz /var/lib/mk1ai/usb-scan-guest/vmlinuz
+   sudo install -o root -g root -m 0644 /path/to/mk1-usb-scan-guest/initramfs.cpio.gz /var/lib/mk1ai/usb-scan-guest/initramfs.cpio.gz
+   sudo install -o root -g root -m 0644 /path/to/mk1-usb-scan-guest/manifest.json /var/lib/mk1ai/usb-scan-guest/manifest.json
+   sudo install -o root -g root -m 0644 /path/to/mk1-usb-scan-guest/manifest.sig /var/lib/mk1ai/usb-scan-guest/manifest.sig
+   sudo install -D -o root -g root -m 0644 security/udev/99-mk1ai-usb-storage.rules /etc/udev/rules.d/99-mk1ai-usb-storage.rules
+   sudo udevadm control --reload-rules
+   ```
+
+   画像ディレクトリ、各イメージ、manifest、署名と公開鍵はroot所有かつgroup/world writableでないことが必要です。ホストが検証する公開鍵は `/etc/mk1ai/usb-scan-signing.pub` に固定し、ゲストディレクトリ内の公開鍵を自動信頼しません。
+5. 登録するHIDは端末のローカルrootシェルで `sudo python3 mk1_usb_guard.py list-hid` を実行して識別し、続けて `sudo python3 mk1_usb_guard.py enroll-hid 1-2` (IDは実際の一覧に置換) を使います。登録時は画面に表示された完全一致のシリアル番号を入力します。シリアルのないHIDは登録できず、VID/PIDだけの一致も許可しません。許可リストはroot所有の `/etc/mk1ai/usb-hid-allowlist.json` に権限 `0600` で保存されます。
+6. Cパネルで `[u]` を有効にしてから `[3]` の実遮断監視を起動します。USBワーカーは監視中も設定変更をポーリングするため、`[u]` 切替を反映します。挿入中の機器も有効化時に照合します。リモートダッシュボードは閲覧専用のままで、USB設定・認証・起動・停止を行えません。
+
+KVM/実USBパススルーはCIやコンテナ内の単体テストでは検証されません。配備前に使い捨てLinux機で、未登録HID、シリアル欠落HID、clean/threat/timeout、署名不一致、改ざん済みイメージ、QEMU/KVM不在、既マウント媒体、iproute2によるNIC停止失敗、ローカル復旧手順を実機検証してください。署名済みゲストはClamAVのスキャン結果を保証せず、未知の脅威、ファームウェア攻撃、BadUSB、ホストカーネルやハイパーバイザーの脆弱性は防げません。
 
 ```bash
 export MK1_REMOTE_ROLE="login"
@@ -129,6 +176,8 @@ sudo bash ./proxmox-transfer-registration.sh 101 100
 このスクリプトはプロフィール形式を検証して本番コンテナの `/etc/mk1ai/owner_profile.dat` へ移し、本番サービス起動を確認した後に登録コンテナの自動起動を無効化して停止します。本番の環境ファイル `/etc/mk1ai/remote-dashboard.env` は `MK1_REMOTE_ROLE=login`、`MK1_DATA_DIR=/var/lib/mk1ai`、`MK1_OWNER_PROFILE=/etc/mk1ai/owner_profile.dat` を設定してください。認証DBとカウンターは更新が必要なので、プロフィールの `0400` と異なり `/var/lib/mk1ai` 内の専用DBをサービスユーザーだけが書き込める状態で保持します。`0400` はrootからの変更を防ぐものではありません。登録コンテナの通信をファイアウォールでも遮断し、停止後に再起動できない運用にしてください。
 
 本番サインインはPasskeyに加えて、GmailとSMSへ並行送信する別々の6桁コードを両方要求します。メールまたはSMSの送信に失敗した場合はログインできません。メール/SMSは同一端末で閲覧可能な場合があり、暗号学的に独立した物理要素とは限りません。ブラウザー内に追加の2桁コードを表示しても独立要素にならないため、追加MFA因子としては実装していません。成功後の画面/APIは状態・検知アラートの読み取り専用です。設定変更、停止/起動、任意コマンド実行のAPIはありません。セッションは15分無操作または最大2時間で失効します。
+
+このPasskey + SMS OTP + Gmail OTPの3要素認証はHTTPSリモートダッシュボード用です。地図WebSocketはlocalhost上の読み取り専用テレメトリー経路で、リモート公開しないでください。Chromeモードを選んだときだけ `127.0.0.1:9001` をlistenします。
 
 systemdで起動する場合は [mk1-remote-dashboard.service](./mk1-remote-dashboard.service) を両コンテナに配置し、各コンテナの `/etc/mk1ai/remote-dashboard.env` に個別のロール・WireGuardアドレス・URLを設定します。サービスは `mk1ai` 非rootユーザー、`ProtectSystem=strict`、`NoNewPrivileges` で動作します。Pythonアプリはloopbackだけにbindし、NginxのみWireGuardアドレスへbindします。
 
@@ -193,7 +242,15 @@ RSI連携には、Colabノートブックで起動するHTTPS受信エンドポ�
 
 WireGuardは各実行環境で利用者が用意・起動し、`wg0` に `0.0.0.0/0` と `::/0` の両方を設定してください。アプリは両方の外向きrouteが `wg0` を使うことを確認し、検証できなければColab/Drive通信を拒否します。ColabノートブックもDrive mount前に同じ確認を行い、`MK1_WIREGUARD_INTERFACE` で別名を指定できます。トンネル設定、peer鍵、秘密鍵は利用者側で安全に管理してください。
 
+Cパネルの `[e]` は管理者確認後に既存WireGuardリンクだけをup/downします。downで通信を遮断しても、wg-quick/systemd設定、ルート、カーネル内の長期秘密鍵を削除する動作ではありません。ユーザー空間の有効なアプリ層鍵はPython transport側とC tunnel側で消去し、以降の暗号送信を拒否します。Python側は可変鍵バッファを上書きし、C側はOpenSSL `OPENSSL_cleanse` を用います。ML-KEM実装や暗号ライブラリの内部コピー、Pythonの不変オブジェクト、スワップ、クラッシュダンプまで物理消去できる保証はありません。リンク操作後もOS firewallのegress kill-switchが必要です。
+
 WireGuardの標準プロトコル自体はCurve25519とChaCha20-Poly1305を使い、AES/PQCへ置き換えることはできません。ここではWireGuardを外側トンネルとして使い、その上に制御可能なMK1Ai↔Colab API向けのML-KEM-768/AES-256-GCM暗号化を重ねます。Google Colab `drive.mount`、Google Drive API、Google/CloudflareのTLS暗号選択は各サービスが管理しており、MK1AiからPQC鍵交換やTLS cipher suiteを強制できません。Drive通信はWireGuard経由に制限しますが、Google管理のTLSは別途維持されます。ルート確認は通信直前の検査であり、VPN切断後のOS全体に対する完全なkill-switch保証ではありません。実運用ではWireGuard設定と併せてOS firewallのegress kill switchを構成してください。
+
+### Linuxプロセスメモリ保護 (実験的)
+
+Cパネルの `[a]` はLinux上で `PR_SET_DUMPABLE=0`、`PR_SET_PTRACER=0`、soft `RLIMIT_CORE=0` を適用し、`/proc/self/status` の `TracerPid` を100ms間隔で監視します。保護中に作成するML-KEM共有秘密とAES鍵、および有効な送信セッション鍵には `mlock` と `MADV_DONTDUMP` を適用します。ページロックに失敗した暗号処理は継続せず、保護ONの設定を監視プロセスへ適用できない場合は起動を中止します。
+
+この機能はASLRを超えるAMTD、メモリ配置の動的変換、デコイ検出を実装するものではありません。`mlock` はOS制限やメモリアロケータのページ共有に依存し、`MADV_DONTDUMP` は共有ページ全体に作用する可能性があります。暗号ライブラリ内部の複製、不変Pythonオブジェクト、スワップ、カーネル、root権限の攻撃者まで保護・消去できる保証はありません。TracerPid監視はポーリング方式であり、0.1ms応答を保証しません。Linux専用で、他OSでは有効化できません。ON/OFFはptrace許可状態を完全に復元する機能ではなく、軍事規格認証や完全な防御を意味しません。
 
 このリポジトリのノートブックは空いているloopback portを選び、`cloudflared` で公開して `https://<random>.trycloudflare.com/rsi` を表示します。Colabの出力がLocalTunnel (`*.loca.lt`) やport `5000` を示す場合は、別のノートブックまたは古いランタイムが動いています。設定URLを取り違えないよう、Colab runtimeを再起動してこのリポジトリのnotebookを上から順に実行してください。トンネル確認では公開鍵pin、ML-KEM/AES-GCMの暗号要求・応答、認証拒否を検証します。
 
