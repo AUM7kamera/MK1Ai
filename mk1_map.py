@@ -133,7 +133,7 @@ def _accept_websocket(
         ):
             return False
         accept = base64.b64encode(
-            hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+            hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()  # nosec B303,B324 - RFC6455 Sec-WebSocket-Accept 規定のSHA-1
         ).decode("ascii")
         client.sendall(
             (

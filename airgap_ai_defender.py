@@ -451,7 +451,7 @@ _MAP_VISUALIZATION_SERVICE: MapVisualizationService | None = None
 
 # ── ONI_MODE (鬼モード): threading.Event 化により実行時に動的切替可能 ──
 # 起動時は環境変数 / CLI引数 で初期値を設定。
-# 実行中は SIGUSR1 シグナルまたは toggle_oni_mode() で切り替え可能。
+# 実行中は toggle_oni_mode() で切り替え可能 (SIGUSR1 は --allow-oni-signal のオプトイン時のみ)。
 _ONI_MODE_ACTIVE = threading.Event()
 if str(os.environ.get("ONI_MODE", "")).lower() in {"1", "true", "yes", "on"}:
     _ONI_MODE_ACTIVE.set()
@@ -465,24 +465,40 @@ ONI_MODE = property(lambda self: _ONI_MODE_ACTIVE.is_set()) if False else _ONI_M
 
 def toggle_oni_mode(activate: bool | None = None) -> bool:
     """ONI_MODE の状態を切り替える。activate=None で現在値をトグル。"""
+    previous = _ONI_MODE_ACTIVE.is_set()
     if activate is None:
-        activate = not _ONI_MODE_ACTIVE.is_set()
+        activate = not previous
     if activate:
         _ONI_MODE_ACTIVE.set()
         log.warning("[ONI_MODE] 検知閾値を変更した監視モードを有効化しました。誤検知リスクが上がります。")
     else:
         _ONI_MODE_ACTIVE.clear()
         log.info("[ONI_MODE] 鬼モード解除 → 通常監視モードへ移行しました。")
+    if previous != activate:
+        log.warning(f"[ONI_MODE] 状態が切り替わりました: {'有効' if previous else '無効'} → {'有効' if activate else '無効'}")
     return activate
 
+# SIGUSR1 によるトグルは明示的なオプトイン時のみ許可する (既定は無効)
+_ONI_SIGNAL_ALLOWED = False
+
 def _oni_mode_signal_handler(signum, frame):
-    """SIGUSR1 受信で ONI_MODE をトグルする。"""
+    """SIGUSR1 受信で ONI_MODE をトグルする。オプトインされていない場合は無視する。"""
+    if not _ONI_SIGNAL_ALLOWED:
+        log.warning("[ONI_MODE] SIGUSR1 を受信しましたが、--allow-oni-signal が未指定のため無視します。")
+        return
     toggle_oni_mode()
 
-try:
-    _signal_module.signal(_signal_module.SIGUSR1, _oni_mode_signal_handler)
-except (AttributeError, OSError):
-    pass  # Windows 等 SIGUSR1 非対応環境では無視
+def _install_oni_mode_signal_handler() -> bool:
+    """--allow-oni-signal / 設定 allow_oni_signal による明示的オプトイン時のみ SIGUSR1 ハンドラを登録する。"""
+    global _ONI_SIGNAL_ALLOWED
+    try:
+        _signal_module.signal(_signal_module.SIGUSR1, _oni_mode_signal_handler)
+    except (AttributeError, OSError, ValueError):
+        log.warning("[ONI_MODE] この環境では SIGUSR1 ハンドラを登録できません。")
+        return False
+    _ONI_SIGNAL_ALLOWED = True
+    log.warning("[ONI_MODE] SIGUSR1 による鬼モード切替がオプトインで有効化されました。")
+    return True
 
 # ── スコア閾値定数 ──
 # 通常モード: 誤検知を抑えた高閾値
@@ -2198,6 +2214,15 @@ def _load_local_adaptation(model, checkpoint_path: str) -> bool:
         return False
 
 
+# 設定ファイルの management_ports / management_ips (main() が起動時に設定)
+_CONFIGURED_MANAGEMENT_ROUTE: dict = {}
+
+
+def _configured_management_route() -> dict:
+    """設定ファイルに管理経路の記載がある場合のみ、build_containment_plan へ渡す引数を返す。"""
+    return {key: list(value) for key, value in _CONFIGURED_MANAGEMENT_ROUTE.items() if value}
+
+
 def build_containment_plan(interface: str | None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None) -> dict:
     """キルスイッチ発動時の隔離モードを構造化して返し、管理セッション維持オプションを明示する。"""
     ports = [int(port) for port in (management_ports or _MANAGEMENT_SAFE_HARBOR_DEFAULT_PORTS)]
@@ -3109,33 +3134,131 @@ def _write_sysctl_value(path: str, value: str) -> bool:
         return False
 
 
-def _apply_kernel_hardening(profile: dict, report: dict):
-    sysctl_map = {
-        "/proc/sys/net/ipv4/ip_forward": "0",
-        "/proc/sys/net/ipv4/tcp_syncookies": "1",
-        "/proc/sys/net/ipv4/conf/all/rp_filter": "1",
-        "/proc/sys/net/ipv4/conf/default/rp_filter": "1",
-        "/proc/sys/net/ipv4/conf/all/accept_source_route": "0",
-        "/proc/sys/net/ipv4/conf/default/accept_source_route": "0",
-        "/proc/sys/kernel/sysrq": "0",
-        "/proc/sys/vm/swappiness": "10",
-        "/proc/sys/vm/overcommit_memory": "0",
-        "/proc/sys/fs/suid_dumpable": "0",
-    }
-    for path, value in sysctl_map.items():
-        if os.path.exists(path) and _write_sysctl_value(path, value):
+_HARDENING_SYSCTL_MAP = {
+    "/proc/sys/net/ipv4/ip_forward": "0",
+    "/proc/sys/net/ipv4/tcp_syncookies": "1",
+    "/proc/sys/net/ipv4/conf/all/rp_filter": "1",
+    "/proc/sys/net/ipv4/conf/default/rp_filter": "1",
+    "/proc/sys/net/ipv4/conf/all/accept_source_route": "0",
+    "/proc/sys/net/ipv4/conf/default/accept_source_route": "0",
+    "/proc/sys/kernel/sysrq": "0",
+    "/proc/sys/vm/swappiness": "10",
+    "/proc/sys/vm/overcommit_memory": "0",
+    "/proc/sys/fs/suid_dumpable": "0",
+}
+_SYSCTL_BACKUP_FILENAME = "sysctl_backup.json"
+
+
+def _read_sysctl_value(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except Exception as exc:
+        log.warning(f"[BOOT_HARDENING] sysctl {path} の現在値を読み取れません ({exc})")
+        return None
+
+
+def _sysctl_backup_path(backup_dir: str) -> str:
+    return os.path.join(backup_dir, _SYSCTL_BACKUP_FILENAME)
+
+
+def _save_sysctl_backup(backup_dir: str, originals: dict) -> bool:
+    """書き込み前の sysctl 値を JSON に保存する(既存バックアップの元値は上書きしない)。"""
+    backup_path = _sysctl_backup_path(backup_dir)
+    try:
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+        os.chmod(backup_dir, 0o700)
+        merged = dict(originals)
+        if os.path.exists(backup_path):
+            with open(backup_path, "r", encoding="utf-8") as handle:
+                previous = json.load(handle)
+            if isinstance(previous, dict):
+                merged.update({k: v for k, v in previous.items() if isinstance(v, str)})
+        descriptor = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(merged, handle)
+        os.chmod(backup_path, 0o600)
+        return True
+    except Exception as exc:
+        log.error(f"[BOOT_HARDENING] sysctl バックアップを保存できません ({exc})")
+        return False
+
+
+def _restore_kernel_hardening(backup_dir: str, report: dict | None = None) -> dict:
+    """保存済みの sysctl 値を書き戻す。許可対象は _HARDENING_SYSCTL_MAP のパスのみ。"""
+    report = report if report is not None else {}
+    restored = report.setdefault("restored", [])
+    restore_failures = report.setdefault("restore_failures", [])
+    backup_path = _sysctl_backup_path(backup_dir)
+    if not os.path.exists(backup_path):
+        return report
+    try:
+        with open(backup_path, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+        if not isinstance(saved, dict):
+            raise ValueError("backup is not a JSON object")
+    except Exception as exc:
+        log.error(f"[BOOT_HARDENING] sysctl バックアップを読み込めません ({exc})")
+        restore_failures.append(backup_path)
+        return report
+
+    for path, value in saved.items():
+        if path not in _HARDENING_SYSCTL_MAP or not isinstance(value, str):
+            restore_failures.append(str(path))
+        elif _write_sysctl_value(path, value):
+            restored.append(path)
+        else:
+            restore_failures.append(path)
+
+    if not restore_failures:
+        try:
+            os.unlink(backup_path)
+        except OSError:
+            pass
+    log.info(f"[BOOT_HARDENING] 復元: {restored} / 復元失敗: {restore_failures}")
+    return report
+
+
+def _apply_kernel_hardening(profile: dict, report: dict, dry_run: bool = False, backup_dir: str | None = None):
+    sysctl_map = _HARDENING_SYSCTL_MAP
+    targets = [path for path in sysctl_map if os.path.exists(path)]
+    report["failures"].extend(path for path in sysctl_map if path not in targets)
+
+    if dry_run:
+        for path in targets:
+            report.setdefault("would_apply", []).append({"path": path, "value": sysctl_map[path]})
+        return
+
+    if backup_dir is not None:
+        originals = {path: _read_sysctl_value(path) for path in targets}
+        readable = {path: value for path, value in originals.items() if value is not None}
+        if not _save_sysctl_backup(backup_dir, readable):
+            log.error("[BOOT_HARDENING] バックアップ不能のため sysctl の書き換えを中止します。")
+            report["failures"].extend(targets)
+            return
+        report["backup_path"] = _sysctl_backup_path(backup_dir)
+        targets = [path for path in targets if path in readable]
+        report["failures"].extend(path for path in originals if path not in readable)
+
+    for path in targets:
+        if _write_sysctl_value(path, sysctl_map[path]):
             report["applied"].append(path)
         else:
             report["failures"].append(path)
 
 
-def _apply_process_limits(report: dict):
+def _apply_process_limits(report: dict, dry_run: bool = False):
     try:
         import resource
         soft_no, hard_no = resource.getrlimit(resource.RLIMIT_NOFILE)
         soft_no = min(soft_no if soft_no > 0 else hard_no, 4096)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft_no, hard_no))
-        report["applied"].append("rlimit_nofile")
+        if dry_run:
+            report.setdefault("would_apply", []).append(
+                {"resource": "RLIMIT_NOFILE", "soft": soft_no, "hard": hard_no}
+            )
+        else:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft_no, hard_no))
+            report["applied"].append("rlimit_nofile")
     except Exception as exc:
         log.warning(f"[BOOT_HARDENING] RLIMIT_NOFILE の設定に失敗しました ({exc})")
         report["failures"].append("rlimit_nofile")
@@ -3144,18 +3267,25 @@ def _apply_process_limits(report: dict):
         import resource
         soft_proc, hard_proc = resource.getrlimit(resource.RLIMIT_NPROC)
         if soft_proc > 512 or soft_proc == resource.RLIM_INFINITY:
-            resource.setrlimit(resource.RLIMIT_NPROC, (512, hard_proc))
-            report["applied"].append("rlimit_nproc")
+            if dry_run:
+                report.setdefault("would_apply", []).append(
+                    {"resource": "RLIMIT_NPROC", "soft": 512, "hard": hard_proc}
+                )
+            else:
+                resource.setrlimit(resource.RLIMIT_NPROC, (512, hard_proc))
+                report["applied"].append("rlimit_nproc")
     except Exception as exc:
         report["failures"].append("rlimit_nproc")
 
 
-def boot_time_auto_hardening(profile: dict) -> dict:
-    report = {"applied": [], "failures": []}
+def boot_time_auto_hardening(profile: dict, dry_run: bool = False, backup_dir: str | None = None) -> dict:
+    report = {"applied": [], "failures": [], "would_apply": []}
     if profile.get("permissions", {}).get("root"):
         log.info("[BOOT_HARDENING] ブート時ハードニングを実行します。")
-        _apply_kernel_hardening(profile, report)
-        _apply_process_limits(report)
+        _apply_kernel_hardening(profile, report, dry_run=dry_run, backup_dir=backup_dir)
+        if report.get("backup_path"):
+            atexit.register(_restore_kernel_hardening, backup_dir)
+        _apply_process_limits(report, dry_run=dry_run)
     else:
         log.warning("[BOOT_HARDENING] root でないため、一部カーネルハードニングはスキップします。")
         report["failures"].append("missing_root")
@@ -3713,10 +3843,10 @@ def _parse_tls_client_hello(packet_bytes: bytes) -> dict:
         ",".join(str(fmt) for fmt in metadata["ec_point_formats"]),
     ]
     ja3_string = ",".join(ja3_parts)
-    ja3_hash = hashlib.md5(ja3_string.encode("utf-8")).hexdigest()
+    ja3_hash = hashlib.md5(ja3_string.encode("utf-8")).hexdigest()  # nosec B303,B324 - JA3/JA4フィンガープリント計算用(認証に使用しない)
     metadata["ja3_string"] = ja3_string
     metadata["ja3_hash"] = ja3_hash
-    metadata["ja4_hash"] = hashlib.md5(f"{metadata['sni'] or ''}|{ja3_string}".encode("utf-8")).hexdigest()
+    metadata["ja4_hash"] = hashlib.md5(f"{metadata['sni'] or ''}|{ja3_string}".encode("utf-8")).hexdigest()  # nosec B303,B324 - JA3/JA4フィンガープリント計算用(認証に使用しない)
 
     if metadata["malformed"]:
         _record_security_health_issue("malformed_packet", "tls_client_hello")
@@ -4984,9 +5114,6 @@ def _attempt_pure_python_network_barrier(interface: str | None = None, available
 
     if platform.system().lower() != "linux":
         return False
-
-    if platform.system().lower() != "linux":
-        return False
     return disable_network_interfaces(interfaces)
 
 
@@ -5104,8 +5231,11 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                 mk1_secure_transport.set_transport_enabled(False)
             log.info(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
             _KILL_SWITCH_EVENT.set()
-            if not _dispatch_privileged_command("kill_switch", interface=interface, dry_run=effective_dry_run):
-                execute_kill_switch(interface, effective_dry_run)
+            management_route = _configured_management_route()
+            if not _dispatch_privileged_command(
+                "kill_switch", interface=interface, dry_run=effective_dry_run, **management_route,
+            ):
+                execute_kill_switch(interface, effective_dry_run, **management_route)
             _KILL_SWITCH_TRIGGERED = True
             _LAST_KILL_SWITCH_TRIGGER = now
             return True
@@ -5473,6 +5603,10 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
         else:
             log.error("[AIRGAP] 全インターフェースの停止を確認できませんでした。隔離完了とは扱いません。")
         return
+
+    if containment_mode == "full_isolation" and (management_ports or management_ips):
+        containment_mode = "management_safe_harbor"
+        log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
 
     containment_plan = build_containment_plan(
         interface,
@@ -6082,6 +6216,13 @@ def _load_runtime_config(config_path: str) -> dict:
         "model_sync_interval": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 30,
         "ignore_model_hash": lambda value: isinstance(value, bool),
         "compact_log": lambda value: isinstance(value, bool),
+        "allow_oni_signal": lambda value: isinstance(value, bool),
+        "management_ports": lambda value: isinstance(value, list) and all(
+            isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536 for port in value
+        ),
+        "management_ips": lambda value: isinstance(value, list) and all(
+            isinstance(ip, str) and bool(ip.strip()) for ip in value
+        ),
         "mode": lambda value: isinstance(value, str) and value in {"normal", "RSI", "rsi"},
         "update_interval": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
         "map_mode": lambda value: (
@@ -6143,6 +6284,10 @@ def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_
     parser.add_argument("--mode", choices=("normal", "RSI", "rsi"), default=config.get("mode", "normal"), help="実行モード")
     parser.add_argument("--install-deps", action="store_true", help="起動前に不足している依存ライブラリを自動インストールします")
     parser.add_argument("--no-dry-run",     action="store_true", help="指定すると実際にNICをダウンさせます(危険！)")
+    parser.add_argument("--allow-oni-signal", action="store_true",
+                        default=config.get("allow_oni_signal", False),
+                        help="SIGUSR1 による鬼モード(ONI_MODE)の切替を許可します(既定は無効)")
+    parser.add_argument("--restore-hardening", action="store_true", help="保存済みの sysctl バックアップを書き戻して終了")
     return parser
 
 
@@ -6252,6 +6397,18 @@ def main():
 
     if args.ignore_model_hash and not TORCH_AVAILABLE:
         parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
+
+    _CONFIGURED_MANAGEMENT_ROUTE.clear()
+    for route_key in ("management_ports", "management_ips"):
+        if runtime_config.get(route_key):
+            _CONFIGURED_MANAGEMENT_ROUTE[route_key] = list(runtime_config[route_key])
+    if args.allow_oni_signal:
+        _install_oni_mode_signal_handler()
+
+    if args.restore_hardening:
+        restore_report = _restore_kernel_hardening(args.local_dir)
+        log.info(f"[BOOT_HARDENING] 復元結果: {restore_report}")
+        return 0 if not restore_report.get("restore_failures") else 1
 
     if args.panel_parent_pid < 0:
         parser.error("--panel-parent-pid は0以上で指定してください")
@@ -6366,7 +6523,7 @@ def main():
         _start_colab_rsi_request(model, args.local_dir, token=rsi_token)
 
     model.eval()  # 推論モードで起動（防衛最優先）
-    boot_report = boot_time_auto_hardening(profile_environment())
+    boot_report = boot_time_auto_hardening(profile_environment(), dry_run=dry_run, backup_dir=args.local_dir)
     log.info(f"[BOOT_HARDENING] 事前評価結果: {boot_report}")
     _install_self_protection_handlers()
     threading.Thread(target=_self_protection_monitor, daemon=True).start()

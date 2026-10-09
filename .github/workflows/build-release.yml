@@ -3,15 +3,28 @@ name: Build and sign release
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libncurses-dev libssl-dev
+          python3 -m pip install bandit
+      - name: Clang static analyzer
+        run: make analyze
+      - name: Bandit
+        run: bandit -q -r airgap_ai_defender.py mk1_usb_guard.py mk1_remote_dashboard.py mk1_secure_transport.py mk1_memory_guard.py mk1_map.py --severity-level high
   build-sign:
+    if: github.event_name != 'pull_request' && (github.event_name != 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-24.04
     environment: release-signing
     permissions:
@@ -26,7 +39,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install release-only builder
-        run: python -m pip install "Cython==3.0.12" setuptools
+        run: python -m pip install "Cython==3.0.12" "setuptools==78.1.1"
       - name: Build and sign bundle
         env:
           MK1AI_ED25519_PRIVATE_KEY: ${{ secrets.MK1AI_ED25519_PRIVATE_KEY }}

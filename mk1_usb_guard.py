@@ -224,7 +224,7 @@ def verify_scan_guest(
         if hasher.hexdigest() != digest:
             raise ValueError(f"Scan-guest {name} SHA-256 does not match")
 
-    completed = subprocess.run(
+    completed = subprocess.run(  # nosec B603 - 信頼済みPATH(TRUSTED_EXECUTION_PATH)で固定されたバイナリ実行
         [
             openssl_path, "pkeyutl", "-verify", "-pubin",
             "-inkey", str(public_key), "-rawin",
@@ -351,7 +351,7 @@ def scan_usb_storage_in_guest(
         "-device", "qemu-xhci,id=usb",
         "-device", f"usb-host,hostbus={device.bus_number},hostaddr={device.device_number}",
     ]
-    process = subprocess.Popen(
+    process = subprocess.Popen(  # nosec B603 - 信頼済みPATH(TRUSTED_EXECUTION_PATH)で固定されたバイナリ実行
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -439,7 +439,7 @@ def disable_network_interfaces(interfaces: list[str]) -> bool:
         results = []
         for name in targets:
             try:
-                disabled = subprocess.run(
+                disabled = subprocess.run(  # nosec B603 - 信頼済みPATH(TRUSTED_EXECUTION_PATH)で固定されたバイナリ実行
                     [ip_binary, "link", "set", "dev", name, "down"],
                     check=False, capture_output=True, text=True, timeout=5,
                     env={"PATH": TRUSTED_EXECUTION_PATH, "HOME": "/"},
@@ -451,7 +451,7 @@ def disable_network_interfaces(interfaces: list[str]) -> bool:
                     )
                     results.append(False)
                     continue
-                verified = subprocess.run(
+                verified = subprocess.run(  # nosec B603 - 信頼済みPATH(TRUSTED_EXECUTION_PATH)で固定されたバイナリ実行
                     [ip_binary, "-o", "link", "show", "dev", name],
                     check=False, capture_output=True, text=True, timeout=5,
                     env={"PATH": TRUSTED_EXECUTION_PATH, "HOME": "/"},

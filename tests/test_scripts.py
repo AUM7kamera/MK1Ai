@@ -115,6 +115,15 @@ class LauncherScriptTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 
+    @unittest.skipUnless(
+        any(
+            subprocess.run(
+                ["pkg-config", "--exists", name], check=False, capture_output=True,
+            ).returncode == 0
+            for name in ("ncursesw", "ncurses")
+        ) if shutil.which("pkg-config") else False,
+        "ncurses開発パッケージ(libncurses-dev相当)が必要です",
+    )
     def test_panel_reports_missing_pqc_provider_and_can_require_it(self):
         package_check = subprocess.run(
             ["pkg-config", "--exists", "liboqs"],

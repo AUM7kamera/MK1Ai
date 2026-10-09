@@ -1854,6 +1854,161 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         result = module.boot_time_auto_hardening(profile)
         self.assertIn("missing_root", result["failures"])
 
+    def test_boot_time_auto_hardening_dry_run_does_not_write_sysctl_or_process_limits(self):
+        profile = {"permissions": {"root": True}}
+        with mock.patch.object(module.os.path, "exists", return_value=True), \
+             mock.patch.object(module, "_write_sysctl_value", return_value=True) as write_value, \
+             mock.patch("resource.setrlimit") as setrlimit:
+            result = module.boot_time_auto_hardening(profile, dry_run=True)
+
+        write_value.assert_not_called()
+        setrlimit.assert_not_called()
+        self.assertTrue(result["would_apply"])
+        self.assertIn(
+            {"path": "/proc/sys/net/ipv4/ip_forward", "value": "0"},
+            result["would_apply"],
+        )
+        self.assertEqual(result["applied"], [])
+
+    def test_boot_hardening_dry_run_does_not_write_sysctl(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with mock.patch.object(module.os.path, "exists", return_value=True), \
+                 mock.patch.object(module, "_write_sysctl_value", return_value=True) as write_value, \
+                 mock.patch("builtins.open", side_effect=AssertionError("open must not be called")) as open_mock:
+                report = {"applied": [], "failures": []}
+                module._apply_kernel_hardening({}, report, dry_run=True, backup_dir=backup_dir)
+            write_value.assert_not_called()
+            open_mock.assert_not_called()
+            self.assertEqual(len(report["would_apply"]), len(module._HARDENING_SYSCTL_MAP))
+            self.assertFalse(os.path.exists(os.path.join(backup_dir, module._SYSCTL_BACKUP_FILENAME)))
+
+    def test_boot_hardening_backup_and_restore(self):
+        with tempfile.TemporaryDirectory() as root:
+            fake_paths = {}
+            for path in module._HARDENING_SYSCTL_MAP:
+                fake = os.path.join(root, path.strip("/").replace("/", "_"))
+                with open(fake, "w", encoding="utf-8") as handle:
+                    handle.write("7\n")
+                fake_paths[path] = fake
+
+            def fake_read(path):
+                with open(fake_paths[path], encoding="utf-8") as handle:
+                    return handle.read().strip()
+
+            def fake_write(path, value):
+                with open(fake_paths[path], "w", encoding="utf-8") as handle:
+                    handle.write(value)
+                return True
+
+            backup_dir = os.path.join(root, "ai_data")
+            real_exists = os.path.exists
+            with mock.patch.object(
+                     module.os.path, "exists",
+                     side_effect=lambda p: True if p in fake_paths else real_exists(p)), \
+                 mock.patch.object(module, "_read_sysctl_value", side_effect=fake_read), \
+                 mock.patch.object(module, "_write_sysctl_value", side_effect=fake_write):
+                report = {"applied": [], "failures": []}
+                module._apply_kernel_hardening({}, report, dry_run=False, backup_dir=backup_dir)
+                self.assertEqual(report["failures"], [])
+                for path, value in module._HARDENING_SYSCTL_MAP.items():
+                    self.assertEqual(fake_read(path), value)
+                backup_file = os.path.join(backup_dir, module._SYSCTL_BACKUP_FILENAME)
+                self.assertEqual(os.stat(backup_dir).st_mode & 0o777, 0o700)
+                self.assertEqual(os.stat(backup_file).st_mode & 0o777, 0o600)
+
+                restore_report = module._restore_kernel_hardening(backup_dir)
+                self.assertEqual(restore_report["restore_failures"], [])
+                self.assertEqual(len(restore_report["restored"]), len(module._HARDENING_SYSCTL_MAP))
+                for path in module._HARDENING_SYSCTL_MAP:
+                    self.assertEqual(fake_read(path), "7")
+                self.assertFalse(os.path.exists(backup_file))
+
+    def test_oni_mode_signal_disabled_by_default(self):
+        self.assertFalse(module._ONI_SIGNAL_ALLOWED)
+        module._ONI_MODE_ACTIVE.clear()
+        try:
+            module._oni_mode_signal_handler(10, None)
+            self.assertFalse(module.ONI_MODE_is_active())
+        finally:
+            module._ONI_MODE_ACTIVE.clear()
+
+    def test_oni_mode_toggle_logs_transition(self):
+        module._ONI_MODE_ACTIVE.clear()
+        try:
+            with mock.patch.object(module, "_ONI_SIGNAL_ALLOWED", True), \
+                 self.assertLogs("AirgapAI", level="WARNING") as captured:
+                module._oni_mode_signal_handler(10, None)
+                self.assertTrue(module.ONI_MODE_is_active())
+                module._oni_mode_signal_handler(10, None)
+                self.assertFalse(module.ONI_MODE_is_active())
+            transitions = [line for line in captured.output if "状態が切り替わりました" in line]
+            self.assertEqual(len(transitions), 2)
+            self.assertIn("無効 → 有効", transitions[0])
+            self.assertIn("有効 → 無効", transitions[1])
+        finally:
+            module._ONI_MODE_ACTIVE.clear()
+
+    def test_oni_signal_handler_registration_is_opt_in(self):
+        with mock.patch.object(module, "_ONI_SIGNAL_ALLOWED", False), \
+             mock.patch.object(module._signal_module, "signal") as register:
+            self.assertTrue(module._install_oni_mode_signal_handler())
+            register.assert_called_once()
+            self.assertTrue(module._ONI_SIGNAL_ALLOWED)
+
+    def test_pure_python_barrier_non_linux_returns_false(self):
+        with mock.patch.object(module.platform, "system", return_value="Windows"), \
+             mock.patch.object(module, "disable_network_interfaces") as disable:
+            self.assertFalse(module._attempt_pure_python_network_barrier("eth0", ["eth0"]))
+            disable.assert_not_called()
+
+    def test_configured_management_route_is_loaded_and_passed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({"management_ports": [22, 443], "management_ips": ["10.0.0.5"],
+                           "allow_oni_signal": True}, handle)
+            config = module._load_runtime_config(config_path)
+        self.assertEqual(config["management_ports"], [22, 443])
+        self.assertTrue(config["allow_oni_signal"])
+        route_config = {k: config[k] for k in ("management_ports", "management_ips")}
+        with mock.patch.dict(module._CONFIGURED_MANAGEMENT_ROUTE, route_config, clear=True):
+            route = module._configured_management_route()
+            plan = module.build_containment_plan("eth0", "management_safe_harbor", **route)
+        self.assertEqual(plan["allowed_ports"], [22, 443])
+        self.assertEqual(plan["allowed_ips"], ["10.0.0.5"])
+        with mock.patch.dict(module._CONFIGURED_MANAGEMENT_ROUTE, {}, clear=True):
+            self.assertEqual(module._configured_management_route(), {})
+            self.assertEqual(module.build_containment_plan("eth0")["mode"], "full_isolation")
+
+    def _run_kill_switch_with_route(self, route, containment_mode="full_isolation"):
+        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", False), \
+             mock.patch.object(module, "build_containment_plan", return_value={"mode": "x"}) as build, \
+             mock.patch.object(module, "profile_environment", return_value={}), \
+             mock.patch.object(module, "generate_optimal_kill_payload", return_value=[]), \
+             mock.patch.object(module, "execute_generated_payload", return_value=True), \
+             mock.patch.object(module.log, "warning") as warning:
+            module.execute_kill_switch("eth0", True, available_interfaces=["eth0"],
+                                       containment_mode=containment_mode, **route)
+        return build, warning
+
+    def test_management_route_auto_promotes_safe_harbor(self):
+        with mock.patch.dict(module._CONFIGURED_MANAGEMENT_ROUTE, {"management_ports": ["22"]}, clear=True):
+            build, _ = self._run_kill_switch_with_route(module._configured_management_route())
+        self.assertEqual(build.call_args.kwargs["containment_mode"], "management_safe_harbor")
+        self.assertEqual(build.call_args.kwargs["management_ports"], ["22"])
+
+    def test_management_route_empty_remains_full_isolation(self):
+        for route in ({}, {"management_ports": [], "management_ips": []}):
+            with self.subTest(route=route):
+                build, warning = self._run_kill_switch_with_route(route)
+                self.assertEqual(build.call_args.kwargs["containment_mode"], "full_isolation")
+                warning.assert_not_called()
+
+    def test_management_route_safe_harbor_promotion_logs(self):
+        _, warning = self._run_kill_switch_with_route({"management_ips": ["10.0.0.5"]})
+        messages = [str(call.args[0]) for call in warning.call_args_list]
+        self.assertEqual(sum("management_safe_harbor" in m for m in messages), 1)
+
     def test_kernel_hardening_keeps_linux_overcommit_heuristic_for_fork(self):
         report = {"applied": [], "failures": []}
         with mock.patch.object(module.os.path, "exists", return_value=True), \

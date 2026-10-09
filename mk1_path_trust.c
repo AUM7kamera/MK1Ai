@@ -18,7 +18,7 @@ static int entry_is_trusted(const char *path) {
 static int absolute_chain_is_trusted(const char *absolute) {
     char current[PATH_MAX];
     if (absolute[0] != '/' || strlen(absolute) >= sizeof(current)) return 0;
-    strcpy(current, absolute);
+    if (snprintf(current, sizeof(current), "%s", absolute) >= (int)sizeof(current)) return 0;
     for (;;) {
         if (!entry_is_trusted(current)) return 0;
         if (strcmp(current, "/") == 0) return 1;
@@ -37,7 +37,7 @@ int mk1_path_chain_is_root_trusted(const char *path) {
     char lexical[PATH_MAX];
     if (path[0] == '/') {
         if (strlen(path) >= sizeof(lexical)) return 0;
-        strcpy(lexical, path);
+        if (snprintf(lexical, sizeof(lexical), "%s", path) >= (int)sizeof(lexical)) return 0;
     } else {
         char cwd[PATH_MAX];
         if (getcwd(cwd, sizeof(cwd)) == NULL) return 0;

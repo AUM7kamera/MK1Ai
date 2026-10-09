@@ -85,6 +85,8 @@ COLAB_RSI_ENDPOINT="https://<your-authenticated-endpoint>/rsi" \
 }
 ```
 
+`management_ports`（整数のリスト）と `management_ips`（文字列のリスト）を `config.json` に記載すると、キルスイッチ発動時に `build_containment_plan` へ自動で渡されます。何も記載がない場合は従来どおり `full_isolation`（全NIC隔離）で、管理経路は保護されません。`management_ports` / `management_ips` を書いた場合は、実行時に `containment_mode` を `management_safe_harbor` に自動的に切り替えます（警告ログを出力）。また、SIGUSR1 による鬼モード(ONI_MODE)の切替は既定で無効です。`--allow-oni-signal` または `"allow_oni_signal": true` を指定した場合のみ有効になります。
+
 `./run.sh` は既定でRSIモードを使い、USB遮断は無効のまま起動します。Colab URLを尋ね、前回値がある場合はプロンプトに表示します。空のままEnterを押すと前回値を保持し、新しいURLを入力すると更新します。`ram_limit`、`mode`、`compact_log` は未設定の場合だけ既定値を保存し、既存の設定値は上書きしません。壊れた `config.json` は上書きせずエラー終了し、`ai_data` は権限 `0700` にします。URL入力時にCtrl+CまたはCtrl+Dを押すと、設定を変更せず終了します。`--compact-log` は通常のINFO/WARNINGを抑え、RAM・swap・脅威スコア・Colab状態を1行で更新します。エラーと高スコアの警告は通常ログとして表示します。
 
 ### C言語操作パネル
@@ -186,9 +188,6 @@ sudo bash ./proxmox-transfer-registration.sh 101 100
 本番サインインはPasskeyに加えて、GmailとSMSへ並行送信する別々の6桁コードを両方要求します。メールまたはSMSの送信に失敗した場合はログインできません。メール/SMSは同一端末で閲覧可能な場合があり、暗号学的に独立した物理要素とは限りません。ブラウザー内に追加の2桁コードを表示しても独立要素にならないため、追加MFA因子としては実装していません。成功後の画面/APIは状態・検知アラートの読み取り専用です。設定変更、停止/起動、任意コマンド実行のAPIはありません。セッションは15分無操作または最大2時間で失効し、認証段階が進むたびにIDを再発行します。
 
 このPasskey + SMS OTP + Gmail OTPの3要素認証はHTTPSリモートダッシュボード用です。地図WebSocketはlocalhost上の読み取り専用テレメトリー経路で、リモート公開しないでください。Chromeモードを選んだときだけ `127.0.0.1:9001` をlistenします。
-
-このPasskey + SMS OTP + Gmail OTPの3要素認証はHTTPSリモートダッシュボード用です。地図WebSocketはlocalhost上の読み取り専用テレメトリー経路で、リモート公開しないでください。Chromeモードを選んだときだけ `127.0.0.1:9001` をlistenします。
-
 systemdで起動する場合は [mk1-remote-dashboard.service](./mk1-remote-dashboard.service) を両コンテナに配置し、各コンテナの `/etc/mk1ai/remote-dashboard.env` に個別のロール・WireGuardアドレス・URLを設定します。サービスは `mk1ai` 非rootユーザー、`ProtectSystem=strict`、`NoNewPrivileges` で動作します。Pythonアプリはloopbackだけにbindし、NginxのみWireGuardアドレスへbindします。
 
 外部HTTPSは [mk1-remote-nginx.conf.template](./mk1-remote-nginx.conf.template) を実環境用に設定して使います。NginxをOpenSSL 3.5以降で構築し、TLS 1.3の `TLS_AES_256_GCM_SHA384` とハイブリッドPQC鍵交換 `X25519MLKEM768` だけを許可します。対応していないNginx/OpenSSLやクライアントでは接続が成立しません。古い鍵交換へのフォールバックを有効にしないでください。Passkey登録・リモートUIもこのHTTPS終端を通るため、TLSが成立しなければ画面/APIを使用できません。
@@ -415,7 +414,7 @@ sudo --preserve-env=COLAB_RSI_ENDPOINT,COLAB_RSI_TOKEN,COLAB_RSI_PQ_PUBLIC_KEY_S
 5. **ローカルデータ更新**: 起動時に `--drive-id` のフォルダ一覧を取得し、サイズを確認できるJSON/JSONL/CSVのうち最大4ファイル（各8 MiB、合計32 MiBまで）を `ai_data/gdrive_raw/` 以下へ直接保存します。既存ファイル、サイズ不明のファイル、上限超過ファイル、アーカイブは取得せず、展開もしません。その後ローカル入力を逐次処理し、条件に合うデータを `ai_data/curated/curated_data.jsonl` に追加して学習キューに送ります。
 6. **メモリ管理・補助処理**: RAM 使用量の監視、バッファの一時退避、自己保護監視や Moving Target Defense の補助処理を実行します。
 
-`airgap_ai_defender_6.py` は別実装です。既定では `./cloud_base_model.pth` を参照し、環境プロファイル、ハードニング、メモリ確認などを一度実行して終了します。通常版の継続的なパケット監視・データ更新処理と同じ機能を提供するものではありません。
+`airgap_ai_defender_6.py` は非推奨です（メンテナンス対象外、削除予定）。別実装です。既定では `./cloud_base_model.pth` を参照し、環境プロファイル、ハードニング、メモリ確認などを一度実行して終了します。通常版の継続的なパケット監視・データ更新処理と同じ機能を提供するものではありません。
 
 ## ローカル学習の仕組み
 
