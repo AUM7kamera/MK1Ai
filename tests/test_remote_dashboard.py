@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import pathlib
 import tempfile
 import threading
@@ -140,6 +141,67 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertFalse(state.allow_request("192.0.2.1", "/api/auth/options"))
         self.assertTrue(state.allow_request("192.0.2.1", "/api/session"))
 
+    def test_rate_limit_evicts_old_keys_instead_of_rejecting_every_new_client(self):
+        state = DashboardState(self.config)
+
+        for index in range(4097):
+            self.assertTrue(state.allow_request(f"192.0.2.{index}", "/api/status"))
+
+        self.assertTrue(state.allow_request("192.0.2.0", "/api/status"))
+
+    def test_forwarded_client_ip_is_trusted_only_from_loopback(self):
+        loopback_handler = object.__new__(DashboardHandler)
+        loopback_handler.client_address = ("127.0.0.1", 1234)
+        loopback_handler.headers = mock.Mock()
+        loopback_handler.headers.get.return_value = "198.51.100.1, 192.0.2.9"
+        self.assertEqual(loopback_handler._client_ip(), "192.0.2.9")
+        with mock.patch("mk1_remote_dashboard.LOGGER.info") as info:
+            loopback_handler.log_message("%s", "", "", "", "200")
+        info.assert_called_once_with("remote-dashboard %s %s", "192.0.2.9", "200")
+
+        remote_handler = object.__new__(DashboardHandler)
+        remote_handler.client_address = ("203.0.113.7", 1234)
+        remote_handler.headers = mock.Mock()
+        remote_handler.headers.get.return_value = "192.0.2.9"
+        self.assertEqual(remote_handler._client_ip(), "203.0.113.7")
+
+    def test_origin_is_normalized_when_loaded_from_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {
+                "MK1_REMOTE_ROLE": "enrollment",
+                "MK1_REMOTE_ORIGIN": "HTTPS://LocalHost:8443/",
+                "MK1_REMOTE_RP_ID": "localhost",
+                "MK1_ADMIN_EMAIL": "admin@example.test",
+                "MK1_WIREGUARD_BIND_ADDRESS": "10.77.0.1",
+            },
+            clear=True,
+        ):
+            config = DashboardConfig.from_environment(pathlib.Path(temp_dir))
+
+        self.assertEqual(config.origin, "https://localhost:8443")
+
+    def test_session_rotation_invalidates_old_id_and_rotates_csrf(self):
+        state = DashboardState(self.config)
+        old_id, session = state.new_session()
+        old_csrf = session["csrf"]
+
+        new_id = state.rotate_session(old_id, session)
+
+        self.assertNotEqual(new_id, old_id)
+        self.assertIsNone(state.get_session(old_id))
+        self.assertIs(state.get_session(new_id), session)
+        self.assertNotEqual(session["csrf"], old_csrf)
+
+    def test_handler_uses_host_cookie_and_request_timeout(self):
+        state = DashboardState(self.config)
+        handler = object.__new__(DashboardHandler)
+
+        self.assertEqual(DashboardHandler.timeout, 10)
+        self.assertTrue(handler._set_session_cookie("opaque").startswith("__Host-mk1_session="))
+        self.assertIn("Path=/; ", handler._set_session_cookie("opaque"))
+        self.assertIn("; Secure;", handler._set_session_cookie("opaque"))
+
     def test_enrollment_role_has_registration_ui_only(self):
         state = DashboardState(self.config)
         server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
@@ -177,19 +239,38 @@ class RemoteDashboardTest(unittest.TestCase):
             options.return_value.challenge = b"challenge"
             connection.request(
                 "POST",
-                "/api/register/options",
+                "/api/register/options?ignored=1",
                 body=body,
                 headers={
                     "Host": f"127.0.0.1:{port}",
-                    "Origin": f"https://127.0.0.1:{port}",
+                    "Origin": f"HTTPS://127.0.0.1:{port}/",
                     "Content-Type": "application/json",
                     "Content-Length": str(len(body)),
+                    "X-Forwarded-For": "198.51.100.1, 192.0.2.9",
                 },
             )
             response = connection.getresponse()
             registration_options = response.read()
         self.assertEqual(response.status, 200)
         self.assertIn(b'"options"', registration_options)
+        self.assertIn(("192.0.2.9", "/api/register/options"), state.rate_limits)
+
+        connection.request(
+            "POST",
+            "/api/unknown?key=varies",
+            body=b"{}",
+            headers={
+                "Host": f"127.0.0.1:{port}",
+                "Origin": f"https://127.0.0.1:{port}",
+                "Content-Type": "application/json",
+                "Content-Length": "2",
+                "X-Forwarded-For": "198.51.100.1, 192.0.2.9",
+            },
+        )
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 404)
+        self.assertNotIn(("192.0.2.9", "/api/unknown"), state.rate_limits)
 
         connection.request("GET", "/api/status")
         response = connection.getresponse()
