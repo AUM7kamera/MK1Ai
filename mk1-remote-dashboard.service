@@ -1,0 +1,27 @@
+[Unit]
+Description=MK1Ai authenticated remote dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mk1ai
+Group=mk1ai
+WorkingDirectory=/opt/mk1ai
+EnvironmentFile=/etc/mk1ai/remote-dashboard.env
+UMask=0077
+ExecStart=/opt/mk1ai/.venv-mk1/bin/python /opt/mk1ai/mk1_remote_dashboard.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/mk1ai
+
+[Install]
+WantedBy=multi-user.target

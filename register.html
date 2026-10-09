@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>MK1Ai 初回Passkey登録</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand">MK1<span>AI</span></div>
+      <span class="secure">ONE-TIME ENROLLMENT</span>
+    </header>
+    <section class="card">
+      <p class="eyebrow">SEPARATE ENROLLMENT SERVICE</p>
+      <h1>管理者Passkey登録</h1>
+      <p class="muted">登録専用コンテナで一度だけ実行してください。登録後、このサービスは停止し、owner_profile.datを本番環境へ安全に移行します。</p>
+      <label id="token-row">ローカルコンソールに表示された登録トークン
+        <input id="bootstrap-token" type="password" autocomplete="off" spellcheck="false">
+      </label>
+      <button id="register" class="button">この端末のPasskeyを登録</button>
+      <p id="message" role="status" aria-live="polite"></p>
+    </section>
+    <footer>MK1Ai · Enrollment-only console</footer>
+  </main>
+  <script src="/register.js" defer></script>
+</body>
+</html>

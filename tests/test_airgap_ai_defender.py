@@ -26,8 +26,55 @@ assert spec is not None and spec.loader is not None, "Failed to load spec or loa
 module: Any = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+TORCH_AVAILABLE = isinstance(getattr(module.torch, "__version__", None), str)
+SECURE_TRANSPORT_AVAILABLE = module.mk1_secure_transport is not None
+REQUESTS_AVAILABLE = module.requests is not None
+GDOWN_AVAILABLE = module.gdown is not None
+AESGCM_AVAILABLE = module.AESGCM is not None
+
+requires_torch = unittest.skipUnless(
+    TORCH_AVAILABLE, "PyTorch is required for model and training assertions",
+)
+requires_secure_transport = unittest.skipUnless(
+    SECURE_TRANSPORT_AVAILABLE, "secure-transport dependencies are unavailable",
+)
+requires_rsi_dependencies = unittest.skipUnless(
+    SECURE_TRANSPORT_AVAILABLE and REQUESTS_AVAILABLE,
+    "RSI transport dependencies are unavailable",
+)
+requires_gdrive_dependencies = unittest.skipUnless(
+    SECURE_TRANSPORT_AVAILABLE and REQUESTS_AVAILABLE and GDOWN_AVAILABLE,
+    "Google Drive download dependencies are unavailable",
+)
+requires_aesgcm = unittest.skipUnless(
+    AESGCM_AVAILABLE, "cryptography AES-GCM is required for encrypted spill tests",
+)
+
 
 class AirgapSecurityHelpersTest(unittest.TestCase):
+    def test_capset_rejects_ids_outside_its_v3_abi(self):
+        with mock.patch.object(module.platform, "system", return_value="Linux"):
+            self.assertFalse(module._set_linux_capabilities(permitted={64}))
+
+    def test_privilege_drop_stops_when_capability_restriction_fails(self):
+        account = mock.Mock(pw_uid=65534, pw_gid=65534)
+        with mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module.pwd, "getpwnam", return_value=account), \
+             mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.object(module.os, "setgroups"), \
+             mock.patch.object(module.os, "setgid"), \
+             mock.patch.object(module.os, "setuid"), \
+             mock.patch.object(module, "_call_prctl", return_value=0) as prctl, \
+             mock.patch.object(
+                 module, "_set_linux_capabilities", side_effect=[False, True],
+             ) as capset:
+            self.assertFalse(
+                module._drop_to_user("nobody", preserve_caps={module._CAP_NET_RAW}),
+            )
+
+        self.assertEqual(capset.call_count, 2)
+        self.assertEqual(prctl.call_args_list[-1], mock.call(8, 0, 0, 0, 0))
+
     def test_runtime_config_sets_parser_defaults_and_cli_can_override(self):
         config = {
             "interface": "wg0",
@@ -59,6 +106,227 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(overridden.max_memory_mb, 900)
         self.assertFalse(overridden.ignore_model_hash)
         self.assertFalse(overridden.compact_log)
+
+    def test_panel_config_overrides_runtime_config_without_discarding_other_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_path = pathlib.Path(temp_dir) / "config.json"
+            panel_path = pathlib.Path(temp_dir) / "panel-config.json"
+            runtime_path.write_text(json.dumps({
+                "interface": "eth0",
+                "drive_id": "folder-id",
+                "colab_endpoint": "https://colab.example.test/rsi",
+            }), encoding="utf-8")
+            panel_path.write_text(json.dumps({
+                "interface": "wg0",
+                "ram_limit": 900,
+            }), encoding="utf-8")
+
+            config = module._merge_runtime_config(str(runtime_path), str(panel_path))
+
+        self.assertEqual(config["interface"], "wg0")
+        self.assertEqual(config["ram_limit"], 900)
+        self.assertEqual(config["drive_id"], "folder-id")
+        self.assertEqual(config["colab_endpoint"], "https://colab.example.test/rsi")
+
+    def test_map_mode_config_accepts_only_the_three_supported_modes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for mode in (0, 1, 2):
+                config_path.write_text(json.dumps({"map_mode": mode}), encoding="utf-8")
+                self.assertEqual(module._load_runtime_config(str(config_path))["map_mode"], mode)
+
+            config_path.write_text(json.dumps({"map_mode": True}), encoding="utf-8")
+            self.assertNotIn("map_mode", module._load_runtime_config(str(config_path)))
+
+    def test_usb_guard_config_accepts_only_integer_toggle_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for enabled in (0, 1):
+                config_path.write_text(json.dumps({"usb_guard_enabled": enabled}), encoding="utf-8")
+                self.assertEqual(
+                    module._load_runtime_config(str(config_path))["usb_guard_enabled"],
+                    enabled,
+                )
+
+            for invalid in (True, 2, "1"):
+                config_path.write_text(json.dumps({"usb_guard_enabled": invalid}), encoding="utf-8")
+                self.assertNotIn(
+                    "usb_guard_enabled",
+                    module._load_runtime_config(str(config_path)),
+                )
+
+    def test_secure_tunnel_config_accepts_only_integer_toggle_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for enabled in (0, 1):
+                config_path.write_text(
+                    json.dumps({"secure_tunnel_enabled": enabled}), encoding="utf-8",
+                )
+                self.assertEqual(
+                    module._load_runtime_config(str(config_path))["secure_tunnel_enabled"],
+                    enabled,
+                )
+
+            for invalid in (True, 2, "1"):
+                config_path.write_text(
+                    json.dumps({"secure_tunnel_enabled": invalid}), encoding="utf-8",
+                )
+                self.assertNotIn(
+                    "secure_tunnel_enabled",
+                    module._load_runtime_config(str(config_path)),
+                )
+
+    def test_memory_guard_config_accepts_only_integer_toggle_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            for enabled in (0, 1):
+                config_path.write_text(
+                    json.dumps({"memory_guard_enabled": enabled}), encoding="utf-8",
+                )
+                self.assertEqual(
+                    module._load_runtime_config(str(config_path))["memory_guard_enabled"],
+                    enabled,
+                )
+
+            for invalid in (True, 2, "1"):
+                config_path.write_text(
+                    json.dumps({"memory_guard_enabled": invalid}), encoding="utf-8",
+                )
+                self.assertNotIn(
+                    "memory_guard_enabled",
+                    module._load_runtime_config(str(config_path)),
+                )
+
+    @requires_secure_transport
+    def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
+        device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
+        interfaces = ["eth0", "wlan0"]
+        with mock.patch.object(module, "discover_available_interfaces", return_value=interfaces), \
+             mock.patch.object(module, "disable_network_interfaces", return_value=True) as barrier, \
+             mock.patch.object(
+                 module.mk1_secure_transport, "request_transport_state", return_value=True,
+             ) as key_wipe:
+            module._usb_scan_threat_response(device, "error", interfaces)
+            barrier.assert_not_called()
+
+            module._usb_scan_threat_response(device, "threat", interfaces, "/tmp/tunnel.sock")
+
+        barrier.assert_called_once_with(interfaces)
+        key_wipe.assert_called_once_with("/tmp/tunnel.sock", False)
+
+    def test_usb_guard_is_a_separate_privileged_worker_only_in_full_isolation(self):
+        processes = [mock.Mock(), mock.Mock(), mock.Mock()]
+        with mock.patch.object(module, "_PRIVILEGED_AGENT_ACTIVE", False), \
+             mock.patch.object(module, "_PRIVILEGED_STOP_EVENT", mock.Mock()), \
+             mock.patch.object(module, "_PRIVILEGED_COMMAND_PROCESS", None), \
+             mock.patch.object(module, "_PRIVILEGED_CAPTURE_PROCESS", None), \
+             mock.patch.object(module, "_PRIVILEGED_USB_PROCESS", None), \
+             mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
+             mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.object(module, "discover_available_interfaces", return_value=["eth0"]), \
+             mock.patch.object(module.multiprocessing, "Process", side_effect=processes) as process_factory:
+            module._ensure_privileged_agent(
+                "eth0", 500, "/tmp/mk1", False, panel_config_path="ai_data/panel-config.json",
+            )
+
+        self.assertEqual(process_factory.call_count, 3)
+        self.assertIs(process_factory.call_args_list[2].kwargs["target"], module._usb_guard_process_main)
+        self.assertEqual(processes[2].start.call_count, 1)
+
+    def test_threat_map_telemetry_runs_after_the_defense_decision(self):
+        call_order = []
+        with mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", False), \
+             mock.patch.object(module, "_BACKDOOR_RISK_SCORE", 0.0), \
+             mock.patch.object(module, "maybe_log_crypto_markers"), \
+             mock.patch.object(module, "inspect_packet_pipeline", return_value={
+                 "block": True, "stage": "dpi", "score": 0.9,
+             }), \
+             mock.patch.object(
+                 module, "evaluate_threat_state",
+                 side_effect=lambda *args, **kwargs: call_order.append("defense") or True,
+             ), \
+             mock.patch.object(
+                 module, "_publish_threat_map_event",
+                 side_effect=lambda *args, **kwargs: call_order.append("map"),
+             ):
+            module.handle_packet_event(
+                b"packet", "eth0", dry_run=True, dpi_result={"suspicious": True},
+            )
+
+        self.assertEqual(call_order, ["defense", "map"])
+
+    def test_panel_status_is_atomic_private_and_reports_isolation_alert(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "_BACKDOOR_RISK_SCORE", 0.8), \
+             mock.patch.object(module, "_LAST_THREAT_SCORE", 0.99), \
+             mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", True), \
+             mock.patch.object(module.mk1_memory_guard, "is_enabled", return_value=True):
+            module._write_panel_status(
+                temp_dir, 12.5, 42, "Normal", True, state="STOPPED",
+            )
+            status_path = pathlib.Path(temp_dir) / "panel-status.txt"
+            content = status_path.read_text(encoding="ascii")
+            status_mode = status_path.stat().st_mode & 0o777
+            remaining_temporary_files = list(pathlib.Path(temp_dir).glob(".panel-status.*.tmp"))
+
+        self.assertIn("state=STOPPED\n", content)
+        self.assertIn("packets_per_second=12.50\n", content)
+        self.assertIn("packets_total=42\n", content)
+        self.assertIn("isolation_active=1\n", content)
+        self.assertIn("memory_guard_active=1\n", content)
+        self.assertIn("alert=AIRGAP\n", content)
+        self.assertEqual(status_mode, 0o600)
+        self.assertEqual(remaining_temporary_files, [])
+
+    def test_airgap_closes_only_the_panel_process_in_its_ancestry(self):
+        ancestor = mock.Mock(pid=4321)
+        process = mock.Mock()
+        process.parents.return_value = [ancestor]
+        with mock.patch.object(module, "_PANEL_PARENT_PID", 4321), \
+             mock.patch.object(module.psutil, "Process", return_value=process), \
+             mock.patch.object(module.os, "kill") as kill:
+            module._close_panel_after_airgap()
+
+        kill.assert_called_once_with(4321, module._signal_module.SIGTERM)
+
+        process.parents.return_value = [mock.Mock(pid=1234)]
+        with mock.patch.object(module, "_PANEL_PARENT_PID", 4321), \
+             mock.patch.object(module.psutil, "Process", return_value=process), \
+             mock.patch.object(module.os, "kill") as kill:
+            module._close_panel_after_airgap()
+
+        kill.assert_not_called()
+
+    def test_panel_full_isolation_requires_every_network_interface_to_stop(self):
+        with mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module, "_run_command_with_sudo", return_value=True) as run_command:
+            self.assertTrue(module._disable_all_network_interfaces(["eth0", "wlan0", "lo"]))
+
+        self.assertEqual(
+            [call.args[0] for call in run_command.call_args_list],
+            [
+                ["ip", "link", "set", "dev", "eth0", "down"],
+                ["ip", "link", "set", "dev", "wlan0", "down"],
+            ],
+        )
+
+        with mock.patch.object(module.platform, "system", return_value="Linux"), \
+             mock.patch.object(module, "_run_command_with_sudo", side_effect=[True, False]) as run_command:
+            self.assertFalse(module._disable_all_network_interfaces(["eth0", "wlan0"]))
+
+        self.assertEqual(run_command.call_count, 2)
+
+    def test_panel_full_isolation_stops_all_nics_before_other_containment_work(self):
+        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
+             mock.patch.object(module, "_disable_all_network_interfaces", return_value=True) as stop_all, \
+             mock.patch.object(module, "_close_panel_after_airgap") as close_panel, \
+             mock.patch.object(module, "profile_environment", side_effect=AssertionError("slow follow-up must not run")), \
+             mock.patch.object(module, "execute_generated_payload", side_effect=AssertionError("fallback must not run")):
+            module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0", "wlan0"])
+
+        stop_all.assert_called_once_with(["eth0", "wlan0"])
+        close_panel.assert_called_once_with()
 
     def test_root_privilege_drop_uses_sudo_invoking_user(self):
         passwd_entry = mock.Mock(pw_name="workspace-user")
@@ -102,20 +370,24 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         )
         self.assertIsNone(module._derive_cloud_model_urls("http://colab.example.test/rsi"))
 
+    @unittest.skipUnless(
+        TORCH_AVAILABLE and SECURE_TRANSPORT_AVAILABLE,
+        "PyTorch and secure-transport dependencies are required for model sync",
+    )
     def test_sync_cloud_model_verifies_hash_replaces_atomically_and_queues_state(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         artifact = io.BytesIO()
         module.torch.save(model.state_dict(), artifact)
         model_bytes = artifact.getvalue()
         expected_hash = hashlib.sha256(model_bytes).hexdigest()
-        hash_response = mock.Mock(text=f"{expected_hash} cloud_base_model.pth")
-        model_response = mock.Mock(
-            headers={"Content-Length": str(len(model_bytes))},
-            iter_content=mock.Mock(return_value=[model_bytes[:128], model_bytes[128:]]),
-        )
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
-            with mock.patch.object(module.requests, "get", side_effect=[hash_response, model_response]) as get:
+            with mock.patch.dict(
+                module.os.environ, {"COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "a" * 64},
+            ), mock.patch.object(
+                module.mk1_secure_transport, "encrypted_request",
+                side_effect=[f"{expected_hash} cloud_base_model.pth".encode("ascii"), model_bytes],
+            ) as secure_request:
                 result = module.sync_cloud_model(
                     "https://colab.example.test/model",
                     "https://colab.example.test/model.sha256",
@@ -127,10 +399,11 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256(model_path.read_bytes()).hexdigest(), expected_hash)
             sidecar_path = pathlib.Path(str(model_path) + ".sha256")
             self.assertEqual(sidecar_path.read_text(encoding="utf-8").split()[0], expected_hash)
-            self.assertEqual(get.call_count, 2)
-            self.assertEqual(get.call_args_list[0].kwargs["timeout"], (30, 120))
-            self.assertEqual(get.call_args_list[1].kwargs["timeout"], (30, 300))
-            self.assertEqual(get.call_args_list[0].kwargs["headers"]["Authorization"], "Bearer test-token")
+            self.assertEqual(secure_request.call_count, 2)
+            self.assertEqual(secure_request.call_args_list[0].args[2], {"action": "model_hash"})
+            self.assertEqual(secure_request.call_args_list[1].args[2], {"action": "model"})
+            self.assertEqual(secure_request.call_args_list[0].args[4], "a" * 64)
+            self.assertEqual(secure_request.call_args_list[0].args[3], "test-token")
             self.assertEqual(module._MODEL_SYNC_STATUS, "Updated")
             with module._MODEL_RELOAD_LOCK:
                 self.assertIsNotNone(module._PENDING_CLOUD_STATE)
@@ -139,19 +412,18 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(module._MODEL_SYNC_STATUS, "Loaded")
             self.assertEqual(list(pathlib.Path(temp_dir).glob("*.tmp")), [])
             self.assertEqual(list(pathlib.Path(temp_dir).glob(".model-hash-*.tmp")), [])
-            hash_response.close.assert_called_once()
-            model_response.close.assert_called_once()
 
+    @requires_secure_transport
     def test_sync_cloud_model_rejects_hash_mismatch_without_replacing_existing(self):
-        hash_response = mock.Mock(text=f"{'0' * 64} cloud_base_model.pth")
-        model_response = mock.Mock(
-            headers={"Content-Length": "10"},
-            iter_content=mock.Mock(return_value=[b"not-a-model"]),
-        )
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
             model_path.write_bytes(b"existing-model")
-            with mock.patch.object(module.requests, "get", side_effect=[hash_response, model_response]):
+            with mock.patch.dict(
+                module.os.environ, {"COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "a" * 64},
+            ), mock.patch.object(
+                module.mk1_secure_transport, "encrypted_request",
+                side_effect=[f"{'0' * 64} cloud_base_model.pth".encode("ascii"), b"not-a-model"],
+            ):
                 result = module.sync_cloud_model(
                     "https://colab.example.test/model",
                     "https://colab.example.test/model.sha256",
@@ -163,17 +435,25 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(module._MODEL_SYNC_STATUS, "Failed")
             self.assertEqual(list(pathlib.Path(temp_dir).glob(".cloud-model-*.tmp")), [])
 
+    @unittest.skipUnless(
+        TORCH_AVAILABLE and SECURE_TRANSPORT_AVAILABLE,
+        "PyTorch and secure-transport dependencies are required for model sync",
+    )
     def test_sync_cloud_model_queues_matching_local_model_for_application(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         artifact = io.BytesIO()
         module.torch.save(model.state_dict(), artifact)
         model_bytes = artifact.getvalue()
         expected_hash = hashlib.sha256(model_bytes).hexdigest()
-        hash_response = mock.Mock(text=f"{expected_hash} cloud_base_model.pth")
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
             model_path.write_bytes(model_bytes)
-            with mock.patch.object(module.requests, "get", return_value=hash_response) as get:
+            with mock.patch.dict(
+                module.os.environ, {"COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "a" * 64},
+            ), mock.patch.object(
+                module.mk1_secure_transport, "encrypted_request",
+                return_value=f"{expected_hash} cloud_base_model.pth".encode("ascii"),
+            ) as secure_request:
                 result = module.sync_cloud_model(
                     "https://colab.example.test/model",
                     "https://colab.example.test/model.sha256",
@@ -182,11 +462,26 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
             self.assertFalse(result["updated"])
             self.assertEqual(result["reason"], "already current")
-            self.assertEqual(get.call_count, 1)
-            hash_response.close.assert_called_once()
+            self.assertEqual(secure_request.call_count, 1)
             with module._MODEL_RELOAD_LOCK:
                 self.assertIsNone(module._PENDING_CLOUD_STATE)
 
+    @requires_secure_transport
+    def test_sync_cloud_model_fails_closed_without_pqc_key_pin(self):
+        with mock.patch.dict(module.os.environ, {}, clear=True), mock.patch.object(
+            module.mk1_secure_transport, "encrypted_request",
+        ) as secure_request:
+            result = module.sync_cloud_model(
+                "https://colab.example.test/model",
+                "https://colab.example.test/model.sha256",
+                "unused-model.pth",
+            )
+
+        self.assertFalse(result["updated"])
+        self.assertEqual(result["reason"], "PQC public-key pin required")
+        secure_request.assert_not_called()
+
+    @requires_torch
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -203,6 +498,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(module._adjust_soft_ai_score(0.90, 1.0, reviewed=True), 0.675)
         self.assertEqual(module._adjust_soft_ai_score(0.96, 1.0, reviewed=True), 0.96)
 
+    @requires_torch
     def test_reviewed_head_b_can_clear_borderline_ai_only_detection(self):
         class Model:
             def __call__(self, _inputs):
@@ -334,6 +630,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(untrusted, [[{"features": [0.2] * 10}]])
         self.assertEqual(reviewed, [[{"features": [0.2] * 10, "label": 1}]])
 
+    @requires_gdrive_dependencies
     def test_download_from_gdrive_folder_downloads_only_size_verified_data(self):
         payload = json.dumps({"features": [0.0] * 10}) + "\n"
         candidate = mock.Mock(id="file-id", path="dataset/sample.jsonl")
@@ -342,6 +639,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             "Content-Type": "application/json",
         })
         with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module.mk1_secure_transport, "require_wireguard_full_tunnel", return_value="wg0"), \
              mock.patch.object(module, "GDOWN_AVAILABLE", True), \
              mock.patch.object(module.gdown, "download_folder", return_value=[candidate]) as list_folder, \
              mock.patch.object(module.requests, "head", return_value=response) as head_request, \
@@ -362,9 +660,11 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(len(downloaded), 1)
             self.assertEqual(pathlib.Path(downloaded[0]).read_text(encoding="utf-8"), payload)
 
+    @requires_gdrive_dependencies
     def test_drive_size_check_timeout_is_skipped_safely(self):
         candidate = mock.Mock(id="slow-file", path="dataset/slow.jsonl")
         with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module.mk1_secure_transport, "require_wireguard_full_tunnel", return_value="wg0"), \
              mock.patch.object(module, "GDOWN_AVAILABLE", True), \
              mock.patch.object(module.gdown, "download_folder", return_value=[candidate]), \
              mock.patch.object(module.requests, "head", side_effect=module.requests.ReadTimeout("slow response")) as head_request, \
@@ -375,6 +675,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(head_request.call_count, 3)
         download.assert_not_called()
 
+    @requires_gdrive_dependencies
     def test_gdrive_retries_temporary_head_timeout(self):
         payload = json.dumps({"features": [0.0] * 10}) + "\n"
         candidate = mock.Mock(id="retry-file", path="dataset/retry.jsonl")
@@ -383,6 +684,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             "Content-Type": "application/json",
         })
         with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module.mk1_secure_transport, "require_wireguard_full_tunnel", return_value="wg0"), \
              mock.patch.object(module, "GDOWN_AVAILABLE", True), \
              mock.patch.object(module.gdown, "download_folder", return_value=[candidate]), \
              mock.patch.object(
@@ -522,21 +824,43 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             for call in log_mock.info.call_args_list
         ))
 
+    @requires_rsi_dependencies
+    def test_rsi_refuses_remote_request_without_pqc_pin(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        records = [
+            {"features": [0.1] * 10, "label": 0},
+            {"features": [0.9] * 10, "label": 1},
+        ]
+        with mock.patch.dict(module.os.environ, {
+            "COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi",
+            "COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "",
+            "COLAB_RSI_TOKEN": "test-token",
+        }), mock.patch.object(module.mk1_secure_transport, "encrypted_request") as request:
+            worker, completion, result = module._start_colab_rsi_request(
+                model, ".", wait_for_result=True, records=records,
+            )
+
+        self.assertIsNone(worker)
+        self.assertTrue(completion.is_set())
+        self.assertTrue(result["rejected"])
+        request.assert_not_called()
+
+    @requires_rsi_dependencies
     def test_rsi_posts_only_selected_features_in_colab_api_schema(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
-        response = mock.Mock()
-        response.raise_for_status.return_value = None
         sent_payload = {}
         records = [
             {"features": [0.1] * 10, "label": 0, "packet_bytes": b"never-send"},
             {"features": [0.9] * 10, "label": 1},
         ]
-        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi"}), \
-           mock.patch.object(
-              module.requests,
-              "post",
-              side_effect=lambda *args, **kwargs: (sent_payload.update(kwargs["json"]) or response),
-           ) as post:
+        with mock.patch.dict(module.os.environ, {
+            "COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi",
+            "COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "a" * 64,
+        }), mock.patch.object(
+            module.mk1_secure_transport, "encrypted_request",
+            side_effect=lambda _requests, _url, payload, _token, _pin:
+                (sent_payload.update(payload) or b'{"accepted":true}'),
+        ) as secure_request:
             worker, completion, result = module._start_colab_rsi_request(
                 model, ".", wait_for_result=True, records=records, token="config-token",
             )
@@ -546,7 +870,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(module._RSI_CONNECTION_STATUS, "Connected")
         worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
-        post.assert_called_once()
+        secure_request.assert_called_once()
         self.assertEqual(sent_payload["task"], "recursive_self_improvement")
         self.assertEqual(set(sent_payload), {"task", "curated_data", "training", "submitted_at"})
         self.assertEqual(set(sent_payload["curated_data"]), {"records", "contents_uploaded"})
@@ -556,16 +880,20 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         ])
         self.assertEqual(sent_payload["training"]["epochs"], 1)
         self.assertTrue(sent_payload["curated_data"]["contents_uploaded"])
-        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer config-token")
-        self.assertEqual(post.call_args.kwargs["timeout"], (60, 300))
+        self.assertEqual(secure_request.call_args.args[3], "config-token")
+        self.assertEqual(secure_request.call_args.args[4], "a" * 64)
         self.assertNotIn("never-send", str(sent_payload))
-        response.close.assert_called_once()
 
+    @requires_rsi_dependencies
     def test_rsi_refuses_to_send_single_class_feedback(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         records = [{"features": [0.1] * 10, "label": 0}]
-        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi"}), \
-             mock.patch.object(module.requests, "post") as post, \
+        with mock.patch.dict(module.os.environ, {
+            "COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi",
+            "COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "a" * 64,
+            "COLAB_RSI_TOKEN": "test-token",
+        }), \
+             mock.patch.object(module.mk1_secure_transport, "encrypted_request") as secure_request, \
              mock.patch.object(module, "log") as log_mock:
             worker, completion, result = module._start_colab_rsi_request(
                 model, ".", wait_for_result=True, records=records,
@@ -574,17 +902,25 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertIsNone(worker)
         self.assertTrue(completion.is_set())
         self.assertTrue(result["rejected"])
-        post.assert_not_called()
+        secure_request.assert_not_called()
         log_mock.warning.assert_called_once()
 
+    @requires_rsi_dependencies
     def test_rsi_connection_failure_returns_local_fallback(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         records = [
             {"features": [0.1] * 10, "label": 0},
             {"features": [0.9] * 10, "label": 1},
         ]
-        with mock.patch.dict(module.os.environ, {"COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi"}), \
-             mock.patch.object(module.requests, "post", side_effect=module.requests.ConnectionError("offline")), \
+        with mock.patch.dict(module.os.environ, {
+            "COLAB_RSI_ENDPOINT": "https://colab.example.test/rsi",
+            "COLAB_RSI_PQ_PUBLIC_KEY_SHA256": "a" * 64,
+            "COLAB_RSI_TOKEN": "test-token",
+        }), \
+             mock.patch.object(
+                 module.mk1_secure_transport, "encrypted_request",
+                 side_effect=module.requests.ConnectionError("offline"),
+             ), \
              mock.patch.object(module, "log") as log_mock:
             worker, completion, result = module._start_colab_rsi_request(
                 model, ".", wait_for_result=True, records=records,
@@ -623,10 +959,56 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(train.call_args_list[1].args[2][0]["label"], 0)
         self.assertEqual(train.call_args_list[1].args[2][1]["label"], 1)
 
+    def test_validation_prefers_local_data_before_drive_fetch(self):
+        record = {"features": [0.1] * 10}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            curated_dir = pathlib.Path(temp_dir) / "curated"
+            curated_dir.mkdir()
+            (curated_dir / "curated_data.jsonl").write_text(
+                json.dumps(record) + "\n", encoding="utf-8",
+            )
+            with mock.patch.object(module, "download_from_gdrive_folder") as download, \
+                 mock.patch.object(module, "train_local_whitelist") as train:
+                result = module._run_lightweight_training_validation(
+                    temp_dir,
+                    "folder-id",
+                    max_samples=1,
+                    model=module.LightweightMultiTaskAI(input_dim=10),
+                )
+
+        self.assertEqual(result, 0)
+        download.assert_not_called()
+        train.assert_called_once()
+
+    def test_validation_fetches_drive_data_when_no_local_data_exists(self):
+        record = {"features": [0.1] * 10}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def download_to_local(_drive_id, dest_dir):
+                raw_dir = pathlib.Path(dest_dir)
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                (raw_dir / "sample.jsonl").write_text(
+                    json.dumps(record) + "\n", encoding="utf-8",
+                )
+
+            with mock.patch.object(
+                module, "download_from_gdrive_folder", side_effect=download_to_local,
+            ) as download, mock.patch.object(module, "train_local_whitelist") as train:
+                result = module._run_lightweight_training_validation(
+                    temp_dir,
+                    "folder-id",
+                    max_samples=1,
+                    model=module.LightweightMultiTaskAI(input_dim=10),
+                )
+
+        self.assertEqual(result, 0)
+        download.assert_called_once_with("folder-id", os.path.join(temp_dir, "gdrive_raw"))
+        train.assert_called_once()
+
     def test_training_queue_is_bounded(self):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
 
+    @requires_torch
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
@@ -656,6 +1038,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             torch.testing.assert_close(restored_model.shared_layer[0].weight, baseline_shared)
             torch.testing.assert_close(model.shared_layer[0].weight, original_shared)
 
+    @requires_torch
     def test_local_feedback_checkpoint_marks_both_reviewed_classes(self):
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
              mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
@@ -673,14 +1056,18 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(module._HEAD_B_REVIEWED)
             self.assertEqual(module._HEAD_B_REVIEWED_LABELS, {0, 1})
 
-    def test_training_enqueue_retries_when_queue_is_full(self):
+    def test_training_enqueue_drops_batch_without_blocking_when_queue_is_full(self):
         original_queue = module._train_queue
-        full_queue = mock.Mock()
-        full_queue.put.side_effect = [queue.Full, None]
+        full_queue = queue.Queue(maxsize=1)
+        queued_batch = [{"features": [0.1] * 10, "label": 0}]
+        rejected_batch = [{"features": [0.9] * 10, "label": 1}]
+        full_queue.put_nowait(queued_batch)
         try:
             module._train_queue = full_queue
-            self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
-            self.assertEqual(full_queue.put.call_count, 2)
+            started = module.time.monotonic()
+            self.assertFalse(module._enqueue_training_batch(rejected_batch))
+            self.assertLess(module.time.monotonic() - started, 0.5)
+            self.assertIs(full_queue.get_nowait(), queued_batch)
         finally:
             module._train_queue = original_queue
 
@@ -863,6 +1250,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         original_queue = module._packet_queue
         original_last_pkt_time = module._last_pkt_time
         original_ema_delta = module._ema_delta
+        with module._FLOW_CACHE_LOCK:
+            original_flow_cache = module._FLOW_STATE_CACHE.copy()
+            module._FLOW_STATE_CACHE.clear()
         try:
             module._packet_queue = q
             module._last_pkt_time = 100.0
@@ -878,6 +1268,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             module._packet_queue = original_queue
             module._last_pkt_time = original_last_pkt_time
             module._ema_delta = original_ema_delta
+            with module._FLOW_CACHE_LOCK:
+                module._FLOW_STATE_CACHE.clear()
+                module._FLOW_STATE_CACHE.update(original_flow_cache)
 
     def test_non_linux_capture_uses_simulation_without_opening_raw_socket(self):
         class StopAfterOnePacket:
@@ -1195,6 +1588,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             mock.call(module._signal_module.SIGTERM, module._signal_module.SIG_DFL),
         ])
 
+    @requires_torch
     def test_load_cloud_model_uses_cpu_map_location(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         valid_state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -1208,8 +1602,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(load_mock.call_args.kwargs.get("weights_only", False))
             self.assertTrue(log_mock.info.called or log_mock.warning.called)
 
+    @requires_torch
     def test_load_cloud_model_migrates_legacy_checkpoint_without_changing_outputs(self):
-        if module.torch is None:
+        if not TORCH_AVAILABLE:
             self.skipTest("PyTorch is not installed")
 
         torch = module.torch
@@ -1269,6 +1664,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         finally:
             pathlib.Path(temp_path).unlink(missing_ok=True)
 
+    @requires_torch
     def test_load_cloud_model_can_skip_hash_check_for_development(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         valid_state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -1651,6 +2047,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(effective_score, pipeline["score"])
         self.assertEqual(module._combine_threat_scores(float("nan"), float("inf")), 0.0)
 
+    @requires_aesgcm
     def test_memory_manager_circular_buffer(self):
         temp_swap_dir = "./test_swap"
         mgr = module.MemoryManager(max_memory_mb=10, swap_dir=temp_swap_dir)

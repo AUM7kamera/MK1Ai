@@ -1,31 +1,9 @@
-"""
-============================================================
-  超軽量・オールインワン エアギャップ自動遮断AI
-  airgap_ai_defender.py (最終完成版)
-============================================================
+"""ユーザー空間パケット監視、脅威スコアリング、ローカル学習の実験用プロトタイプ。
 
-【自由工作のレポート用 システム概要】
+AF_PACKETで受信したパケットはPythonで解析し、DPI/AI pipelineへ渡す。
+専用Fast-Path実装ではなく、ラインレート処理や検知遅延を保証しない。
 
-このプログラムは「1つのAIモデルがすべてを支配する」という設計思想で作られています。
-
-★ 3層リソース構造
-  [Layer 1] Googleドライブ (最大100GB) ─── ハッキング手法の最新教材置き場
-      ↓ AIが「使える教材か？」を查定してダウンロード
-  [Layer 2] ローカルストレージ ─────────── 厳選データの保管庫 + 緊急時の仮想メモリ
-      ↓ 必要なデータだけをRAMへ
-  [Layer 3] システムRAM (上限500MB) ────── AIモデル本体が動く超高速の実行現場
-
-★ 1つのAIが3つの顔を持つ
-  Head A (絶対防衛役) : 異常パケットを0.001秒で検知 → ネットワーク即遮断
-  Head B (学習・厳選役): 良い教材を見分け、防衛の邪魔をせずバックグラウンドで成長
-  Head C (司令塔)     : RAMの残量を監視し、溢れる前にデータをストレージへ退避指令
-
-実行方法:
-  pip install torch psutil requests gdown
-  sudo python3 airgap_ai_defender.py --interface eth0
-  ※ raw socketにはroot権限(sudo)が必要
-  ※ デフォルトはDry-Runモード（実際の遮断はしない安全なテストモード）
-  ※ GoogleドライブフォルダID: 100FIfMbB-0kR2bg2NXl-O1k-Lilz-j_G (デフォルト設定済)
+リリースパッケージ担当: 山田 悠 (Yu Yamada)。
 """
 
 # ── 標準ライブラリ (インストール不要) ──
@@ -37,6 +15,15 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Iterable, cast
 from urllib.parse import urlparse
+
+from mk1_map import MapMode, MapVisualizationService, build_threat_map_event
+import mk1_memory_guard
+from mk1_usb_guard import USBHotplugMonitor, disable_network_interfaces
+
+try:
+    import mk1_secure_transport
+except ImportError:
+    mk1_secure_transport = None
 
 try:
     import pwd
@@ -455,15 +442,13 @@ _LAST_KILL_SWITCH_TRIGGER = 0.0
 _MONITOR_INTERFACE = "eth0"
 _DRY_RUN = True
 
-# Linux capabilities and cBPF safe-flow configuration
+# Linux capabilities
 _CAP_NET_ADMIN = 12
 _CAP_NET_RAW = 13
-_SAFE_KERNEL_BPF_PORTS = {80, 443, 1935, 554, 8080, 8443}
-_SAFE_KERNEL_BPF_MINIMUM_PACKET_LENGTH = 1200
-_SAFE_KERNEL_BPF_DIRTY = False
 
 _PROCESS_EVENT_MONITOR_AVAILABLE = False
 _PROCESS_EVENT_MONITOR_FALLBACK_INTERVAL = 2.0
+_MAP_VISUALIZATION_SERVICE: MapVisualizationService | None = None
 
 # ── ONI_MODE (鬼モード): threading.Event 化により実行時に動的切替可能 ──
 # 起動時は環境変数 / CLI引数 で初期値を設定。
@@ -485,7 +470,7 @@ def toggle_oni_mode(activate: bool | None = None) -> bool:
         activate = not _ONI_MODE_ACTIVE.is_set()
     if activate:
         _ONI_MODE_ACTIVE.set()
-        log.warning("[ONI_MODE] ★★★ 鬼モード有効化 ★★★ ホワイトリスト無効・1検知で即キルスイッチ発動！")
+        log.warning("[ONI_MODE] 検知閾値を変更した監視モードを有効化しました。誤検知リスクが上がります。")
     else:
         _ONI_MODE_ACTIVE.clear()
         log.info("[ONI_MODE] 鬼モード解除 → 通常監視モードへ移行しました。")
@@ -506,7 +491,7 @@ _NORMAL_MODE_COMPOSITE_THRESHOLD = 0.88
 _NORMAL_MODE_AI_THRESHOLD = 0.88
 _NORMAL_MODE_MATH_THRESHOLD = 0.88
 _NORMAL_MODE_ENTROPY_THRESHOLD = 0.92   # これ以上の高エントロピーは第1段階で即ブロック
-# 鬼モード: 1検知で即キルスイッチ (閾値を最小化)
+# 鬼モード: 検知閾値を下げる実験用設定
 _ONI_MODE_SCORE_THRESHOLD = 0.01        # 実質的にどんな異常でも即発動
 _ONI_MODE_ANOMALY_COUNT_TRIGGER = 1     # 累積カウンタ1回で発動
 
@@ -523,6 +508,8 @@ _FULL_PACKET_INSPECTION_LOG_LOCK = threading.Lock()
 _MAINTENANCE_ACTIVE = False
 _MAINTENANCE_REASON = ""
 _MAINTENANCE_LOCK = threading.Lock()
+_PANEL_PARENT_PID = 0
+_PANEL_FULL_ISOLATION = False
 _RSI_MODE_ACTIVE = False
 _RSI_CONNECTION_STATUS = "Not configured"
 _MODEL_SYNC_STATUS = "Disabled"
@@ -2283,12 +2270,18 @@ def build_diagnostic_trace(layer: int, threshold: float, score: float, reason: s
 def _call_prctl(option: int, arg2: int = 0, arg3: int = 0, arg4: int = 0, arg5: int = 0) -> int:
     """libc.prctl への薄いラッパー。"""
     if platform.system().lower() != "linux":
-        return -1
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        return libc.prctl(option, arg2, arg3, arg4, arg5)
-    except Exception:
-        return -1
+        raise OSError(errno.ENOTSUP, "prctl is available only on Linux")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = (
+        ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+    )
+    prctl.restype = ctypes.c_int
+    result = prctl(option, arg2, arg3, arg4, arg5)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return result
 
 
 def _set_linux_capabilities(permitted: set[int] | None = None, effective: set[int] | None = None, inheritable: set[int] | None = None) -> bool:
@@ -2298,6 +2291,10 @@ def _set_linux_capabilities(permitted: set[int] | None = None, effective: set[in
     permitted = set(permitted or ())
     effective = set(effective or ())
     inheritable = set(inheritable or ())
+    capabilities = permitted | effective | inheritable
+    if any(capability < 0 or capability >= 64 for capability in capabilities):
+        log.error("[PRIVILEGE] Linux capability ID is outside the v3 capset ABI")
+        return False
 
     class CapHeader(ctypes.Structure):
         _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
@@ -2310,7 +2307,7 @@ def _set_linux_capabilities(permitted: set[int] | None = None, effective: set[in
         ]
 
     header = CapHeader()
-    header.version = 0x19980330
+    header.version = 0x20080522
     header.pid = 0
 
     data = (CapData * 2)()
@@ -2337,11 +2334,19 @@ def _set_linux_capabilities(permitted: set[int] | None = None, effective: set[in
     data[0].inheritable = inheritable_mask
 
     try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        result = libc.capset(ctypes.byref(header), ctypes.byref(data))
-        return result == 0
-    except Exception:
-        return False
+        libc = ctypes.CDLL(None, use_errno=True)
+        capset = libc.capset
+        capset.argtypes = (
+            ctypes.POINTER(CapHeader), ctypes.POINTER(CapData),
+        )
+        capset.restype = ctypes.c_int
+        if capset(ctypes.byref(header), data) == 0:
+            return True
+        error = ctypes.get_errno()
+        log.error("[PRIVILEGE] Linux capset failed: %s", os.strerror(error))
+    except (AttributeError, OSError) as exc:
+        log.error("[PRIVILEGE] Linux capset is unavailable: %s", exc)
+    return False
 
 
 def _drop_to_user(username: str = "nobody", preserve_caps: set[int] | None = None) -> bool:
@@ -2356,24 +2361,38 @@ def _drop_to_user(username: str = "nobody", preserve_caps: set[int] | None = Non
         return False
 
     preserve_caps = set(preserve_caps or ())
+    identity_dropped = False
     try:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            _call_prctl(8, 1, 0, 0, 0)  # PR_SET_KEEPCAPS
+            _call_prctl(8, int(bool(preserve_caps)), 0, 0, 0)  # PR_SET_KEEPCAPS
             os.setgroups([])
             os.setgid(pw.pw_gid)
             os.setuid(pw.pw_uid)
+            identity_dropped = True
+            if not _set_linux_capabilities(
+                permitted=preserve_caps,
+                effective=preserve_caps,
+                inheritable=set(),
+            ):
+                raise OSError(errno.EPERM, "Unable to apply the requested capability set")
             if preserve_caps:
-                _set_linux_capabilities(permitted=preserve_caps, effective=preserve_caps, inheritable=set())
-            else:
-                _set_linux_capabilities(permitted=set(), effective=set(), inheritable=set())
-            _call_prctl(8, 0, 0, 0, 0)
+                _call_prctl(8, 0, 0, 0, 0)
         else:
             os.setgroups([])
             os.setgid(pw.pw_gid)
             os.setuid(pw.pw_uid)
         log.warning(f"[PRIVILEGE] 実効権限を {username} へ降格しました。preserve_caps={preserve_caps}")
         return True
-    except Exception as exc:
+    except (AttributeError, OSError, ValueError) as exc:
+        if identity_dropped:
+            capabilities_cleared = _set_linux_capabilities(set(), set(), set())
+            try:
+                _call_prctl(8, 0, 0, 0, 0)
+            except OSError:
+                capabilities_cleared = False
+            if not capabilities_cleared:
+                log.critical("[PRIVILEGE] capability rollback failed after UID drop; terminating worker")
+                os._exit(1)
         log.warning(f"[PRIVILEGE] 権限降格に失敗しました ({exc})")
         return False
 
@@ -2531,148 +2550,103 @@ def _privileged_command_process_main(stop_event=None):
             log.warning(f"[PRIVILEGE] 特権コマンドプロセスで例外が発生しました: {exc}")
 
 
-def _compile_kernel_bpf_program(safe_ports: set[int]) -> bytes:
-    """cBPF プログラムを構築し、明らかに安全な大容量フローをカーネル側でバイパスします。"""
-    class SockFilter(ctypes.Structure):
-        _fields_ = [
-            ("code", ctypes.c_ushort),
-            ("jt", ctypes.c_ubyte),
-            ("jf", ctypes.c_ubyte),
-            ("k", ctypes.c_uint32),
-        ]
-
-    class SockFprog(ctypes.Structure):
-        _fields_ = [
-            ("len", ctypes.c_ushort),
-            ("pad", ctypes.c_ushort),
-            ("filter", ctypes.POINTER(SockFilter)),
-        ]
-
-    normalized_ports = list(sorted(set(int(p) for p in safe_ports if 0 <= p <= 65535)))
-    program = [
-        (0x28, 0, 0, 12),       # load ethertype
-        (0x15, 0, 7, 0x0800),   # if IPv4 -> next
-        (0x15, 0, 6, 0x86DD),   # if IPv6 -> accept
-        (0x06, 0, 0, 0xFFFF),   # accept non-IP/IPv6
-
-        (0x30, 0, 0, 23),       # load ip protocol
-        (0x15, 0, 5, 6),        # if TCP -> next
-        (0x15, 0, 3, 17),       # if UDP -> tcp fallback skip
-        (0x06, 0, 0, 0xFFFF),   # accept non-TCP/UDP
-
-        # IPv4 options support: IHL を動的に計算し、可変長ヘッダを回避する。
-        (0x30, 0, 0, 14),       # load version/IHL byte
-        (0x54, 0, 0, 0x0f),     # and #0x0f
-        (0x64, 0, 0, 2),        # lsh #2 => IP header length in bytes
-        (0x07, 0, 0, 0),        # tax => X = IP header length
-        (0x51, 0, 0, 13),       # ldxb [x + 13] => TCP flags byte
-        (0x54, 0, 0, 0x17),     # and #0x17 (FIN,SYN,RST,ACK)
-        (0x15, 0, 2, 0x10),     # if exactly ACK-only -> safe_flow_check
-        (0x06, 0, 0, 0xFFFF),   # accept if not ACK-only
-        (0x68, 0, 0, 2),        # ldh [x + 2] => destination TCP port
-    ]
-
-    for port in normalized_ports:
-        program.extend([
-            (0x15, 0, 1, port),  # if dest port == port then drop on next instruction
-            (0x06, 0, 0, 0),
-        ])
-    program.append((0x06, 0, 0, 0xFFFF))
-
-    filter_array = (SockFilter * len(program))(*[SockFilter(code, jt, jf, k) for code, jt, jf, k in program])
-    fprog = SockFprog(len=len(program), pad=0, filter=filter_array)
-    return ctypes.string_at(ctypes.addressof(fprog), ctypes.sizeof(fprog))
-
-
-def _attach_kernel_bpf_filter(sock: socket.socket, safe_ports: set[int] | None = None) -> bool:
-    attach_filter_option = getattr(socket, "SO_ATTACH_FILTER", None)
-    if not isinstance(attach_filter_option, int):
-        return False
-    try:
-        program = _compile_kernel_bpf_program(safe_ports or _SAFE_KERNEL_BPF_PORTS)
-        sock.setsockopt(socket.SOL_SOCKET, attach_filter_option, program)
-        log.info(f"[BPF] カーネル側のパケットフィルタを RAW ソケットにアタッチしました: safe_ports={sorted(safe_ports or _SAFE_KERNEL_BPF_PORTS)}")
-        return True
-    except Exception as exc:
-        log.warning(f"[BPF] カーネルフィルタアタッチに失敗しました ({exc})")
-        return False
-
-
-def _refresh_kernel_bpf_filter(sock: socket.socket) -> None:
-    global _SAFE_KERNEL_BPF_DIRTY
-    if _SAFE_KERNEL_BPF_DIRTY:
-        if _attach_kernel_bpf_filter(sock):
-            _SAFE_KERNEL_BPF_DIRTY = False
-
-
-def _learn_safe_kernel_flow(transport: dict, dpi_result: dict) -> None:
-    """MK1 Ai が安全と判定した大容量ストリームをカーネルレベルでバイパスするための学習。"""
-    global _SAFE_KERNEL_BPF_DIRTY
-    if not transport or not dpi_result or dpi_result.get("suspicious"):
+def _usb_scan_threat_response(
+    device,
+    verdict: str,
+    interfaces: list[str],
+    tunnel_control_path: str | None = None,
+) -> None:
+    if verdict != "threat":
         return
-    if transport.get("protocol") != socket.IPPROTO_TCP:
+    log.critical(
+        "[USB] MicroVMが脅威を検出: %s (%s:%s)。iproute2によるNIC遮断を試みます。",
+        device.device_id, device.vendor_id, device.product_id,
+    )
+    if (
+        tunnel_control_path
+        and mk1_secure_transport is not None
+        and not mk1_secure_transport.request_transport_state(tunnel_control_path, False)
+    ):
+        log.critical("[USB] 暗号化トンネル鍵消去IPCを確認できません。")
+    current_interfaces = discover_available_interfaces() or interfaces
+    if not disable_network_interfaces(current_interfaces):
+        log.critical("[USB] iproute2で全NICを遮断できませんでした。USBデバイスは論理切断済みです。")
+
+
+def _usb_guard_process_main(
+    stop_event,
+    panel_config_path: str,
+    interfaces: list[str],
+) -> None:
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        log.critical("[USB] root権限がないためUSB隔離ワーカーを停止します。")
         return
-    dst_port = transport.get("dst_port")
-    if dst_port not in {80, 443, 8080, 8443, 1935, 554}:
-        return
-    if len(dpi_result.get("preview", "")) < 256:
-        return
-    if dpi_result.get("entropy", 0.0) >= 0.82:
-        return
-    if dpi_result.get("attack_signatures"):
-        return
-
-    if dst_port not in _SAFE_KERNEL_BPF_PORTS:
-        _SAFE_KERNEL_BPF_PORTS.add(dst_port)
-        _SAFE_KERNEL_BPF_DIRTY = True
-        log.info(f"[BPF_LEARNER] MK1 Ai が安全と判定した大容量 TLS/HTTP フローをカーネルフィルタへ追加しました: port={dst_port}")
-
-
-def _open_proc_event_socket() -> socket.socket | None:
-    if platform.system().lower() != "linux":
-        return None
-    try:
-        netlink_type = getattr(socket, "NETLINK_CONNECTOR", 11)
-        netlink = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, netlink_type)
-        netlink.bind((os.getpid(), 0))
-
-        CN_IDX_PROC = 0x1
-        CN_VAL_PROC = 0x1
-        PROC_CN_MCAST_LISTEN = 1
-
-        # nlmsghdr + cn_msg + a single u32 payload
-        nlmsg_len = 16 + 20 + 4
-        nlmsg_type = 0x10
-        nlmsg_flags = 0
-        nlmsg_seq = 0
-        nlmsg_pid = os.getpid()
-        header = struct.pack("IHHII", nlmsg_len, nlmsg_type, nlmsg_flags, nlmsg_seq, nlmsg_pid)
-        cn_msg = struct.pack("IIIIHH", CN_IDX_PROC, CN_VAL_PROC, 0, 0, 4, 0)
-        payload = struct.pack("I", PROC_CN_MCAST_LISTEN)
-        netlink.send(header + cn_msg + payload)
-        return netlink
-    except Exception as exc:
-        log.warning(f"[PROCESS_MONITOR] Netlink proc connector の初期化に失敗しました ({exc})")
-        return None
-
-
-def _parse_proc_event(data: bytes) -> tuple[str, int] | None:
-    if len(data) < 36:
-        return None
-    try:
-        what, _, _ = struct.unpack("IIQ", data[0:16])
-        if what == 0x00000001:  # PROC_EVENT_FORK
-            parent_pid, parent_tgid, child_pid, child_tgid = struct.unpack("IIII", data[16:32])
-            return ("fork", child_pid)
-        if what == 0x00000002:  # PROC_EVENT_EXEC
-            pid, tgid = struct.unpack("II", data[16:24])
-            return ("exec", pid)
-        if what == 0x00000004:  # PROC_EVENT_EXIT
-            pid, tgid, exit_code, exit_signal = struct.unpack("IIII", data[16:32])
-            return ("exit", pid)
-    except Exception:
-        pass
-    return None
+    enabled = threading.Event()
+    monitor = USBHotplugMonitor(
+        enabled=enabled,
+        stop_event=stop_event,
+        image_directory="/var/lib/mk1ai/usb-scan-guest",
+        trusted_public_key="/etc/mk1ai/usb-scan-signing.pub",
+        on_threat=lambda device, verdict: _usb_scan_threat_response(
+            device,
+            verdict,
+            interfaces,
+            os.path.join(os.path.dirname(os.path.abspath(panel_config_path)), "tunnel-control.sock"),
+        ),
+    )
+    monitor_thread = threading.Thread(
+        target=monitor.run, name="mk1-usb-hotplug", daemon=True,
+    )
+    monitor_thread.start()
+    last_enabled = False
+    while not stop_event.is_set():
+        try:
+            config_fd = os.open(
+                panel_config_path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+            try:
+                config_stat = os.fstat(config_fd)
+                if (
+                    not stat.S_ISREG(config_stat.st_mode)
+                    or config_stat.st_mode & 0o022
+                    or config_stat.st_size > 4096
+                ):
+                    raise ValueError("USB policy configuration is not a protected regular file")
+                with os.fdopen(config_fd, "r", encoding="utf-8") as config_file:
+                    config_fd = -1
+                    panel_config = json.load(config_file)
+            finally:
+                if config_fd >= 0:
+                    os.close(config_fd)
+            if not isinstance(panel_config, dict):
+                raise ValueError("USB policy configuration must be a JSON object")
+            requested_value = panel_config.get("usb_guard_enabled", 0)
+            if (
+                not isinstance(requested_value, int)
+                or isinstance(requested_value, bool)
+                or requested_value not in (0, 1)
+            ):
+                raise ValueError("usb_guard_enabled must be 0 or 1")
+            requested = requested_value == 1
+            if requested != last_enabled:
+                last_enabled = requested
+                if requested:
+                    enabled.set()
+                    log.warning("[USB] USBホットプラグ隔離ポリシーを有効化しました。")
+                else:
+                    enabled.clear()
+                    log.info("[USB] USBホットプラグ隔離ポリシーを停止しました。")
+        except FileNotFoundError:
+            if last_enabled:
+                log.critical("[USB] USB設定ファイルが消失しました。現在の隔離ポリシーを維持します。")
+        except (OSError, ValueError, json.JSONDecodeError):
+            log.exception("[USB] パネル設定を読み込めません。現在のUSBポリシーを維持します。")
+        stop_event.wait(0.25)
+    enabled.clear()
+    monitor_thread.join(timeout=5)
+    if monitor_thread.is_alive():
+        log.error("[USB] USB監視スレッドが終了しませんでした。")
 
 
 def _resolve_proc_executable(pid: int) -> str:
@@ -2732,52 +2706,15 @@ def _is_suspicious_process_command(process_identifier: int | str, cmdline: str =
 
 
 def _process_event_monitor_worker() -> None:
-    """Netlink Connector でプロセス fork/exec をリアルタイム監査し、TOCTOU を防ぐ。"""
+    """psutilで定期的にプロセス状態を監査する。"""
     if platform.system().lower() != "linux":
         return
 
-    sock = _open_proc_event_socket()
-    if sock is None:
-        log.warning("[PROCESS_MONITOR] フォールバック: psutil ベースの短周期プロセス監査を開始します。")
-        while True:
-            time.sleep(_PROCESS_EVENT_MONITOR_FALLBACK_INTERVAL)
-            findings = scan_for_backdoors()
-            apply_backdoor_findings(findings)
-        return
-
-    log.info("[PROCESS_MONITOR] Netlink proc connector でリアルタイム監視を開始しました。")
+    log.info("[PROCESS_MONITOR] psutilによる定期プロセス監査を開始しました。")
     while True:
-        try:
-            data = sock.recv(4096)
-            event = _parse_proc_event(data)
-            if not event:
-                continue
-            event_type, pid = event
-            if event_type not in {"exec", "fork"}:
-                continue
-            try:
-                proc = psutil.Process(pid)
-                cmdline = " ".join(proc.cmdline() or [])
-                if _is_suspicious_process_command(pid, cmdline):
-                    exe_path = _resolve_proc_executable(pid)
-                    report = log.debug if is_learning_mode() else log.warning
-                    report(f"[PROCESS_MONITOR] 短命プロセス検知: PID={pid} type={event_type} exe={exe_path} cmdline={cmdline}")
-                    findings = [{
-                        "type": "event_drive_process",
-                        "pid": pid,
-                        "name": proc.name() if hasattr(proc, "name") else "",
-                        "remote": "",
-                        "risk_score": 0.85,
-                        "feature_vector": [],
-                    }]
-                    apply_backdoor_findings(findings)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-            except Exception:
-                continue
-        except Exception as exc:
-            log.warning(f"[PROCESS_MONITOR] イベント監視中に例外が発生しました ({exc})")
-            time.sleep(1.0)
+        time.sleep(_PROCESS_EVENT_MONITOR_FALLBACK_INTERVAL)
+        findings = scan_for_backdoors()
+        apply_backdoor_findings(findings)
 
 
 def _privileged_agent_main(
@@ -2791,10 +2728,12 @@ def _privileged_agent_main(
     stop_event = stop_event or _PRIVILEGED_STOP_EVENT
     try:
         _signal_module.signal(_signal_module.SIGINT, _signal_module.SIG_IGN)
-    except Exception:
-        pass
+    except (OSError, ValueError) as exc:
+        log.error("[PRIVILEGE] Could not ignore SIGINT in capture worker: %s", exc)
     if platform.system().lower() == "linux":
-        _drop_to_user("nobody", preserve_caps={_CAP_NET_RAW})
+        if not _drop_to_user("nobody", preserve_caps={_CAP_NET_RAW}):
+            log.critical("[PRIVILEGE] Capture worker is stopping because privilege drop failed.")
+            return
     swap_dir = tempfile.mkdtemp(prefix="mk1_capture_swap_")
     mem_mgr = None
     capture_thread = None
@@ -2829,7 +2768,8 @@ def _privileged_agent_main(
 
 def _shutdown_privileged_agent():
     """共有イベントとキューで特権ワーカーを協調終了し、親の降格後も安全に回収する。"""
-    global _PRIVILEGED_AGENT_ACTIVE, _PRIVILEGED_COMMAND_PROCESS, _PRIVILEGED_CAPTURE_PROCESS
+    global _PRIVILEGED_AGENT_ACTIVE, _PRIVILEGED_COMMAND_PROCESS
+    global _PRIVILEGED_CAPTURE_PROCESS, _PRIVILEGED_USB_PROCESS
     try:
         _PRIVILEGED_STOP_EVENT.set()
     except (OSError, ValueError):
@@ -2843,6 +2783,7 @@ def _shutdown_privileged_agent():
     process_refs = (
         ("_PRIVILEGED_CAPTURE_PROCESS", _PRIVILEGED_CAPTURE_PROCESS),
         ("_PRIVILEGED_COMMAND_PROCESS", _PRIVILEGED_COMMAND_PROCESS),
+        ("_PRIVILEGED_USB_PROCESS", _PRIVILEGED_USB_PROCESS),
     )
     for process_name, process in process_refs:
         if process is not None:
@@ -2858,11 +2799,15 @@ def _shutdown_privileged_agent():
             if not still_alive:
                 if process_name == "_PRIVILEGED_CAPTURE_PROCESS":
                     _PRIVILEGED_CAPTURE_PROCESS = None
+                elif process_name == "_PRIVILEGED_USB_PROCESS":
+                    _PRIVILEGED_USB_PROCESS = None
                 else:
                     _PRIVILEGED_COMMAND_PROCESS = None
 
     _PRIVILEGED_AGENT_ACTIVE = bool(
-        _PRIVILEGED_CAPTURE_PROCESS is not None or _PRIVILEGED_COMMAND_PROCESS is not None
+        _PRIVILEGED_CAPTURE_PROCESS is not None
+        or _PRIVILEGED_COMMAND_PROCESS is not None
+        or _PRIVILEGED_USB_PROCESS is not None
     )
 
 
@@ -2889,8 +2834,16 @@ def _guard_process_terminate_permission(process) -> None:
         pass
 
 
-def _ensure_privileged_agent(interface: str, max_memory_mb: int, local_dir: str, dry_run: bool):
-    global _PRIVILEGED_AGENT_ACTIVE, _PRIVILEGED_COMMAND_PROCESS, _PRIVILEGED_CAPTURE_PROCESS
+def _ensure_privileged_agent(
+    interface: str,
+    max_memory_mb: int,
+    local_dir: str,
+    dry_run: bool,
+    *,
+    panel_config_path: str | None = None,
+):
+    global _PRIVILEGED_AGENT_ACTIVE, _PRIVILEGED_COMMAND_PROCESS
+    global _PRIVILEGED_CAPTURE_PROCESS, _PRIVILEGED_USB_PROCESS
     if os.name != "posix" or platform.system().lower() != "linux":
         log.warning("[PRIVILEGE] 特権エージェントは Linux 環境でのみ有効です。")
         return None
@@ -2917,6 +2870,21 @@ def _ensure_privileged_agent(interface: str, max_memory_mb: int, local_dir: str,
         _guard_process_terminate_permission(_PRIVILEGED_COMMAND_PROCESS)
         _PRIVILEGED_CAPTURE_PROCESS.start()
         _guard_process_terminate_permission(_PRIVILEGED_CAPTURE_PROCESS)
+        if (
+            not dry_run
+            and _PANEL_FULL_ISOLATION
+            and panel_config_path
+        ):
+            _PRIVILEGED_USB_PROCESS = multiprocessing.Process(
+                target=_usb_guard_process_main,
+                args=(
+                    _PRIVILEGED_STOP_EVENT,
+                    panel_config_path,
+                    discover_available_interfaces(),
+                ),
+            )
+            _PRIVILEGED_USB_PROCESS.start()
+            _guard_process_terminate_permission(_PRIVILEGED_USB_PROCESS)
     except OSError as exc:
         for process in (_PRIVILEGED_CAPTURE_PROCESS, _PRIVILEGED_COMMAND_PROCESS):
             if process is not None and getattr(process, "pid", None) is not None:
@@ -2927,6 +2895,7 @@ def _ensure_privileged_agent(interface: str, max_memory_mb: int, local_dir: str,
                     pass
         _PRIVILEGED_COMMAND_PROCESS = None
         _PRIVILEGED_CAPTURE_PROCESS = None
+        _PRIVILEGED_USB_PROCESS = None
         log.warning(f"[PRIVILEGE] 特権エージェントの起動に失敗しました。メモリ不足の可能性があります ({exc})")
         return None
     _PRIVILEGED_AGENT_ACTIVE = True
@@ -3189,7 +3158,7 @@ def boot_time_auto_hardening(profile: dict) -> dict:
     return report
 
 
-def _build_absolute_containment_payload(profile: dict, learning_data=None) -> dict:
+def _build_network_containment_plan(profile: dict, learning_data=None) -> dict:
     env_signal, ranked = _ai_command_policy_vector(profile, learning_data)
     tools = profile.get("tools", {})
     interfaces = [iface for iface in profile.get("available_interfaces", []) if iface != "lo"]
@@ -3222,13 +3191,13 @@ def _build_absolute_containment_payload(profile: dict, learning_data=None) -> di
         commands.append(["ifconfig", adapter, "down"])
 
     payload = {
-        "strategy": "absolute_containment",
-        "reason": "ローカルブート時に構築された絶対遮断コンテナペイロード",
+        "strategy": "best_effort_network_isolation",
+        "reason": "利用可能なOSネットワーク制御コマンドの実行計画",
         "commands": commands,
         "profile": profile,
         "policy_vector": env_signal,
     }
-    log.info("[CONTAINMENT_PAYLOAD] 絶対遮断ペイロードを構築しました。")
+    log.info("[CONTAINMENT_PLAN] OSネットワーク隔離コマンドの実行計画を構築しました。")
     return payload
 
 
@@ -3527,7 +3496,7 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
     fallback_payloads = payload.get("fallback_payloads", [])
     profile = payload.get("profile", {})
 
-    log.critical("[DYNAMIC_EXECUTION] 環境特化型遮断ロジックを JIT 的に実行します。")
+    log.info("[DYNAMIC_EXECUTION] 遮断処理を実行します。")
     if dry_run:
         for cmd in commands:
             log.critical(f"    - 予定: {' '.join(cmd)}")
@@ -3535,7 +3504,7 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
 
     success_count = 0
     for cmd in commands:
-        log.critical(f"    - 実行: {' '.join(cmd)}")
+        log.info(f"    - 実行: {' '.join(cmd)}")
         if _run_command_with_sudo(cmd, dry_run=False):
             success_count += 1
             log.critical("    → 遮断コマンド成功")
@@ -3547,7 +3516,7 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
 
     if not success_count:
         if _attempt_pure_python_network_barrier(interface, available_interfaces):
-            log.warning("[FALLBACK_BARRIER] Python ベースのフェールクローズ遮断を適用しました。")
+            log.warning("[FALLBACK_BARRIER] iproute2/netlinkによる遮断を適用しました。")
             return True
 
     connectivity_state = _probe_network_connectivity()
@@ -3558,7 +3527,7 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
 
     if success_count == 0 or connectivity_state is True:
         if _attempt_pure_python_network_barrier(interface, available_interfaces):
-            log.warning("[FALLBACK_BARRIER] Python ベースのフェールクローズ遮断を適用しました。")
+            log.warning("[FALLBACK_BARRIER] iproute2/netlinkによる遮断を適用しました。")
             return True
 
     if success_count == 0 or (connectivity_state is True and success_count == 0):
@@ -4067,8 +4036,7 @@ class LightweightMultiTaskAI(nn.Module):
             nn.Linear(32, 16),        nn.ReLU(),
         )
 
-        # Head A (絶対防衛役): 2層構成で異常度スコアを精密に出力 (0.0=正常 / 1.0=攻撃)
-        # C2ビーコンの微小ジッターパターンも見逃さない高精度スコアリング。
+        # Head A: heuristic/learned traffic anomaly score (0.0=low, 1.0=high).
         self.head_a = nn.Sequential(
             nn.Linear(16, 8), nn.ReLU(),
             nn.Linear(8, 1),  nn.Sigmoid(),
@@ -4316,6 +4284,13 @@ def download_from_gdrive_folder(folder_id: str, dest_dir: str) -> list:
     if not folder_id:
         log.info("[Google Drive] フォルダID未指定のため取得をスキップします。")
         return []
+    if mk1_secure_transport is None:
+        raise RuntimeError("Secure transport dependencies are required for Google Drive access")
+    try:
+        mk1_secure_transport.require_wireguard_full_tunnel()
+    except mk1_secure_transport.SecureTransportError as exc:
+        log.error("[Google Drive] WireGuard full-tunnelを確認できず、取得を拒否しました (%s)", exc)
+        raise
     if not GDOWN_AVAILABLE or requests is None:
         log.warning("[Google Drive] gdown または requests がないため取得をスキップします。")
         return []
@@ -4755,6 +4730,7 @@ _command_queue = multiprocessing.Queue()            # 特権エージェント�
 _PRIVILEGED_AGENT_ACTIVE = False
 _PRIVILEGED_COMMAND_PROCESS = None
 _PRIVILEGED_CAPTURE_PROCESS = None
+_PRIVILEGED_USB_PROCESS = None
 _PRIVILEGED_STOP_EVENT = multiprocessing.Event()
 atexit.register(_close_packet_inspection_log)
 atexit.register(_shutdown_privileged_agent)
@@ -4764,10 +4740,8 @@ _last_pkt_time = time.time()
 
 def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool, stop_event=None):
     """
-    生ソケット(SOCK_RAW)で直接カーネルからパケットを受け取り、
-    structで即座に解析 → 10次元特徴量に変換します。
-    scapyのような重いライブラリを一切使わないので非常に高速！
-    推論は 1 ms 以下を目指しています。
+    AF_PACKET raw socketで受信し、structで解析して10次元特徴量を作る。
+    ユーザー空間処理であり、スループットや推論遅延の上限は保証しない。
     """
     global _last_pkt_time, _ema_delta, _last_dpi_result
     if platform.system().lower() != "linux":
@@ -4806,7 +4780,6 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
     try:
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
         s.bind((interface, 0))
-        _attach_kernel_bpf_filter(s)
         s.settimeout(1.0)
         log.info(f"[キャプチャ] {interface} でリアルタイム監視開始 (root権限確認済)")
     except PermissionError:
@@ -4819,7 +4792,6 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
     while stop_event is None or not stop_event.is_set():
         try:
             pkt, _ = s.recvfrom(65535)
-            _refresh_kernel_bpf_filter(s)
             now = time.time()
             pkt_len   = len(pkt)
             delta     = now - _last_pkt_time
@@ -4875,7 +4847,6 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
 
             dpi_result = analyze_dpi_payload(pkt)
             _last_dpi_result = dpi_result
-            _learn_safe_kernel_flow(parse_packet_transport(pkt), dpi_result)
             handle_packet_event(pkt, interface, dry_run or is_maintenance_mode(), dpi_result=dpi_result)
         except socket.timeout:
             continue
@@ -4893,18 +4864,15 @@ _TRAIN_QUEUE_MAX_BATCHES = 10
 _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
-def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
+def _enqueue_training_batch(batch: list) -> bool:
     if not batch:
         return True
-    warned = False
-    while True:
-        try:
-            _train_queue.put(batch, timeout=wait_timeout)
-            return True
-        except queue.Full:
-            if not warned:
-                log.warning("[学習キュー] 未処理バッチが上限に達しました。空きができるまで入力を抑制します。")
-                warned = True
+    try:
+        _train_queue.put_nowait(batch)
+    except queue.Full:
+        log.warning("[学習キュー] 上限に達したため今回の学習バッチを破棄しました。監視処理は継続します。")
+        return False
+    return True
 
 
 def _buffer_monitor_candidate(buffer: list, features: list, head_b_score: float) -> None:
@@ -4999,7 +4967,7 @@ def _run_command_with_sudo(cmd: list, dry_run: bool = False) -> bool:
 
 
 def _attempt_pure_python_network_barrier(interface: str | None = None, available_interfaces=None) -> bool:
-    """OSコマンドが利用できない場合でも、可能な限り純粋Pythonでフェールクローズ遮断を試みる。"""
+    """信頼済みiproute2/netlink経由でインターフェース停止を試みる。"""
     interfaces = []
     if available_interfaces:
         interfaces = list(available_interfaces)
@@ -5012,44 +4980,9 @@ def _attempt_pure_python_network_barrier(interface: str | None = None, available
     if platform.system().lower() != "linux":
         return False
 
-    try:
-        import fcntl
-    except ImportError:
+    if platform.system().lower() != "linux":
         return False
-
-    success = False
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            for iface in interfaces:
-                try:
-                    ifreq = struct.pack("16sH14s", iface.encode("utf-8"), 0, b"")
-                    current_flags = struct.unpack("16sH14s", fcntl.ioctl(sock.fileno(), 0x8913, ifreq))[1]
-                    if current_flags & 0x1:
-                        new_flags = current_flags & ~0x1
-                        ifreq = struct.pack("16sH14s", iface.encode("utf-8"), new_flags, b"")
-                        fcntl.ioctl(sock.fileno(), 0x8914, ifreq)
-                        success = True
-                except Exception as exc:
-                    log.warning(f"[BARRIER] インターフェース {iface} の障壁操作に失敗しました: {exc}")
-                    continue
-        finally:
-            sock.close()
-    except Exception as exc:
-        log.warning(f"[BARRIER] ネットワーク障壁の初期化に失敗しました: {exc}")
-        success = False
-
-    for iface in interfaces:
-        sysfs_path = f"/sys/class/net/{iface}/operstate"
-        if os.path.exists(sysfs_path):
-            try:
-                with open(sysfs_path, "w") as handle:
-                    handle.write("down")
-                success = True
-            except Exception:
-                pass
-
-    return success
+    return disable_network_interfaces(interfaces)
 
 
 def _load_admin_recovery_token() -> str:
@@ -5162,7 +5095,9 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
         if should_trigger:
             if effective_dry_run:
                 log.warning("[MAINTENANCE] メンテナンス状態のため、遮断処理は Dry-Run として扱います。")
-            log.critical(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
+            elif mk1_secure_transport is not None:
+                mk1_secure_transport.set_transport_enabled(False)
+            log.info(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
             _KILL_SWITCH_EVENT.set()
             if not _dispatch_privileged_command("kill_switch", interface=interface, dry_run=effective_dry_run):
                 execute_kill_switch(interface, effective_dry_run)
@@ -5478,32 +5413,61 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
         stage = pipeline.get("stage")
         score = min(0.99, pipeline.get("score", 0.0))
         backdoor_detected = stage in {"math", "ai", "blacklist"} or (stage == "dpi" and (score >= 0.72 or dpi_result.get("fast_track", False)))
-        return evaluate_threat_state(
+        blocked = evaluate_threat_state(
             interface,
             effective_dry_run,
             score_a=score,
             backdoor_detected=backdoor_detected,
             backdoor_boost=max(0.05, score * 0.15) if backdoor_detected else 0.0,
         )
+        _publish_threat_map_event(packet_bytes, str(stage or "threat"), score)
+        return blocked
 
     if _BACKDOOR_RISK_SCORE > 0.0:
-        return evaluate_threat_state(
+        blocked = evaluate_threat_state(
             interface,
             effective_dry_run,
             score_a=min(0.99, 0.5 + _BACKDOOR_RISK_SCORE),
             backdoor_detected=True,
             backdoor_boost=_BACKDOOR_RISK_SCORE,
         )
+        _publish_threat_map_event(packet_bytes, "backdoor_risk", min(0.99, 0.5 + _BACKDOOR_RISK_SCORE))
+        return blocked
     return False
+
+
+def _publish_threat_map_event(packet_bytes: bytes, reason: str, threat_score: float) -> None:
+    service = _MAP_VISUALIZATION_SERVICE
+    if service is None or service.mode == MapMode.OFF:
+        return
+    transport = parse_packet_transport(packet_bytes)
+    source_ip = transport.get("src_ip") if transport else None
+    if not isinstance(source_ip, str):
+        return
+    event = build_threat_map_event(
+        source_ip,
+        reason=reason,
+        threat_score=threat_score,
+    )
+    if event is not None:
+        service.publish(event)
 
 
 def execute_kill_switch(interface: str | None, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
     """
-    異常検知時にOSコマンドでネットワークを物理的に切断します。
+    異常検知時にOSのファイアウォール/ネットワーク機能による隔離を試みます。
     失敗しても次のコマンドを続ける fail-safe 方式です。
     """
     if available_interfaces is None:
         available_interfaces = discover_available_interfaces()
+
+    if _PANEL_FULL_ISOLATION and not dry_run:
+        if _disable_all_network_interfaces(available_interfaces):
+            log.critical("[AIRGAP] 全ネットワークインターフェースの停止を確認しました。")
+            _close_panel_after_airgap()
+        else:
+            log.error("[AIRGAP] 全インターフェースの停止を確認できませんでした。隔離完了とは扱いません。")
+        return
 
     containment_plan = build_containment_plan(
         interface,
@@ -5514,7 +5478,7 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
     profile = profile_environment()
     payload = generate_optimal_kill_payload(profile, learning_data=["bridge", "vpn", "unreachable", "iptables", "dbus"])
 
-    log.critical("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] 隔離プロトコルを起動します。")
+    log.info("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] 隔離処理を実行します。")
     log.info(f"[CONTAINMENT_PLAN] {json.dumps(containment_plan, sort_keys=True)}")
     if dry_run:
         log.critical("    → Dry-Runモードのため実際の遮断はスキップ (安全モード)")
@@ -5531,6 +5495,61 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
                 log.warning(f"\033[1;33m  - sudo ip link set {iface} up\033[0m")
     else:
         log.error("    → すべての遮断コマンドが失敗しました。sudo 権限またはコマンドの有無を確認してください。")
+
+
+def _disable_all_network_interfaces(available_interfaces: list[str] | None = None) -> bool:
+    interfaces = [
+        name for name in (available_interfaces or discover_available_interfaces())
+        if isinstance(name, str) and name and name != "lo"
+    ]
+    if not interfaces:
+        log.error("[AIRGAP] 遮断対象のネットワークインターフェースを確認できません。")
+        return False
+
+    system = platform.system().lower()
+    if system == "linux":
+        commands = [["ip", "link", "set", "dev", name, "down"] for name in interfaces]
+    elif system == "darwin":
+        commands = [["ifconfig", name, "down"] for name in interfaces]
+    elif system == "windows":
+        commands = [
+            ["netsh", "interface", "set", "interface", f'name="{name}"', "admin=disabled"]
+            for name in interfaces
+        ]
+    else:
+        log.error(f"[AIRGAP] 未対応OSでは全NIC遮断を実行できません: {system}")
+        return False
+
+    results = []
+    for interface_name, command in zip(interfaces, commands):
+        if _run_command_with_sudo(command, dry_run=False):
+            results.append(True)
+            log.critical(f"[AIRGAP] ネットワークインターフェースを停止しました: {interface_name}")
+        else:
+            results.append(False)
+            log.error(f"[AIRGAP] NIC停止に失敗しました: {' '.join(command)}")
+    return all(results)
+
+
+def _close_panel_after_airgap() -> None:
+    if _PANEL_PARENT_PID <= 0:
+        return
+    try:
+        ancestors = psutil.Process(os.getpid()).parents()
+    except (
+        AttributeError, OSError,
+        psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess,
+    ) as exc:
+        log.error(f"[PANEL] 隔離後に親画面を確認できません ({exc})")
+        return
+    if not any(process.pid == _PANEL_PARENT_PID for process in ancestors):
+        log.error("[PANEL] 隔離後の画面終了を拒否しました。指定PIDが親プロセスではありません。")
+        return
+    try:
+        os.kill(_PANEL_PARENT_PID, _signal_module.SIGTERM)
+        log.critical("[PANEL] 隔離後の遠隔操作画面を終了しました。復旧は端末の前で行ってください。")
+    except OSError as exc:
+        log.error(f"[PANEL] 隔離後に親画面を終了できません ({exc})")
 
 
 # =====================================================================
@@ -5603,29 +5622,40 @@ def _run_lightweight_training_validation(
         torch.set_num_threads(1)
 
     raw_dir = os.path.join(local_dir, "gdrive_raw")
-    if fetch_drive:
-        download_from_gdrive_folder(drive_id, raw_dir)
-    else:
-        log.info("[検証] RSIモードのため追加のDrive取得を行わず、ローカルデータを使います。")
-    data_files = []
-    if os.path.isdir(raw_dir):
-        for root, dirs, files in os.walk(raw_dir):
-            dirs[:] = [name for name in dirs if not name.startswith(".")]
-            data_files.extend(
-                os.path.join(root, name)
-                for name in files
-                if name.lower().endswith((".json", ".jsonl", ".csv"))
-            )
-
-    if not data_files:
-        curated_path = os.path.join(local_dir, "curated", "curated_data.jsonl")
-        if os.path.isfile(curated_path):
-            data_files = [curated_path]
-            log.info("[検証] 生データがないため既存の curated_data.jsonl を使用します。")
     reviewed_feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
+    curated_path = os.path.join(local_dir, "curated", "curated_data.jsonl")
+
+    def find_raw_data_files() -> list[str]:
+        found = []
+        if os.path.isdir(raw_dir):
+            for root, dirs, files in os.walk(raw_dir):
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                found.extend(
+                    os.path.join(root, name)
+                    for name in files
+                    if name.lower().endswith((".json", ".jsonl", ".csv"))
+                )
+        return found
+
+    data_files = find_raw_data_files()
+    if not data_files and os.path.isfile(curated_path):
+        data_files = [curated_path]
+        log.info("[検証] 生データがないため既存の curated_data.jsonl を使用します。")
+
     training_sources = [(data_files, False)] if data_files else []
     if os.path.isfile(reviewed_feedback_path):
         training_sources.append(([reviewed_feedback_path], True))
+
+    if not training_sources and fetch_drive:
+        download_from_gdrive_folder(drive_id, raw_dir)
+        data_files = find_raw_data_files()
+        if data_files:
+            training_sources.append((data_files, False))
+    elif training_sources and fetch_drive:
+        log.info("[検証] ローカルデータを使用するためGoogle Drive取得をスキップします。")
+    elif not fetch_drive:
+        log.info("[検証] Google Drive取得を行わず、ローカルデータを使用します。")
+
     if not training_sources:
         log.error("[検証] 読み込み可能なJSON/JSONL/CSVデータがありません。")
         return 2
@@ -5816,26 +5846,27 @@ def _cloud_checkpoint_has_reviewed_labels(model_path: str) -> bool:
 
 
 def sync_cloud_model(model_url: str, hash_url: str, model_path: str, token: str = "") -> dict:
-    """HTTPSモデルとSHA-256を検証し、正常なstate_dictのみ原子的に配置する。"""
+    """Fetch pinned ML-KEM/AES-GCM encrypted artifacts and atomically install a valid state_dict."""
     global _MODEL_SYNC_STATUS, _PENDING_CLOUD_STATE, _PENDING_CLOUD_REVIEWED
-    if requests is None:
+    expected_fingerprint = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip().lower()
+    if requests is None or mk1_secure_transport is None:
         _MODEL_SYNC_STATUS = "Unavailable"
-        return {"updated": False, "state_dict": None, "reason": "requests unavailable"}
+        return {"updated": False, "state_dict": None, "reason": "secure transport unavailable"}
+    if not mk1_secure_transport.validate_public_key_pin(expected_fingerprint):
+        _MODEL_SYNC_STATUS = "Rejected"
+        return {"updated": False, "state_dict": None, "reason": "PQC public-key pin required"}
     if any(urlparse(url).scheme != "https" for url in (model_url, hash_url)):
         _MODEL_SYNC_STATUS = "Rejected"
         return {"updated": False, "state_dict": None, "reason": "HTTPS required"}
 
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
     os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
     temporary_path = None
     _MODEL_SYNC_STATUS = "Downloading"
     try:
-        hash_response = requests.get(hash_url, headers=headers, timeout=(30, 120))
-        try:
-            hash_response.raise_for_status()
-            expected_hash = (hash_response.text or "").strip().split()[0].lower()
-        finally:
-            hash_response.close()
+        hash_content = mk1_secure_transport.encrypted_request(
+            requests, hash_url, {"action": "model_hash"}, token, expected_fingerprint,
+        )
+        expected_hash = hash_content.decode("ascii").strip().split()[0].lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("model SHA-256 response is invalid")
 
@@ -5844,31 +5875,22 @@ def sync_cloud_model(model_url: str, hash_url: str, model_path: str, token: str 
             _MODEL_SYNC_STATUS = "Current"
             return {"updated": False, "state_dict": None, "reason": "already current"}
 
-        model_response = requests.get(model_url, headers=headers, timeout=(30, 300), stream=True)
-        try:
-            model_response.raise_for_status()
-            content_length = model_response.headers.get("Content-Length")
-            if content_length and int(content_length) > _MAX_CLOUD_MODEL_BYTES:
-                raise ValueError("model artifact exceeds the configured size limit")
-            with tempfile.NamedTemporaryFile(
-                prefix=".cloud-model-", suffix=".tmp",
-                dir=os.path.dirname(os.path.abspath(model_path)), delete=False,
-            ) as temporary_file:
-                temporary_path = temporary_file.name
-                digest = hashlib.sha256()
-                total_bytes = 0
-                for chunk in model_response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    total_bytes += len(chunk)
-                    if total_bytes > _MAX_CLOUD_MODEL_BYTES:
-                        raise ValueError("model artifact exceeds the configured size limit")
-                    digest.update(chunk)
-                    temporary_file.write(chunk)
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-        finally:
-            model_response.close()
+        model_bytes = mk1_secure_transport.encrypted_request(
+            requests, model_url, {"action": "model"}, token, expected_fingerprint,
+            max_response_bytes=_MAX_CLOUD_MODEL_BYTES + 28,
+        )
+        if len(model_bytes) > _MAX_CLOUD_MODEL_BYTES:
+            raise ValueError("model artifact exceeds the configured size limit")
+        with tempfile.NamedTemporaryFile(
+            prefix=".cloud-model-", suffix=".tmp",
+            dir=os.path.dirname(os.path.abspath(model_path)), delete=False,
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+            digest = hashlib.sha256()
+            digest.update(model_bytes)
+            temporary_file.write(model_bytes)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
 
         if digest.hexdigest() != expected_hash:
             raise ValueError("downloaded model SHA-256 does not match")
@@ -5969,6 +5991,19 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
         log.info("[RSI_CLOUD] Google Colab への RSI 自己学習指示の送信を完了しました (送信不可・ローカル継続)")
         completion.set()
         return None, completion, result
+    expected_fingerprint = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip()
+    if mk1_secure_transport is None or not mk1_secure_transport.validate_public_key_pin(expected_fingerprint):
+        _RSI_CONNECTION_STATUS = "Rejected"
+        result["rejected"] = True
+        completion.set()
+        log.error("[RSI_CLOUD] PQC公開鍵pinが未設定または不正のため、送信を拒否しました。")
+        return None, completion, result
+    if not (token or os.environ.get("COLAB_RSI_TOKEN", "")):
+        _RSI_CONNECTION_STATUS = "Rejected"
+        result["rejected"] = True
+        completion.set()
+        log.error("[RSI_CLOUD] 認証tokenが未設定のため、送信を拒否しました。")
+        return None, completion, result
 
     payload = _build_rsi_payload(model, local_dir, records=records)
     label_set = {record["label"] for record in payload["curated_data"]["records"]}
@@ -5982,12 +6017,14 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
 
     def send_request():
         global _RSI_CONNECTION_STATUS
-        response = None
         try:
             auth_token = token or os.environ.get("COLAB_RSI_TOKEN", "")
-            headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-            response = requests.post(endpoint, json=payload, headers=headers, timeout=(60, 300))
-            response.raise_for_status()
+            encrypted_response = mk1_secure_transport.encrypted_request(
+                requests, endpoint, payload, auth_token, expected_fingerprint,
+            )
+            reply = json.loads(encrypted_response.decode("utf-8"))
+            if reply.get("accepted") is not True:
+                raise ValueError("Colab did not acknowledge the encrypted RSI request")
             result["sent"] = True
             _RSI_CONNECTION_STATUS = "Connected"
             log.info("[RSI_CLOUD] Colab endpointが学習指示を受理しました。")
@@ -5995,8 +6032,6 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
             _RSI_CONNECTION_STATUS = "Failed"
             log.error(f"[RSI_CLOUD] Colabへの送信に失敗しました。ローカル軽量処理を継続します ({exc})")
         finally:
-            if response is not None:
-                response.close()
             payload.clear()
             completion.set()
             if not result.get("timed_out"):
@@ -6034,6 +6069,8 @@ def _load_runtime_config(config_path: str) -> dict:
         "ram_limit": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
         "drive_id": lambda value: isinstance(value, str),
         "colab_endpoint": lambda value: isinstance(value, str),
+        "colab_pq_public_key_sha256": lambda value: isinstance(value, str)
+        and bool(re.fullmatch(r"[0-9a-fA-F]{64}", value.strip())),
         "model_url": lambda value: isinstance(value, str),
         "model_hash_url": lambda value: isinstance(value, str),
         "model_sync_token": lambda value: isinstance(value, str),
@@ -6042,6 +6079,18 @@ def _load_runtime_config(config_path: str) -> dict:
         "compact_log": lambda value: isinstance(value, bool),
         "mode": lambda value: isinstance(value, str) and value in {"normal", "RSI", "rsi"},
         "update_interval": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+        "map_mode": lambda value: (
+            isinstance(value, int) and not isinstance(value, bool) and value in (0, 1, 2)
+        ),
+        "usb_guard_enabled": lambda value: (
+            isinstance(value, int) and not isinstance(value, bool) and value in (0, 1)
+        ),
+        "secure_tunnel_enabled": lambda value: (
+            isinstance(value, int) and not isinstance(value, bool) and value in (0, 1)
+        ),
+        "memory_guard_enabled": lambda value: (
+            isinstance(value, int) and not isinstance(value, bool) and value in (0, 1)
+        ),
     }
     validated = {}
     for key, value in config.items():
@@ -6055,10 +6104,19 @@ def _load_runtime_config(config_path: str) -> dict:
     return validated
 
 
+def _merge_runtime_config(config_path: str, panel_config_path: str | None = None) -> dict:
+    config = _load_runtime_config(config_path)
+    if panel_config_path:
+        config.update(_load_runtime_config(panel_config_path))
+    return config
+
+
 def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_data/config.json"):
     config = config or {}
     parser = argparse.ArgumentParser(description="MK1")
     parser.add_argument("--config", default=config_path, help="JSON設定ファイルのパス")
+    parser.add_argument("--panel-config", help="操作パネル専用のJSON設定ファイル")
+    parser.add_argument("--panel-parent-pid", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--interface", default=config.get("interface", "eth0"), help="監視するNIC (例: eth0)")
     parser.add_argument("--drive-id",
                         default=config.get("drive_id", GDRIVE_FOLDER_ID),
@@ -6068,6 +6126,7 @@ def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_
     parser.add_argument("--max-memory-mb", "--ram-limit", dest="max_memory_mb", default=config.get("ram_limit", 500), type=int,
                         help="メモリ監視基準(MB)。OSレベルの強制上限ではありません")
     parser.add_argument("--validation-only", action="store_true", help="小規模データ変換とHead B学習を検証して終了")
+    parser.add_argument("--no-drive-fetch", action="store_true", help="検証時にGoogle Driveへ接続せず、ローカルデータのみを使用")
     parser.add_argument("--max-samples", default=32, type=int, help="検証モードで処理する最大サンプル数")
     parser.add_argument("--ignore-model-hash", action=argparse.BooleanOptionalAction,
                         default=config.get("ignore_model_hash", False),
@@ -6103,20 +6162,96 @@ def _render_compact_status(mem_mgr: MemoryManager, ram_limit_mb: int, mode: str,
     sys.stdout.flush()
 
 
+def _write_panel_status(
+    local_dir: str,
+    packets_per_second: float,
+    packets_total: int,
+    mode: str,
+    dry_run: bool,
+    state: str = "RUNNING",
+    ram_used_mb: float | None = None,
+    ram_limit_mb: int | None = None,
+    swap_used_mb: float | None = None,
+) -> None:
+    backdoor_score = max(0.0, min(1.0, float(_BACKDOOR_RISK_SCORE)))
+    threat_score = max(0.0, min(1.0, float(_LAST_THREAT_SCORE)))
+    if _KILL_SWITCH_TRIGGERED:
+        alert = "AIRGAP"
+    elif backdoor_score >= 0.35:
+        alert = "BACKDOOR"
+    elif threat_score >= 0.75:
+        alert = "THREAT"
+    else:
+        alert = "NONE"
+    status = (
+        f"state={state}\n"
+        f"packets_per_second={max(0.0, packets_per_second):.2f}\n"
+        f"packets_total={max(0, packets_total)}\n"
+        f"threat_score={threat_score:.3f}\n"
+        f"backdoor_score={backdoor_score:.3f}\n"
+        f"isolation_active={int(bool(_KILL_SWITCH_TRIGGERED))}\n"
+        f"mode={mode}\n"
+        f"dry_run={int(bool(dry_run))}\n"
+        f"secure_tunnel_active={int(bool(mk1_secure_transport and mk1_secure_transport.transport_is_enabled()))}\n"
+        f"memory_guard_active={int(mk1_memory_guard.is_enabled())}\n"
+        f"alert={alert}\n"
+        f"interface={_MONITOR_INTERFACE}\n"
+        f"model_sync_status={_MODEL_SYNC_STATUS}\n"
+        f"rsi_connection_status={_RSI_CONNECTION_STATUS}\n"
+        f"training_queue_batches={_train_queue.qsize()}\n"
+        f"learning_mode={int(bool(is_learning_mode()))}\n"
+        f"ram_used_mb={max(0.0, ram_used_mb or 0.0):.1f}\n"
+        f"ram_limit_mb={max(0, ram_limit_mb or 0)}\n"
+        f"swap_used_mb={max(0.0, swap_used_mb or 0.0):.1f}\n"
+    )
+    status_path = os.path.join(local_dir, "panel-status.txt")
+    temporary_path = None
+    file_descriptor = None
+    try:
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".panel-status.", suffix=".tmp", dir=local_dir,
+        )
+        temporary_path = temporary_name
+        os.fchmod(file_descriptor, 0o600)
+        handle = os.fdopen(file_descriptor, "w", encoding="ascii")
+        file_descriptor = None
+        with handle:
+            handle.write(status)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, status_path)
+    except OSError as exc:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+        log.error(f"[PANEL] 状態ファイルを書き込めません ({status_path}: {exc})")
+
+
 # =====================================================================
 # メインループ (すべてを統合する中枢)
 # =====================================================================
 def main():
-    global _RSI_MODE_ACTIVE, _LAST_THREAT_SCORE
+    global _RSI_MODE_ACTIVE, _LAST_THREAT_SCORE, _PANEL_PARENT_PID, _PANEL_FULL_ISOLATION
+    global _MAP_VISUALIZATION_SERVICE
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default="./ai_data/config.json")
+    pre_parser.add_argument("--panel-config")
     pre_args, _ = pre_parser.parse_known_args()
-    runtime_config = _load_runtime_config(pre_args.config)
+    runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
 
+    if args.panel_parent_pid < 0:
+        parser.error("--panel-parent-pid は0以上で指定してください")
+    _PANEL_PARENT_PID = args.panel_parent_pid
     if "colab_endpoint" in runtime_config:
         os.environ["COLAB_RSI_ENDPOINT"] = runtime_config["colab_endpoint"]
+    if "colab_pq_public_key_sha256" in runtime_config:
+        os.environ["COLAB_RSI_PQ_PUBLIC_KEY_SHA256"] = runtime_config["colab_pq_public_key_sha256"]
     if args.install_deps:
         ensure_dependencies()
     configure_compact_logging(args.compact_log)
@@ -6126,9 +6261,21 @@ def main():
     if args.max_samples < 1:
         parser.error("--max-samples は1以上で指定してください")
     rsi_requested = args.rsi or args.mode.upper() == "RSI"
+    configured_endpoint = os.environ.get("COLAB_RSI_ENDPOINT", "").strip()
+    if rsi_requested and configured_endpoint:
+        public_key_pin = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip()
+        if mk1_secure_transport is None or not mk1_secure_transport.validate_public_key_pin(public_key_pin):
+            parser.error("RSI通信にはCOLAB_RSI_PQ_PUBLIC_KEY_SHA256の64桁SHA-256 pinが必要です")
+        if not (runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")):
+            parser.error("RSI通信にはCOLAB_RSI_TOKENまたは設定ファイルのmodel_sync_tokenが必要です")
+        try:
+            mk1_secure_transport.require_wireguard_full_tunnel()
+        except mk1_secure_transport.SecureTransportError as exc:
+            parser.error(f"RSI通信を開始できません。WireGuard full-tunnelが必要です: {exc}")
     rsi_token = runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")
     _RSI_MODE_ACTIVE = rsi_requested
     dry_run = not args.no_dry_run or rsi_requested
+    _PANEL_FULL_ISOLATION = bool(args.panel_parent_pid > 0 and not dry_run)
     if args.validation_only:
         os.makedirs(args.local_dir, exist_ok=True)
         rsi_model = None
@@ -6142,7 +6289,7 @@ def main():
             args.drive_id,
             args.max_samples,
             model=rsi_model,
-            fetch_drive=not rsi_requested,
+            fetch_drive=not rsi_requested and not args.no_drive_fetch,
         )
         del rsi_model
         gc.collect()
@@ -6167,6 +6314,24 @@ def main():
 
     # ── 初期化 ──
     os.makedirs(args.local_dir, exist_ok=True)
+    map_service = MapVisualizationService(args.local_dir)
+    _MAP_VISUALIZATION_SERVICE = map_service
+    map_mode = runtime_config.get("map_mode", MapMode.OFF)
+    tunnel_enabled = runtime_config.get("secure_tunnel_enabled", 1) == 1
+    if mk1_secure_transport is not None:
+        if not tunnel_enabled:
+            mk1_secure_transport.set_transport_enabled(False)
+        else:
+            try:
+                mk1_secure_transport.set_transport_enabled(True)
+            except mk1_secure_transport.SecureTransportError as exc:
+                mk1_secure_transport.set_transport_enabled(False)
+                log.error("[TUNNEL] WireGuard検証に失敗し、暗号化送信を停止しました (%s)", exc)
+    try:
+        map_service.set_mode(map_mode)
+    except OSError as exc:
+        log.error(f"[MAP] 初期化に失敗しました。地図表示はOFFです ({exc})")
+    last_requested_map_mode = map_mode
     model = LightweightMultiTaskAI(input_dim=10)
 
     # ★ クラウド学習済みモデルの読み込み（防衛力MAX起動）
@@ -6200,8 +6365,49 @@ def main():
 
     _prepare_packet_inspection_log()
     if hasattr(os, "geteuid") and os.geteuid() == 0:
-        _ensure_privileged_agent(monitor_interface, args.max_memory_mb, args.local_dir, dry_run)
-    _drop_privileges_if_possible()
+        _ensure_privileged_agent(
+            monitor_interface,
+            args.max_memory_mb,
+            args.local_dir,
+            dry_run,
+            panel_config_path=args.panel_config,
+        )
+    if hasattr(os, "geteuid") and os.geteuid() == 0 and not _drop_privileges_if_possible():
+        log.critical("[PRIVILEGE] 権限降格に失敗したため、rootのまま起動を継続しません。")
+        try:
+            map_service.close()
+        except RuntimeError as close_error:
+            log.error("[MAP] 権限降格失敗時にワーカーを停止できません (%s)", close_error)
+        _MAP_VISUALIZATION_SERVICE = None
+        _shutdown_privileged_agent()
+        _close_packet_inspection_log()
+        return 1
+    memory_guard_enabled = runtime_config.get("memory_guard_enabled", 0) == 1
+    try:
+        if mk1_secure_transport is not None:
+            mk1_secure_transport.set_memory_guard_enabled(memory_guard_enabled)
+        else:
+            mk1_memory_guard.set_enabled(memory_guard_enabled)
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.critical("[MEMORY_GUARD] メモリ保護を適用できません。Fail-Closedで起動を中止します (%s)", exc)
+        try:
+            map_service.close()
+        except RuntimeError as close_error:
+            log.error("[MAP] 起動中止時にワーカーを停止できません (%s)", close_error)
+        _MAP_VISUALIZATION_SERVICE = None
+        _shutdown_privileged_agent()
+        _close_packet_inspection_log()
+        raise SystemExit(1) from exc
+    tunnel_control_server = None
+    if args.panel_config and mk1_secure_transport is not None:
+        try:
+            tunnel_control_server = mk1_secure_transport.TunnelControlServer(
+                os.path.join(args.local_dir, "tunnel-control.sock"),
+            )
+            tunnel_control_server.start()
+        except (OSError, mk1_secure_transport.SecureTransportError) as exc:
+            tunnel_control_server = None
+            log.error("[TUNNEL] 同期鍵消去IPCを開始できません。設定監視へフォールバックします (%s)", exc)
     optimizer = optim.SGD(model.parameters(), lr=0.005)  # 低い学習率で既存知識を守る
     mem_mgr   = MemoryManager(max_memory_mb=args.max_memory_mb, swap_dir=args.local_dir)
     whitelist_buf: list = []  # RAM上の一時バッファ
@@ -6250,8 +6456,16 @@ def main():
     update_gdrive_ips()
     log.info("[メインループ] 開始！ Ctrl+C で終了")
 
+    panel_packets_total = 0
     try:
         next_status_update = 0.0
+        next_panel_update = 0.0
+        next_map_config_check = 0.0
+        last_requested_tunnel_enabled = tunnel_enabled
+        last_requested_memory_guard_enabled = memory_guard_enabled
+        panel_rate_sample_time = time.monotonic()
+        panel_rate_sample_total = 0
+        panel_packets_per_second = 0.0
         while True:
             _apply_pending_cloud_model(model, local_checkpoint_path=local_checkpoint_path)
             # ── 司令塔: メモリ監視 ──
@@ -6270,6 +6484,89 @@ def main():
                 )
                 next_status_update = time.monotonic() + 1.0
 
+            now_monotonic = time.monotonic()
+            if args.panel_config and now_monotonic >= next_map_config_check:
+                panel_config = _load_runtime_config(args.panel_config)
+                requested_tunnel = panel_config.get("secure_tunnel_enabled")
+                requested_tunnel_enabled = requested_tunnel == 1
+                if (
+                    requested_tunnel is not None
+                    and requested_tunnel_enabled != last_requested_tunnel_enabled
+                ):
+                    last_requested_tunnel_enabled = requested_tunnel_enabled
+                    try:
+                        if mk1_secure_transport is None:
+                            raise RuntimeError("Secure transport dependencies are unavailable")
+                        mk1_secure_transport.set_transport_enabled(requested_tunnel_enabled)
+                        tunnel_enabled = requested_tunnel_enabled
+                        log.warning(
+                            "[TUNNEL] 暗号化トンネル要求を%sへ変更しました",
+                            "有効" if tunnel_enabled else "無効",
+                        )
+                    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                        if mk1_secure_transport is not None:
+                            mk1_secure_transport.set_transport_enabled(False)
+                        tunnel_enabled = False
+                        log.error("[TUNNEL] 設定変更を適用できず、暗号化送信を停止しました (%s)", exc)
+                requested_memory_guard = panel_config.get("memory_guard_enabled")
+                requested_memory_guard_enabled = requested_memory_guard == 1
+                if (
+                    requested_memory_guard is not None
+                    and requested_memory_guard_enabled != last_requested_memory_guard_enabled
+                ):
+                    last_requested_memory_guard_enabled = requested_memory_guard_enabled
+                    try:
+                        if mk1_secure_transport is not None:
+                            mk1_secure_transport.set_memory_guard_enabled(
+                                requested_memory_guard_enabled,
+                            )
+                        else:
+                            mk1_memory_guard.set_enabled(requested_memory_guard_enabled)
+                        memory_guard_enabled = requested_memory_guard_enabled
+                        log.warning(
+                            "[MEMORY_GUARD] プロセスメモリ保護を%sへ変更しました",
+                            "有効" if memory_guard_enabled else "無効",
+                        )
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        if requested_memory_guard_enabled:
+                            log.critical(
+                                "[MEMORY_GUARD] 保護ONを適用できません。Fail-Closedで監視を停止します (%s)",
+                                exc,
+                            )
+                            raise SystemExit(1) from exc
+                        log.error(
+                            "[MEMORY_GUARD] 設定変更を適用できません。保護状態=%s (%s)",
+                            mk1_memory_guard.is_enabled(),
+                            exc,
+                        )
+                requested_map_mode = panel_config.get("map_mode", MapMode.OFF)
+                if requested_map_mode != last_requested_map_mode:
+                    last_requested_map_mode = requested_map_mode
+                    try:
+                        map_service.set_mode(requested_map_mode)
+                        log.info("[MAP] 表示モードを %s に切り替えました", MapMode(requested_map_mode).name)
+                    except (OSError, RuntimeError) as exc:
+                        log.error(f"[MAP] 表示モードを切り替えられません ({exc})")
+                next_map_config_check = now_monotonic + 0.25
+            if now_monotonic >= next_panel_update:
+                elapsed = max(now_monotonic - panel_rate_sample_time, 0.001)
+                panel_packets_per_second = (
+                    panel_packets_total - panel_rate_sample_total
+                ) / elapsed
+                panel_rate_sample_time = now_monotonic
+                panel_rate_sample_total = panel_packets_total
+                _write_panel_status(
+                    args.local_dir,
+                    panel_packets_per_second,
+                    panel_packets_total,
+                    "RSI" if rsi_requested else "Normal",
+                    dry_run,
+                    ram_used_mb=mem_mgr.process.memory_info().rss / (1024 * 1024),
+                    ram_limit_mb=args.max_memory_mb,
+                    swap_used_mb=getattr(mem_mgr, "_offset", 0) / (1024 * 1024),
+                )
+                next_panel_update = now_monotonic + 1.0
+
             # ── パケット取得 ──
             try:
                 payload = _packet_queue.get(timeout=0.01)
@@ -6278,6 +6575,7 @@ def main():
             if not _validate_packet_queue_item(payload):
                 log.warning("[IPC] 受信したキューアイテムのスキーマ検証に失敗しました。破棄します。")
                 continue
+            panel_packets_total += 1
             if isinstance(payload, PacketQueueItem):
                 feat, pkt = payload.feature_vector, payload.packet_bytes
             else:
@@ -6294,7 +6592,7 @@ def main():
                 time.sleep(5)
                 continue
 
-            # ── AIによる超高速推論 (no_grad = 勾配なし = 最速・最省メモリ) ──
+            # AI inference runs in the Python slow path; it is not a packet fast path.
             x = torch.tensor([feat], dtype=torch.float32)
             with _MODEL_ACCESS_LOCK, torch.no_grad():
                 score_a, score_b, score_c = model(x)
@@ -6333,6 +6631,27 @@ def main():
             sys.stdout.flush()
         log.info("\n[終了] ユーザー割り込み受信。クリーンアップ中...")
     finally:
+        try:
+            map_service.close()
+        except RuntimeError as exc:
+            log.error(f"[MAP] 表示ワーカーの停止に失敗しました ({exc})")
+        if tunnel_control_server is not None:
+            try:
+                tunnel_control_server.close()
+            except RuntimeError as exc:
+                log.error("[TUNNEL] 制御IPCの停止に失敗しました (%s)", exc)
+        _MAP_VISUALIZATION_SERVICE = None
+        _write_panel_status(
+            args.local_dir,
+            0.0,
+            panel_packets_total,
+            "RSI" if rsi_requested else "Normal",
+            dry_run,
+            state="STOPPED",
+            ram_used_mb=mem_mgr.process.memory_info().rss / (1024 * 1024),
+            ram_limit_mb=args.max_memory_mb,
+            swap_used_mb=getattr(mem_mgr, "_offset", 0) / (1024 * 1024),
+        )
         whitelist_buf.clear()
         _train_queue.put(None)  # 学習スレッドを正常終了
         _shutdown_privileged_agent()
