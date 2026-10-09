@@ -1,4 +1,7 @@
-"""Linux USB policy, signed scan-guest verification, and disposable QEMU scans."""
+"""Linux USB policy, signed scan-guest verification, and disposable QEMU scans.
+
+Release packaging contact: 山田 悠 (Yu Yamada).
+"""
 
 from __future__ import annotations
 
@@ -133,42 +136,6 @@ def identify_usb_device(sysfs_root: str | Path, device_id: str) -> USBDevice | N
     )
 
 
-def load_hid_allowlist(path: str | Path) -> set[tuple[str, str, str]]:
-    allowlist_path = Path(path)
-    try:
-        file_stat = allowlist_path.lstat()
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_mode & 0o022:
-            raise ValueError("HID allowlist must be a regular, non-group/world-writable file")
-        document = json.loads(allowlist_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return set()
-    if not isinstance(document, dict) or document.get("version") != 1:
-        raise ValueError("Unsupported USB HID allowlist format")
-    entries = document.get("devices")
-    if not isinstance(entries, list) or len(entries) > 128:
-        raise ValueError("USB HID allowlist entries are invalid")
-
-    allowed: set[tuple[str, str, str]] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError("USB HID allowlist entry is invalid")
-        vendor_id = entry.get("vid")
-        product_id = entry.get("pid")
-        serial = entry.get("serial")
-        if (
-            not isinstance(vendor_id, str)
-            or not HEX_DEVICE_ID.fullmatch(vendor_id)
-            or not isinstance(product_id, str)
-            or not HEX_DEVICE_ID.fullmatch(product_id)
-            or not isinstance(serial, str)
-            or not serial
-            or not SERIAL_PATTERN.fullmatch(serial)
-        ):
-            raise ValueError("USB HID allowlist requires valid VID, PID, and non-empty serial")
-        allowed.add((vendor_id.lower(), product_id.lower(), serial))
-    return allowed
-
-
 def list_hid_devices(sysfs_root: str | Path = "/sys/bus/usb/devices") -> list[USBDevice]:
     devices: list[USBDevice] = []
     for device_path in Path(sysfs_root).iterdir():
@@ -176,47 +143,6 @@ def list_hid_devices(sysfs_root: str | Path = "/sys/bus/usb/devices") -> list[US
         if device is not None and device.is_hid:
             devices.append(device)
     return sorted(devices, key=lambda device: device.device_id)
-
-
-def enroll_hid_device(
-    device: USBDevice,
-    allowlist_path: str | Path,
-    *,
-    confirmed_serial: str,
-) -> None:
-    if not device.is_hid or not device.serial or confirmed_serial != device.serial:
-        raise ValueError("HID enrollment requires a detected HID and exact serial confirmation")
-    target = Path(allowlist_path)
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        entries = [
-            {"vid": vid, "pid": pid, "serial": serial}
-            for vid, pid, serial in sorted(load_hid_allowlist(target))
-        ]
-    except FileNotFoundError:
-        entries = []
-    identity = (device.vendor_id, device.product_id, device.serial)
-    if identity not in {
-        (entry["vid"], entry["pid"], entry["serial"]) for entry in entries
-    }:
-        entries.append({"vid": device.vendor_id, "pid": device.product_id, "serial": device.serial})
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump({"version": 1, "devices": entries}, output, sort_keys=True, indent=2)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, target)
-        os.chmod(target, 0o600)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def verify_scan_guest(
@@ -518,7 +444,6 @@ class USBHotplugMonitor:
         enabled: threading.Event,
         stop_event: threading.Event,
         sysfs_root: str | Path = "/sys/bus/usb/devices",
-        allowlist_path: str | Path = "/etc/mk1ai/usb-hid-allowlist.json",
         image_directory: str | Path = "/var/lib/mk1ai/usb-scan-guest",
         trusted_public_key: str | Path = "/etc/mk1ai/usb-scan-signing.pub",
         qemu_binary: str | None = None,
@@ -527,7 +452,6 @@ class USBHotplugMonitor:
         self.enabled = enabled
         self.stop_event = stop_event
         self.sysfs_root = Path(sysfs_root)
-        self.allowlist_path = Path(allowlist_path)
         self.image_directory = Path(image_directory)
         self.trusted_public_key = Path(trusted_public_key)
         self.qemu_binary = qemu_binary
@@ -677,28 +601,8 @@ class USBHotplugMonitor:
         if device.is_hub:
             return "hub_ignored"
 
-        if device.is_hid and (
-            device.device_class not in {"00", "03"}
-            or device.interface_classes - {"03"}
-        ):
-            return self._unbind(device, "composite or non-HID interface is not permitted")
         if device.is_hid:
-            try:
-                allowlist = load_hid_allowlist(self.allowlist_path)
-                if os.geteuid() == 0 and self.allowlist_path.exists():
-                    if self.allowlist_path.stat().st_uid != 0:
-                        raise ValueError("USB HID allowlist must be owned by root")
-            except (OSError, ValueError, json.JSONDecodeError):
-                LOGGER.exception("USB HID allowlist is invalid; device will be blocked")
-                allowlist = set()
-            identity = (device.vendor_id, device.product_id, device.serial)
-            if device.serial and identity in allowlist:
-                LOGGER.info(
-                    "Allowed enrolled USB HID device %s (%s:%s)",
-                    device.device_id, device.vendor_id, device.product_id,
-                )
-                return "hid_allowed"
-            return self._unbind(device, "unregistered HID device")
+            return self._unbind(device, "USB HID devices are denied by policy")
 
         if device.is_storage:
             try:
@@ -776,18 +680,11 @@ class USBHotplugMonitor:
 def _main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Manage the local Linux USB HID allowlist")
+    parser = argparse.ArgumentParser(description="Inspect devices blocked by the Linux USB policy")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("list-hid", help="List connected HID identities for local enrollment")
-    enroll_parser = subparsers.add_parser("enroll-hid", help="Enroll one connected HID by exact serial")
-    enroll_parser.add_argument("device_id", help="USB sysfs device id shown by list-hid")
-    enroll_parser.add_argument(
-        "--allowlist", default="/etc/mk1ai/usb-hid-allowlist.json",
-    )
+    subparsers.add_parser("list-hid", help="List connected HID devices (all are denied)")
     args = parser.parse_args()
 
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        parser.error("USB HID allowlist management requires a local root shell")
     if args.command == "list-hid":
         for device in list_hid_devices():
             print(
@@ -795,23 +692,6 @@ def _main() -> int:
                 f"serial={device.serial or '<missing>'}"
             )
         return 0
-
-    device = identify_usb_device("/sys/bus/usb/devices", args.device_id)
-    if device is None or not device.is_hid or not device.serial:
-        parser.error("Device is not a valid connected HID with a non-empty serial")
-    if not sys.stdin.isatty():
-        parser.error("HID enrollment requires an interactive local terminal")
-    print(
-        f"Enroll {device.device_id} VID={device.vendor_id} PID={device.product_id} "
-        f"serial={device.serial!r}?"
-    )
-    confirmation = input("Type the exact serial to confirm enrollment: ")
-    try:
-        enroll_hid_device(device, args.allowlist, confirmed_serial=confirmation)
-    except (OSError, ValueError) as exc:
-        parser.error(str(exc))
-    print(f"Enrolled in {args.allowlist}")
-    return 0
 
 
 if __name__ == "__main__":

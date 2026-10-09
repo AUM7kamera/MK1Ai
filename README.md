@@ -98,7 +98,8 @@ bash ./mk1-panel.sh
 - ChromebookはLinux開発環境 (Crostini) の端末で起動します。macOSはTerminalで起動します。WindowsはWSLとLinuxディストリビューションを用意し、コマンドプロンプトから `mk1-gui.cmd` を実行します (Windowsネイティブ版ではありません)。各環境にCコンパイラ、ncurses、OpenSSL開発ファイルおよび `pkg-config` が必要です。
 - ネイティブCのビルドと実行安全性テストは `make check` で実行できます。Linuxのfork子プロセスで `PR_SET_DUMPABLE` によるptrace拒否を試し、OpenSSL初期化/AES-256-GCMと `OPENSSL_cleanse` のゼロ化を検証します。libsodium・libbpf・liboqsは任意依存としてロード/API可用性/初期化を検査し、未導入の場合はSKIPを明示します。liboqsの開発パッケージがある環境ではC側の実ML-KEM-768 keygen/encapsulate/decapsulateとAES-GCM往復も実行します。`make analyze` はClang静的解析を実行します。
 - `[1]` は起動前警告に同意した後にDry-Run監視を起動します。Dry-Runは異常を検知しても通信を切断しないため、実際の遮断を提供しません。
-- `[3]` は監視開始前に全通信遮断の警告を表示し、続行には `y` と管理者認証が必要です。監視中は検知前の警告待ちやユーザー確認を挟まず、検知後すぐ全ネットワークインターフェースの停止を試行します。停止成功後に操作パネルとリモート画面サーバーを終了します。SSHや遠隔アクセスも例外なく切断する方針で、遠隔復旧経路は提供しません。誤検知やOSの権限・ファイアウォール・カーネルの制限により、遮断に失敗する可能性があります。ハードウェア・カーネルを迂回不能にする「絶対保証」ではありません。
+- `[3]` は監視開始前に全通信遮断の警告を表示し、続行には `y` と管理者認証が必要です。監視中は検知前の警告待ちやユーザー確認を挟まず、検知後に全ネットワークインターフェースの停止を試行します。停止成功後に操作パネルとリモート画面サーバーを終了します。SSHや遠隔アクセスも切断される可能性があり、遠隔復旧経路は提供しません。誤検知やOSの権限・ファイアウォール・カーネルの制限により、遮断に失敗する場合があります。
+- TUIはステータス、脅威イベントログ、RAM/swapメーターを分割表示し、レベル別カラー、対応端末でのマウスショートカット、キーボードガイドを提供します。pthread workerはstatus/logファイルを非同期に読み込み、ncurses描画と入力は単一UIスレッドで行います。テレメトリ更新間隔は約500msで、操作時の認証・設定ダイアログやOSコマンド実行が非同期になる保証ではありません。
 - `[4]` でNIC、RAM監視基準、通常/RSIモード、Colab HTTPS URLを編集できます。`[5]` はNIC一覧、`[6]` はGoogle Driveへ接続しないローカル検証です。監視中は処理パケット/秒、累計、脅威・バックドアリスク、隔離状態、RAM・swapを表示します。設定は `ai_data/panel-config.json` に権限 `0600` で保存し、ログは `ai_data/panel.log` に追記します。
 - `[m]` は地図モードを `OFF` → `Chrome` → `Local` の順に切り替えます。監視中は設定ファイルの変更を監視ループが反映し、OFFでは地図ワーカーを起動しません。Chromeモードは `127.0.0.1:9001/map` のWebSocketで、Chrome拡張Originからの読み取り専用接続だけを受け付けます。Localモードは外部通信をせず、イベントを `ai_data/map-events.jsonl` に保存します (Raylib描画はこのMVPには含みません)。
 - 地図イベントは脅威判定後に上限付きの非同期キューへ投入し、配信・保存は遮断処理と別スレッドで行います。イベントにはグローバルIPのみを含め、GeoIPデータセットがない位置、RSSIがない距離、パケットから確実に判別できないOSは `null` / `unknown` のままです。日本の市区町村や海外の行政区画、実座標を推定する機能ではありません。
@@ -108,12 +109,15 @@ bash ./mk1-panel.sh
 - `[a]` はLinuxプロセスメモリ保護を切り替えます。パネルと監視プロセスのダンプ抑止、ptrace制限、TracerPid監視に加え、保護中の暗号セッション鍵への `mlock` / `MADV_DONTDUMP` 適用を試みます。設定ONを監視プロセスへ適用できない場合はFail-Closedで起動を中止します。
 - USBスキャンが脅威を返した場合も同じローカルIPCでメイン防衛プロセスへ同期的に鍵消去を要求してから、rootワーカーがiproute2によるNIC遮断を試します。IPC確認に失敗してもNIC遮断は続行します。
 - 独自のcBPFフィルター・Netlink Connector ABI組み立て・AF_PACKET用カーネルバイパスは削除しました。パケット検査はユーザー空間で行い、プロセス監視は `psutil` による定期走査です。低遅延XDP/eBPF offloadや `SCHED_FIFO` は実装・保証していません。USB脅威時のNIC停止はroot所有の `iproute2` 実行ファイルに `ip link` netlink操作を依頼し、状態を再照会します。
+- 現行のAF_PACKET→Python/DPI/PyTorch経路はプロトタイプであり、800 Gbit/s処理やline-rate遮断を実装・保証しません。将来設計では、L2-L4 header検査と明示ルールによるbounded Fast-Path（XDP/eBPF、DPDKまたは対応NIC offload）と、異常候補flowを最大0.01%までサンプリングする非同期PyTorch Slow-Pathを分ける案を検討します。Fast-Path自体は未実装です。1.6 Tbit/sおよび5 Pbit/sも将来の水平拡張目標で、達成値ではありません。
 
 ### Linux USB隔離 (実験的機能)
 
-これはOS上の**論理隔離**であり、USB電源を物理的に切る機能ではありません。USBのsysfs unbindに失敗すれば物理接続は維持されます。また、ソフトウェア設定だけで「軍事レベル」や侵害不能を保証することはできません。専用の電源遮断ハードウェア、Linux/KVM、USBコントローラー、udev/自動マウント構成を含め、実機での検証が必要です。
+これはOS上の**論理隔離**であり、USB電源を物理的に切る機能ではありません。USBのsysfs unbindに失敗すれば物理接続は維持されます。専用の電源遮断ハードウェア、Linux/KVM、USBコントローラー、udev/自動マウント構成を含む脅威モデルは別途評価し、実機で検証する必要があります。
 
-有効化すると、未登録HIDと未承認のUSBデバイスはsysfs unbindで拒否します。USBストレージはホストのusb-storage/UASドライバーを外してから、USBデバイスをネットワークなしの一時QEMU/KVMゲストへ直接渡し、読み取り専用でマウントしてClamAVスキャンします。スキャン後はclean判定でもUSBをホストへ自動再認可しません。脅威判定ではUSBの論理切断を試行し、併せてrootワーカーが検証済みiproute2実行ファイル経由で全ネットワークインターフェースの停止を試します。検証鍵・署名・イメージ・QEMU/KVM・スキャン・sysfs操作のいずれかが失敗した場合、USBを未許可として切断します。ゲスト内でファイルシステムを読めない場合もclean扱いにせず、fail-closedにします。
+有効化すると、すべてのUSB HIDと未承認のUSBデバイスをsysfs unbindで拒否します。HIDの許可リストや登録手順はありません。USBストレージはホストのusb-storage/UASドライバーを外してから、USBデバイスをネットワークなしの一時QEMU/KVMゲストへ直接渡し、読み取り専用でマウントしてClamAVスキャンします。スキャン後はclean判定でもUSBをホストへ自動再認可しません。脅威判定ではUSBの論理切断を試行し、併せてrootワーカーが検証済みiproute2実行ファイル経由で全ネットワークインターフェースの停止を試します。検証鍵・署名・イメージ・QEMU/KVM・スキャン・sysfs操作のいずれかが失敗した場合、USBを未許可として切断します。ゲスト内でファイルシステムを読めない場合もclean扱いにせず、fail-closedにします。
+
+HID拒否は非同期のユーザー空間uevent監視とsysfs unbindによる論理隔離です。識別済みHIDに対し許可リストを設けずunbindを試みますが、物理的・即時の入力遮断ではありません。カーネルがイベントを処理する前後の入力、unbind失敗、既存の入力経路、USB以外のHIDを遮断するものではありません。専用USB無効化ポリシーやハードウェア制御を含む実機検証が別途必要です。
 
 **ホストのマウント競合:** uevent監視はカーネルイベントの非同期通知です。udevルールは一般的なUDisks自動マウントを抑止し、既にマウント済みのUSBブロックデバイスはゲストへ渡さず切断します。しかし、独自の自動マウンター、別の特権プロセス、カーネル/udevのタイミングまで完全に封じるものではありません。使用するLinuxディストリビューションで自動マウントを無効化し、udevルールを配備して試験してください。
 
@@ -143,7 +147,7 @@ bash ./mk1-panel.sh
    ```
 
    画像ディレクトリ、各イメージ、manifest、署名と公開鍵はroot所有かつgroup/world writableでないことが必要です。ホストが検証する公開鍵は `/etc/mk1ai/usb-scan-signing.pub` に固定し、ゲストディレクトリ内の公開鍵を自動信頼しません。
-5. 登録するHIDは端末のローカルrootシェルで `sudo python3 mk1_usb_guard.py list-hid` を実行して識別し、続けて `sudo python3 mk1_usb_guard.py enroll-hid 1-2` (IDは実際の一覧に置換) を使います。登録時は画面に表示された完全一致のシリアル番号を入力します。シリアルのないHIDは登録できず、VID/PIDだけの一致も許可しません。許可リストはroot所有の `/etc/mk1ai/usb-hid-allowlist.json` に権限 `0600` で保存されます。
+5. 任意で `python3 mk1_usb_guard.py list-hid` を実行すると接続中HIDを確認できます。列挙は監視開始前の入力イベントや物理的な接続を止めるものではありません。
 6. Cパネルで `[u]` を有効にしてから `[3]` の実遮断監視を起動します。USBワーカーは監視中も設定変更をポーリングするため、`[u]` 切替を反映します。挿入中の機器も有効化時に照合します。リモートダッシュボードは閲覧専用のままで、USB設定・認証・起動・停止を行えません。
 
 KVM/実USBパススルーはCIやコンテナ内の単体テストでは検証されません。配備前に使い捨てLinux機で、未登録HID、シリアル欠落HID、clean/threat/timeout、署名不一致、改ざん済みイメージ、QEMU/KVM不在、既マウント媒体、iproute2によるNIC停止失敗、ローカル復旧手順を実機検証してください。署名済みゲストはClamAVのスキャン結果を保証せず、未知の脅威、ファームウェア攻撃、BadUSB、ホストカーネルやハイパーバイザーの脆弱性は防げません。
@@ -250,7 +254,7 @@ WireGuardの標準プロトコル自体はCurve25519とChaCha20-Poly1305を使�
 
 Cパネルの `[a]` はLinux上で `PR_SET_DUMPABLE=0`、`PR_SET_PTRACER=0`、soft `RLIMIT_CORE=0` を適用し、`/proc/self/status` の `TracerPid` を100ms間隔で監視します。保護中に作成するML-KEM共有秘密とAES鍵、および有効な送信セッション鍵には `mlock` と `MADV_DONTDUMP` を適用します。ページロックに失敗した暗号処理は継続せず、保護ONの設定を監視プロセスへ適用できない場合は起動を中止します。
 
-この機能はASLRを超えるAMTD、メモリ配置の動的変換、デコイ検出を実装するものではありません。`mlock` はOS制限やメモリアロケータのページ共有に依存し、`MADV_DONTDUMP` は共有ページ全体に作用する可能性があります。暗号ライブラリ内部の複製、不変Pythonオブジェクト、スワップ、カーネル、root権限の攻撃者まで保護・消去できる保証はありません。TracerPid監視はポーリング方式であり、0.1ms応答を保証しません。Linux専用で、他OSでは有効化できません。ON/OFFはptrace許可状態を完全に復元する機能ではなく、軍事規格認証や完全な防御を意味しません。
+この機能は動的なメモリ配置変更やデコイ検出を実装するものではありません。`mlock` はOS制限やメモリアロケータのページ共有に依存し、`MADV_DONTDUMP` は共有ページ全体に作用する可能性があります。暗号ライブラリ内部の複製、不変Pythonオブジェクト、スワップ、カーネル、root権限の攻撃者まで保護・消去できる保証はありません。TracerPid監視はポーリング方式で、監視周期は設定値であり応答時間の保証ではありません。Linux専用で、他OSでは有効化できません。ON/OFFはptrace許可状態を完全に復元する機能ではなく、独立評価や認証を意味しません。
 
 このリポジトリのノートブックは空いているloopback portを選び、`cloudflared` で公開して `https://<random>.trycloudflare.com/rsi` を表示します。Colabの出力がLocalTunnel (`*.loca.lt`) やport `5000` を示す場合は、別のノートブックまたは古いランタイムが動いています。設定URLを取り違えないよう、Colab runtimeを再起動してこのリポジトリのnotebookを上から順に実行してください。トンネル確認では公開鍵pin、ML-KEM/AES-GCMの暗号要求・応答、認証拒否を検証します。
 
@@ -459,13 +463,22 @@ Driveに接続できない場合は既存の `ai_data/gdrive_raw/` データ、�
 - **データが学習に使われない**: ファイルが `ai_data/gdrive_raw/` 以下にあるか、拡張子が `.json` / `.jsonl` か、各レコードに10個以上の数値を含む `features` があるか、更新ログを確認します。
 - **ネットワークが切断された**: Dry-Run でない場合、コンソールに出る復旧コマンドを確認し、ローカルコンソールからインターフェースやネットワークサービスを復旧します。リモート接続だけに頼って実行しないでください。
 
+## 開発ビルドと署名付きリリース
+
+通常の開発では、`make check` と unittest は既存のPythonソースをそのまま使い、署名検証やCythonを要求しません。リリース生成だけで `make release` を使います。リリースビルドにはCython 3.0.12、C compiler、OpenSSL、ncurses開発ヘッダー、`strip` が必要です。ビルドは `airgap_ai_defender.py` と `mk1_usb_guard.py` をCython共有ライブラリにし、Cパネルをビルドしてstripした後、Ed25519署名とSHA-256サイドカーを作ります。モデルチェックポイントは自動で収集せず、署名対象に含めるファイルを `MK1AI_MODEL_FILES` にリポジトリ相対パスで改行区切り指定します。
+
+秘密鍵はリポジトリへ保存せず、オフラインで生成して保管してください。CIを使う場合、GitHub Actionsの `release-signing` Environmentに `MK1AI_ED25519_PRIVATE_KEY` secretとしてPEMを登録し、Environmentのデプロイ保護ルールで署名可能なブランチ・タグを制限します。Workflowはmainへのpushと `v*` タグでビルド・署名・検証を行い、タグではGitHub Releaseも作成/更新します。秘密鍵を設定していない場合は署名工程を失敗させます。CI署名は設定済みの長期鍵によるため、Actionsと対象Environmentの保護が信頼境界です。
+
+生成バンドルは `python3 scripts/verify_release.py --bundle dist/mk1ai-release --public-key /trusted/path/release-signing.pub` で検証できます。`scripts/run_release.sh BUNDLE_DIR TRUSTED_PUBLIC_KEY COMMAND [ARG ...]` は検証成功後に指定コマンドを実行します。公開鍵はバンドル同梱版をそのまま信頼せず、信頼済みの別経路で取得・固定してください。アプリを直接起動するとこのランチャー検証を迂回できます。これは共有ライブラリとパネルの署名済みパッケージングであり、全Pythonアプリをスタンドアロン化するものではありません。
+
 ## テスト
 
-テストではPyTorch、NumPy、gdown、requests、psutil、cryptographyを使用します。アプリ本体は一部依存がない場合にstubへフォールバックしますが、その状態では学習・モデル・Drive連携などのテストは実行できません。まだ仮想環境を作成していない場合は、次のように依存を導入してからテストを実行してください。
+テストではPyTorch、NumPy、gdown、requests、psutil、cryptographyを使用します。実PyTorchがない場合はモデル・学習依存のテストをskipし、アプリ本体のstubを実PyTorchの代わりとしてテストしません。secure transportのテストはcryptographyとpqcryptoの両方がある場合だけ実行します。依存不足によるskipは成功を意味しないため、完全なテストには次のように依存を導入してください。
 
 ```bash
 python3 -m venv .venv-mk1
-.venv-mk1/bin/python -m pip install torch numpy psutil requests gdown cryptography
+.venv-mk1/bin/python -m pip install torch numpy psutil requests gdown
+.venv-mk1/bin/python -m pip install -r requirements-secure-transport.txt
 .venv-mk1/bin/python -m unittest discover -s tests -v
 ```
 

@@ -9,12 +9,26 @@ import threading
 import unittest
 from unittest import mock
 
-from cryptography.exceptions import InvalidTag
-from pqcrypto.kem.ml_kem_768 import decaps, keygen  # type: ignore[reportMissingModuleSource]
 
-import mk1_secure_transport as secure_transport
+try:
+    from cryptography.exceptions import InvalidTag
+    from pqcrypto.kem.ml_kem_768 import decaps, keygen  # type: ignore[reportMissingModuleSource]
+except ModuleNotFoundError:
+    SECURE_TRANSPORT_DEPENDENCIES_AVAILABLE = False
+    InvalidTag = None
+    decaps = None
+    keygen = None
+    secure_transport = None
+else:
+    import mk1_secure_transport as secure_transport
+
+    SECURE_TRANSPORT_DEPENDENCIES_AVAILABLE = True
 
 
+@unittest.skipUnless(
+    SECURE_TRANSPORT_DEPENDENCIES_AVAILABLE,
+    "cryptography and pqcrypto are required for secure-transport tests",
+)
 class SecureTransportTest(unittest.TestCase):
     def setUp(self):
         with secure_transport._TRANSPORT_STATE_LOCK:

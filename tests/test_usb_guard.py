@@ -10,9 +10,7 @@ from unittest import mock
 from mk1_usb_guard import (
     USBHotplugMonitor,
     disable_network_interfaces,
-    enroll_hid_device,
     identify_usb_device,
-    load_hid_allowlist,
     parse_uevent,
     scan_usb_storage_in_guest,
     usb_storage_is_mounted,
@@ -60,26 +58,20 @@ class USBGuardTest(unittest.TestCase):
         self.assertEqual(event["ACTION"], "add")
         self.assertEqual(event["DEVPATH"], "/devices/1-2")
 
-    def test_allowlist_matches_exact_vid_pid_and_nonempty_serial(self):
+    def test_hid_is_blocked_by_deny_all_policy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir) / "usb"
             root.mkdir()
             device = self.make_device(root, device_class="00", interface_class="03", serial="kbd-serial")
-            allowlist = pathlib.Path(temp_dir) / "allowlist.json"
-            allowlist.write_text(json.dumps({
-                "version": 1,
-                "devices": [{"vid": "1234", "pid": "abcd", "serial": "kbd-serial"}],
-            }), encoding="utf-8")
-            allowlist.chmod(0o600)
             monitor = USBHotplugMonitor(
                 enabled=mock.Mock(is_set=mock.Mock(return_value=True)),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=allowlist,
             )
 
-            self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "hid_allowed")
-            self.assertEqual(load_hid_allowlist(allowlist), {("1234", "abcd", "kbd-serial")})
+            with mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
+                self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "blocked")
+            unbind.assert_called_once()
 
     def test_hid_without_serial_is_blocked_even_if_vid_and_pid_are_known(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,7 +82,6 @@ class USBGuardTest(unittest.TestCase):
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=pathlib.Path(temp_dir) / "missing.json",
             )
             with mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
                 self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "blocked")
@@ -105,13 +96,12 @@ class USBGuardTest(unittest.TestCase):
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=pathlib.Path(temp_dir) / "missing.json",
             )
             with mock.patch("mk1_usb_guard.unbind_usb_device") as unbind:
                 self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "hub_ignored")
             unbind.assert_not_called()
 
-    def test_allowlisted_hid_with_additional_network_interface_is_blocked(self):
+    def test_hid_with_additional_network_interface_is_blocked(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir) / "usb"
             root.mkdir()
@@ -120,46 +110,16 @@ class USBGuardTest(unittest.TestCase):
             extra_target.mkdir()
             (extra_target / "bInterfaceClass").write_text("02", encoding="ascii")
             (root / f"{device.device_id}:1.1").symlink_to(extra_target)
-            allowlist = pathlib.Path(temp_dir) / "allowlist.json"
-            allowlist.write_text(json.dumps({
-                "version": 1,
-                "devices": [{"vid": "1234", "pid": "abcd", "serial": "combo-1"}],
-            }), encoding="utf-8")
-            allowlist.chmod(0o600)
             monitor = USBHotplugMonitor(
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=allowlist,
             )
 
             with mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
                 self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "blocked")
 
             unbind.assert_called_once()
-
-    def test_hid_enrollment_requires_exact_serial_and_writes_private_allowlist(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = pathlib.Path(temp_dir) / "usb"
-            root.mkdir()
-            device = self.make_device(root, device_class="03", interface_class="03", serial="local-kbd")
-            target = pathlib.Path(temp_dir) / "config" / "allowlist.json"
-            with self.assertRaisesRegex(ValueError, "exact serial"):
-                enroll_hid_device(device, target, confirmed_serial="wrong")
-
-            enroll_hid_device(device, target, confirmed_serial="local-kbd")
-
-            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(load_hid_allowlist(target), {("1234", "abcd", "local-kbd")})
-
-    def test_group_or_world_writable_allowlist_is_rejected(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            target = pathlib.Path(temp_dir) / "allowlist.json"
-            target.write_text('{"version":1,"devices":[]}', encoding="utf-8")
-            target.chmod(0o666)
-
-            with self.assertRaisesRegex(ValueError, "non-group/world-writable"):
-                load_hid_allowlist(target)
 
     def test_scan_guest_verification_checks_signature_and_image_hashes(self):
         openssl = shutil.which("openssl")
@@ -246,7 +206,6 @@ class USBGuardTest(unittest.TestCase):
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=pathlib.Path(temp_dir) / "allowlist.json",
                 image_directory=pathlib.Path(temp_dir) / "missing-guest",
                 trusted_public_key=pathlib.Path(temp_dir) / "missing-key",
             )
@@ -269,7 +228,6 @@ class USBGuardTest(unittest.TestCase):
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=pathlib.Path(temp_dir) / "allowlist.json",
                 on_threat=callback,
             )
             with mock.patch("mk1_usb_guard.usb_storage_is_mounted", return_value=False), \
@@ -338,7 +296,6 @@ class USBGuardTest(unittest.TestCase):
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=pathlib.Path(temp_dir) / "missing.json",
             )
             with mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
                 self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "blocked")
@@ -359,7 +316,6 @@ class USBGuardTest(unittest.TestCase):
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
                 sysfs_root=root,
-                allowlist_path=pathlib.Path(temp_dir) / "missing.json",
             )
             for _ in range(monitor._event_queue.maxsize):
                 monitor._event_queue.put_nowait(b"")
