@@ -1,31 +1,9 @@
-"""
-============================================================
-  超軽量・オールインワン エアギャップ自動遮断AI
-  airgap_ai_defender.py (最終完成版)
-============================================================
+"""ユーザー空間パケット監視、脅威スコアリング、ローカル学習の実験用プロトタイプ。
 
-【自由工作のレポート用 システム概要】
+AF_PACKETで受信したパケットはPythonで解析し、DPI/AI pipelineへ渡す。
+専用Fast-Path実装ではなく、ラインレート処理や検知遅延を保証しない。
 
-このプログラムは「1つのAIモデルがすべてを支配する」という設計思想で作られています。
-
-★ 3層リソース構造
-  [Layer 1] Googleドライブ (最大100GB) ─── ハッキング手法の最新教材置き場
-      ↓ AIが「使える教材か？」を查定してダウンロード
-  [Layer 2] ローカルストレージ ─────────── 厳選データの保管庫 + 緊急時の仮想メモリ
-      ↓ 必要なデータだけをRAMへ
-  [Layer 3] システムRAM (上限500MB) ────── AIモデル本体が動く超高速の実行現場
-
-★ 1つのAIが3つの顔を持つ
-  Head A (絶対防衛役) : 異常パケットを0.001秒で検知 → ネットワーク即遮断
-  Head B (学習・厳選役): 良い教材を見分け、防衛の邪魔をせずバックグラウンドで成長
-  Head C (司令塔)     : RAMの残量を監視し、溢れる前にデータをストレージへ退避指令
-
-実行方法:
-  pip install torch psutil requests gdown
-  sudo python3 airgap_ai_defender.py --interface eth0
-  ※ raw socketにはroot権限(sudo)が必要
-  ※ デフォルトはDry-Runモード（実際の遮断はしない安全なテストモード）
-  ※ GoogleドライブフォルダID: 100FIfMbB-0kR2bg2NXl-O1k-Lilz-j_G (デフォルト設定済)
+リリースパッケージ担当: 山田 悠 (Yu Yamada)。
 """
 
 # ── 標準ライブラリ (インストール不要) ──
@@ -492,7 +470,7 @@ def toggle_oni_mode(activate: bool | None = None) -> bool:
         activate = not previous
     if activate:
         _ONI_MODE_ACTIVE.set()
-        log.warning("[ONI_MODE] ★★★ 鬼モード有効化 ★★★ ホワイトリスト無効・1検知で即キルスイッチ発動！")
+        log.warning("[ONI_MODE] 検知閾値を変更した監視モードを有効化しました。誤検知リスクが上がります。")
     else:
         _ONI_MODE_ACTIVE.clear()
         log.info("[ONI_MODE] 鬼モード解除 → 通常監視モードへ移行しました。")
@@ -528,7 +506,7 @@ _NORMAL_MODE_COMPOSITE_THRESHOLD = 0.88
 _NORMAL_MODE_AI_THRESHOLD = 0.88
 _NORMAL_MODE_MATH_THRESHOLD = 0.88
 _NORMAL_MODE_ENTROPY_THRESHOLD = 0.92   # これ以上の高エントロピーは第1段階で即ブロック
-# 鬼モード: 1検知で即キルスイッチ (閾値を最小化)
+# 鬼モード: 検知閾値を下げる実験用設定
 _ONI_MODE_SCORE_THRESHOLD = 0.01        # 実質的にどんな異常でも即発動
 _ONI_MODE_ANOMALY_COUNT_TRIGGER = 1     # 累積カウンタ1回で発動
 
@@ -3315,7 +3293,7 @@ def boot_time_auto_hardening(profile: dict, dry_run: bool = False, backup_dir: s
     return report
 
 
-def _build_absolute_containment_payload(profile: dict, learning_data=None) -> dict:
+def _build_network_containment_plan(profile: dict, learning_data=None) -> dict:
     env_signal, ranked = _ai_command_policy_vector(profile, learning_data)
     tools = profile.get("tools", {})
     interfaces = [iface for iface in profile.get("available_interfaces", []) if iface != "lo"]
@@ -3348,13 +3326,13 @@ def _build_absolute_containment_payload(profile: dict, learning_data=None) -> di
         commands.append(["ifconfig", adapter, "down"])
 
     payload = {
-        "strategy": "absolute_containment",
-        "reason": "ローカルブート時に構築された絶対遮断コンテナペイロード",
+        "strategy": "best_effort_network_isolation",
+        "reason": "利用可能なOSネットワーク制御コマンドの実行計画",
         "commands": commands,
         "profile": profile,
         "policy_vector": env_signal,
     }
-    log.info("[CONTAINMENT_PAYLOAD] 絶対遮断ペイロードを構築しました。")
+    log.info("[CONTAINMENT_PLAN] OSネットワーク隔離コマンドの実行計画を構築しました。")
     return payload
 
 
@@ -4193,8 +4171,7 @@ class LightweightMultiTaskAI(nn.Module):
             nn.Linear(32, 16),        nn.ReLU(),
         )
 
-        # Head A (絶対防衛役): 2層構成で異常度スコアを精密に出力 (0.0=正常 / 1.0=攻撃)
-        # C2ビーコンの微小ジッターパターンも見逃さない高精度スコアリング。
+        # Head A: heuristic/learned traffic anomaly score (0.0=low, 1.0=high).
         self.head_a = nn.Sequential(
             nn.Linear(16, 8), nn.ReLU(),
             nn.Linear(8, 1),  nn.Sigmoid(),
@@ -4898,10 +4875,8 @@ _last_pkt_time = time.time()
 
 def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool, stop_event=None):
     """
-    生ソケット(SOCK_RAW)で直接カーネルからパケットを受け取り、
-    structで即座に解析 → 10次元特徴量に変換します。
-    scapyのような重いライブラリを一切使わないので非常に高速！
-    推論は 1 ms 以下を目指しています。
+    AF_PACKET raw socketで受信し、structで解析して10次元特徴量を作る。
+    ユーザー空間処理であり、スループットや推論遅延の上限は保証しない。
     """
     global _last_pkt_time, _ema_delta, _last_dpi_result
     if platform.system().lower() != "linux":
@@ -5024,18 +4999,15 @@ _TRAIN_QUEUE_MAX_BATCHES = 10
 _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
-def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
+def _enqueue_training_batch(batch: list) -> bool:
     if not batch:
         return True
-    warned = False
-    while True:
-        try:
-            _train_queue.put(batch, timeout=wait_timeout)
-            return True
-        except queue.Full:
-            if not warned:
-                log.warning("[学習キュー] 未処理バッチが上限に達しました。空きができるまで入力を抑制します。")
-                warned = True
+    try:
+        _train_queue.put_nowait(batch)
+    except queue.Full:
+        log.warning("[学習キュー] 上限に達したため今回の学習バッチを破棄しました。監視処理は継続します。")
+        return False
+    return True
 
 
 def _buffer_monitor_candidate(buffer: list, features: list, head_b_score: float) -> None:
@@ -6785,7 +6757,7 @@ def main():
                 time.sleep(5)
                 continue
 
-            # ── AIによる超高速推論 (no_grad = 勾配なし = 最速・最省メモリ) ──
+            # AI inference runs in the Python slow path; it is not a packet fast path.
             x = torch.tensor([feat], dtype=torch.float32)
             with _MODEL_ACCESS_LOCK, torch.no_grad():
                 score_a, score_b, score_c = model(x)

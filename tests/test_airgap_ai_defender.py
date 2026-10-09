@@ -27,6 +27,30 @@ assert spec is not None and spec.loader is not None, "Failed to load spec or loa
 module: Any = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+TORCH_AVAILABLE = isinstance(getattr(module.torch, "__version__", None), str)
+SECURE_TRANSPORT_AVAILABLE = module.mk1_secure_transport is not None
+REQUESTS_AVAILABLE = module.requests is not None
+GDOWN_AVAILABLE = module.gdown is not None
+AESGCM_AVAILABLE = module.AESGCM is not None
+
+requires_torch = unittest.skipUnless(
+    TORCH_AVAILABLE, "PyTorch is required for model and training assertions",
+)
+requires_secure_transport = unittest.skipUnless(
+    SECURE_TRANSPORT_AVAILABLE, "secure-transport dependencies are unavailable",
+)
+requires_rsi_dependencies = unittest.skipUnless(
+    SECURE_TRANSPORT_AVAILABLE and REQUESTS_AVAILABLE,
+    "RSI transport dependencies are unavailable",
+)
+requires_gdrive_dependencies = unittest.skipUnless(
+    SECURE_TRANSPORT_AVAILABLE and REQUESTS_AVAILABLE and GDOWN_AVAILABLE,
+    "Google Drive download dependencies are unavailable",
+)
+requires_aesgcm = unittest.skipUnless(
+    AESGCM_AVAILABLE, "cryptography AES-GCM is required for encrypted spill tests",
+)
+
 
 class AirgapSecurityHelpersTest(unittest.TestCase):
     def test_torch_stub_never_uses_pickle_fallback(self):
@@ -210,6 +234,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                     module._load_runtime_config(str(config_path)),
                 )
 
+    @requires_secure_transport
     def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
         device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
         interfaces = ["eth0", "wlan0"]
@@ -382,6 +407,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         )
         self.assertIsNone(module._derive_cloud_model_urls("http://colab.example.test/rsi"))
 
+    @unittest.skipUnless(
+        TORCH_AVAILABLE and SECURE_TRANSPORT_AVAILABLE,
+        "PyTorch and secure-transport dependencies are required for model sync",
+    )
     def test_sync_cloud_model_verifies_hash_replaces_atomically_and_queues_state(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         artifact = io.BytesIO()
@@ -421,6 +450,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(list(pathlib.Path(temp_dir).glob("*.tmp")), [])
             self.assertEqual(list(pathlib.Path(temp_dir).glob(".model-hash-*.tmp")), [])
 
+    @requires_secure_transport
     def test_sync_cloud_model_rejects_hash_mismatch_without_replacing_existing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = pathlib.Path(temp_dir) / "cloud_base_model.pth"
@@ -442,6 +472,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(module._MODEL_SYNC_STATUS, "Failed")
             self.assertEqual(list(pathlib.Path(temp_dir).glob(".cloud-model-*.tmp")), [])
 
+    @unittest.skipUnless(
+        TORCH_AVAILABLE and SECURE_TRANSPORT_AVAILABLE,
+        "PyTorch and secure-transport dependencies are required for model sync",
+    )
     def test_sync_cloud_model_queues_matching_local_model_for_application(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         artifact = io.BytesIO()
@@ -469,6 +503,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             with module._MODEL_RELOAD_LOCK:
                 self.assertIsNone(module._PENDING_CLOUD_STATE)
 
+    @requires_secure_transport
     def test_sync_cloud_model_fails_closed_without_pqc_key_pin(self):
         with mock.patch.dict(module.os.environ, {}, clear=True), mock.patch.object(
             module.mk1_secure_transport, "encrypted_request",
@@ -483,6 +518,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(result["reason"], "PQC public-key pin required")
         secure_request.assert_not_called()
 
+    @requires_torch
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -499,6 +535,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(module._adjust_soft_ai_score(0.90, 1.0, reviewed=True), 0.675)
         self.assertEqual(module._adjust_soft_ai_score(0.96, 1.0, reviewed=True), 0.96)
 
+    @requires_torch
     def test_reviewed_head_b_can_clear_borderline_ai_only_detection(self):
         class Model:
             def __call__(self, _inputs):
@@ -630,6 +667,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(untrusted, [[{"features": [0.2] * 10}]])
         self.assertEqual(reviewed, [[{"features": [0.2] * 10, "label": 1}]])
 
+    @requires_gdrive_dependencies
     def test_download_from_gdrive_folder_downloads_only_size_verified_data(self):
         payload = json.dumps({"features": [0.0] * 10}) + "\n"
         candidate = mock.Mock(id="file-id", path="dataset/sample.jsonl")
@@ -659,6 +697,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(len(downloaded), 1)
             self.assertEqual(pathlib.Path(downloaded[0]).read_text(encoding="utf-8"), payload)
 
+    @requires_gdrive_dependencies
     def test_drive_size_check_timeout_is_skipped_safely(self):
         candidate = mock.Mock(id="slow-file", path="dataset/slow.jsonl")
         with tempfile.TemporaryDirectory() as temp_dir, \
@@ -673,6 +712,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(head_request.call_count, 3)
         download.assert_not_called()
 
+    @requires_gdrive_dependencies
     def test_gdrive_retries_temporary_head_timeout(self):
         payload = json.dumps({"features": [0.0] * 10}) + "\n"
         candidate = mock.Mock(id="retry-file", path="dataset/retry.jsonl")
@@ -821,6 +861,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             for call in log_mock.info.call_args_list
         ))
 
+    @requires_rsi_dependencies
     def test_rsi_refuses_remote_request_without_pqc_pin(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         records = [
@@ -841,6 +882,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertTrue(result["rejected"])
         request.assert_not_called()
 
+    @requires_rsi_dependencies
     def test_rsi_posts_only_selected_features_in_colab_api_schema(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         sent_payload = {}
@@ -879,6 +921,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(secure_request.call_args.args[4], "a" * 64)
         self.assertNotIn("never-send", str(sent_payload))
 
+    @requires_rsi_dependencies
     def test_rsi_refuses_to_send_single_class_feedback(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         records = [{"features": [0.1] * 10, "label": 0}]
@@ -899,6 +942,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         secure_request.assert_not_called()
         log_mock.warning.assert_called_once()
 
+    @requires_rsi_dependencies
     def test_rsi_connection_failure_returns_local_fallback(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         records = [
@@ -1001,6 +1045,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
 
+    @requires_torch
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
@@ -1030,6 +1075,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             torch.testing.assert_close(restored_model.shared_layer[0].weight, baseline_shared)
             torch.testing.assert_close(model.shared_layer[0].weight, original_shared)
 
+    @requires_torch
     def test_local_feedback_checkpoint_marks_both_reviewed_classes(self):
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
              mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
@@ -1047,14 +1093,18 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(module._HEAD_B_REVIEWED)
             self.assertEqual(module._HEAD_B_REVIEWED_LABELS, {0, 1})
 
-    def test_training_enqueue_retries_when_queue_is_full(self):
+    def test_training_enqueue_drops_batch_without_blocking_when_queue_is_full(self):
         original_queue = module._train_queue
-        full_queue = mock.Mock()
-        full_queue.put.side_effect = [queue.Full, None]
+        full_queue = queue.Queue(maxsize=1)
+        queued_batch = [{"features": [0.1] * 10, "label": 0}]
+        rejected_batch = [{"features": [0.9] * 10, "label": 1}]
+        full_queue.put_nowait(queued_batch)
         try:
             module._train_queue = full_queue
-            self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
-            self.assertEqual(full_queue.put.call_count, 2)
+            started = module.time.monotonic()
+            self.assertFalse(module._enqueue_training_batch(rejected_batch))
+            self.assertLess(module.time.monotonic() - started, 0.5)
+            self.assertIs(full_queue.get_nowait(), queued_batch)
         finally:
             module._train_queue = original_queue
 
@@ -1575,6 +1625,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             mock.call(module._signal_module.SIGTERM, module._signal_module.SIG_DFL),
         ])
 
+    @requires_torch
     def test_load_cloud_model_uses_cpu_map_location(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         valid_state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -1588,8 +1639,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(load_mock.call_args.kwargs.get("weights_only", False))
             self.assertTrue(log_mock.info.called or log_mock.warning.called)
 
+    @requires_torch
     def test_load_cloud_model_migrates_legacy_checkpoint_without_changing_outputs(self):
-        if module.torch is None:
+        if not TORCH_AVAILABLE:
             self.skipTest("PyTorch is not installed")
 
         torch = module.torch
@@ -1649,6 +1701,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         finally:
             pathlib.Path(temp_path).unlink(missing_ok=True)
 
+    @requires_torch
     def test_load_cloud_model_can_skip_hash_check_for_development(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         valid_state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -2186,6 +2239,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(effective_score, pipeline["score"])
         self.assertEqual(module._combine_threat_scores(float("nan"), float("inf")), 0.0)
 
+    @requires_aesgcm
     def test_memory_manager_circular_buffer(self):
         temp_swap_dir = "./test_swap"
         mgr = module.MemoryManager(max_memory_mb=10, swap_dir=temp_swap_dir)

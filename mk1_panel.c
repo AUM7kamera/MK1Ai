@@ -1,3 +1,4 @@
+/* Release packaging contact: 山田 悠 (Yu Yamada). */
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
@@ -7,9 +8,11 @@
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -18,7 +21,6 @@
 #include <time.h>
 #include <unistd.h>
 #include "mk1_memory_guard.h"
-#include "mk1_path_trust.h"
 #include "mk1_tunnel.h"
 
 #define CONFIG_PATH "ai_data/panel-config.json"
@@ -26,6 +28,14 @@
 #define LOG_PATH "ai_data/panel.log"
 #define TUNNEL_CONTROL_PATH "ai_data/tunnel-control.sock"
 #define VALUE_SIZE 512
+#define UI_LOG_LINES 8
+#define UI_LOG_LINE_SIZE 192
+
+enum {
+    COLOR_CRITICAL = 1,
+    COLOR_HIGH,
+    COLOR_INFO
+};
 
 typedef struct {
     char interface[VALUE_SIZE];
@@ -54,12 +64,31 @@ typedef struct {
     int memory_guard_active;
 } PanelStatus;
 
+typedef struct {
+    PanelStatus status;
+    bool status_available;
+    char log_lines[UI_LOG_LINES][UI_LOG_LINE_SIZE];
+    size_t log_count;
+} PanelSnapshot;
+
 static pid_t monitor_pid = -1;
 static pid_t dashboard_pid = -1;
 static volatile sig_atomic_t close_requested = 0;
 static volatile sig_atomic_t isolation_closed = 0;
 static char message[256] = "準備完了";
 static void set_message(const char *text);
+static PanelSnapshot panel_snapshot;
+static pthread_mutex_t panel_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t telemetry_thread;
+static atomic_bool telemetry_stop = ATOMIC_VAR_INIT(false);
+static bool telemetry_thread_started;
+static WINDOW *header_window;
+static WINDOW *status_window;
+static WINDOW *log_window;
+static WINDOW *resource_window;
+static WINDOW *footer_window;
+static int panel_rows;
+static int panel_columns;
 
 static void handle_shutdown_signal(int signal_number) {
     if (signal_number == SIGTERM) {
@@ -331,6 +360,247 @@ static void set_message(const char *text) {
     copy_value(message, sizeof(message), text);
 }
 
+static void load_recent_log(char output[UI_LOG_LINES][UI_LOG_LINE_SIZE], size_t *count) {
+    *count = 0;
+    FILE *file = fopen(LOG_PATH, "r");
+    if (file == NULL) return;
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return;
+    }
+    long file_size = ftell(file);
+    if (file_size < 0) {
+        fclose(file);
+        return;
+    }
+    long start = file_size > 16384 ? file_size - 16384 : 0;
+    if (fseek(file, start, SEEK_SET) != 0) {
+        fclose(file);
+        return;
+    }
+
+    char buffer[16385];
+    size_t length = fread(buffer, 1, sizeof(buffer) - 1, file);
+    fclose(file);
+    buffer[length] = '\0';
+    char *line_start = buffer;
+    if (start > 0) {
+        char *first_newline = strchr(buffer, '\n');
+        if (first_newline == NULL) return;
+        line_start = first_newline + 1;
+    }
+
+    char *save_pointer = NULL;
+    for (char *line = strtok_r(line_start, "\n", &save_pointer);
+         line != NULL;
+         line = strtok_r(NULL, "\n", &save_pointer)) {
+        if (*line == '\0') continue;
+        if (*count == UI_LOG_LINES) {
+            memmove(output[0], output[1],
+                    (UI_LOG_LINES - 1) * sizeof(output[0]));
+            *count = UI_LOG_LINES - 1;
+        }
+        copy_value(output[*count], UI_LOG_LINE_SIZE, line);
+        (*count)++;
+    }
+}
+
+static void *telemetry_worker(void *unused) {
+    (void)unused;
+    while (!atomic_load_explicit(&telemetry_stop, memory_order_relaxed)) {
+        PanelSnapshot next_snapshot;
+        memset(&next_snapshot, 0, sizeof(next_snapshot));
+        next_snapshot.status_available = read_status(&next_snapshot.status);
+        load_recent_log(next_snapshot.log_lines, &next_snapshot.log_count);
+
+        pthread_mutex_lock(&panel_snapshot_mutex);
+        panel_snapshot = next_snapshot;
+        pthread_mutex_unlock(&panel_snapshot_mutex);
+
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 500000000};
+        nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+
+static void destroy_panel_windows(void) {
+    if (header_window != NULL) delwin(header_window);
+    if (status_window != NULL) delwin(status_window);
+    if (log_window != NULL) delwin(log_window);
+    if (resource_window != NULL) delwin(resource_window);
+    if (footer_window != NULL) delwin(footer_window);
+    header_window = NULL;
+    status_window = NULL;
+    log_window = NULL;
+    resource_window = NULL;
+    footer_window = NULL;
+}
+
+static void create_panel_windows(void) {
+    destroy_panel_windows();
+    panel_rows = LINES;
+    panel_columns = COLS;
+    if (LINES < 23 || COLS < 80) return;
+
+    int header_height = 3;
+    int footer_height = 4;
+    int resource_height = 4;
+    int body_y = header_height;
+    int body_height = LINES - header_height - resource_height - footer_height;
+    int resource_y = body_y + body_height;
+    int footer_y = resource_y + resource_height;
+    int status_width = (COLS * 5) / 12;
+    if (status_width < 32) status_width = 32;
+    if (status_width > COLS - 32) status_width = COLS - 32;
+
+    header_window = newwin(header_height, COLS, 0, 0);
+    status_window = newwin(body_height, status_width, body_y, 0);
+    log_window = newwin(body_height, COLS - status_width, body_y, status_width);
+    resource_window = newwin(resource_height, COLS, resource_y, 0);
+    footer_window = newwin(footer_height, COLS, footer_y, 0);
+    if (header_window == NULL || status_window == NULL || log_window == NULL
+        || resource_window == NULL || footer_window == NULL) {
+        destroy_panel_windows();
+    }
+}
+
+static short log_color(const char *line) {
+    if (strstr(line, "CRITICAL") != NULL || strstr(line, "CRIT") != NULL
+        || strstr(line, "致命") != NULL) return COLOR_CRITICAL;
+    if (strstr(line, "ERROR") != NULL || strstr(line, "WARNING") != NULL
+        || strstr(line, "HIGH") != NULL || strstr(line, "警告") != NULL) {
+        return COLOR_HIGH;
+    }
+    return COLOR_INFO;
+}
+
+static void draw_resource_bar(WINDOW *window, int row, int column, int width,
+                              const char *label, double used, double limit) {
+    int bar_width = width - 25;
+    if (bar_width < 5) bar_width = 5;
+    if (bar_width > 32) bar_width = 32;
+    int filled = 0;
+    if (limit > 0.0 && used > 0.0) {
+        double ratio = used / limit;
+        if (ratio > 1.0) ratio = 1.0;
+        filled = (int)(ratio * bar_width);
+    }
+    mvwprintw(window, row, column, "%-8s [", label);
+    short color = used > limit && limit > 0.0 ? COLOR_CRITICAL :
+        (limit > 0.0 && used / limit >= 0.75 ? COLOR_HIGH : COLOR_INFO);
+    wattron(window, COLOR_PAIR(color));
+    for (int index = 0; index < bar_width; index++) {
+        waddch(window, index < filled ? '#' : '-');
+    }
+    wattroff(window, COLOR_PAIR(color));
+    wprintw(window, "] %7.1f / %7.1f MB", used, limit);
+}
+
+static void draw_panel_windows(const PanelConfig *config, const PanelSnapshot *snapshot) {
+    if (LINES != panel_rows || COLS != panel_columns || header_window == NULL) {
+        create_panel_windows();
+    }
+    if (header_window == NULL) {
+        erase();
+        attron(A_BOLD);
+        mvprintw(0, 0, "MK1Ai C TUI");
+        attroff(A_BOLD);
+        mvprintw(2, 0, "端末を拡大してください (最低80列 x 23行)");
+        mvprintw(LINES - 1, 0, "q:終了");
+        refresh();
+        return;
+    }
+
+    const PanelStatus *status = &snapshot->status;
+    werase(header_window);
+    box(header_window, 0, 0);
+    wattron(header_window, A_BOLD | COLOR_PAIR(COLOR_INFO));
+    mvwprintw(header_window, 1, 2, "MK1Ai | 運用コンソール");
+    wattroff(header_window, A_BOLD | COLOR_PAIR(COLOR_INFO));
+    mvwprintw(header_window, 1, COLS > 56 ? COLS - 54 : 2,
+              "表示・ログ読込は非同期 / Fast-Path性能保証なし");
+    wnoutrefresh(header_window);
+
+    werase(status_window);
+    box(status_window, 0, 0);
+    mvwprintw(status_window, 0, 2, " STATUS ");
+    mvwprintw(status_window, 2, 2, "監視: %s",
+              monitor_pid > 0 ? "RUNNING" : "STOPPED");
+    mvwprintw(status_window, 3, 2, "NIC: %.15s  mode: %.6s",
+              config->interface, config->mode);
+    mvwprintw(status_window, 4, 2, "PPS: %10.2f  total: %lld",
+              snapshot->status_available ? status->packets_per_second : 0.0,
+              snapshot->status_available ? status->packets_total : 0LL);
+    short threat_color = status->threat_score >= 0.9 ? COLOR_CRITICAL :
+        (status->threat_score >= 0.65 ? COLOR_HIGH : COLOR_INFO);
+    wattron(status_window, COLOR_PAIR(threat_color) | A_BOLD);
+    mvwprintw(status_window, 5, 2, "脅威 %.3f  backdoor %.3f",
+              snapshot->status_available ? status->threat_score : 0.0,
+              snapshot->status_available ? status->backdoor_score : 0.0);
+    wattroff(status_window, COLOR_PAIR(threat_color) | A_BOLD);
+    short alert_color = status->isolation_active ? COLOR_CRITICAL :
+        (strcmp(status->alert, "NONE") == 0 ? COLOR_INFO : COLOR_HIGH);
+    wattron(status_window, COLOR_PAIR(alert_color) | A_BOLD);
+    mvwprintw(status_window, 6, 2, "Alert: %.20s", snapshot->status_available
+              ? status->alert : "STATE UNAVAILABLE");
+    wattroff(status_window, COLOR_PAIR(alert_color) | A_BOLD);
+    mvwprintw(status_window, 7, 2, "実行: %s",
+              !snapshot->status_available ? "状態未取得" :
+              status->dry_run ? "Dry-Run (no enforcement)" : "隔離操作有効");
+    mvwprintw(status_window, 8, 2, "USB policy: %s",
+              config->usb_guard_enabled ? "HID deny / storage scan" : "OFF");
+    mvwprintw(status_window, 9, 2, "WG gate: %s  mem guard: %s",
+              snapshot->status_available && status->secure_tunnel_active ? "ON" : "OFF",
+              snapshot->status_available && status->memory_guard_active ? "ON" : "OFF");
+    mvwaddnstr(status_window, 11, 2, message, getmaxx(status_window) - 4);
+    wnoutrefresh(status_window);
+
+    werase(log_window);
+    box(log_window, 0, 0);
+    mvwprintw(log_window, 0, 2, " THREAT / EVENT LOG ");
+    int available_rows = getmaxy(log_window) - 2;
+    size_t first = snapshot->log_count > (size_t)available_rows
+        ? snapshot->log_count - (size_t)available_rows : 0;
+    int row = 1;
+    for (size_t index = first; index < snapshot->log_count; index++, row++) {
+        short color = log_color(snapshot->log_lines[index]);
+        wattron(log_window, COLOR_PAIR(color));
+        mvwaddnstr(log_window, row, 1, snapshot->log_lines[index],
+                   getmaxx(log_window) - 2);
+        wattroff(log_window, COLOR_PAIR(color));
+    }
+    if (snapshot->log_count == 0) {
+        wattron(log_window, COLOR_PAIR(COLOR_INFO));
+        mvwprintw(log_window, 1, 2, "ログ待機中");
+        wattroff(log_window, COLOR_PAIR(COLOR_INFO));
+    }
+    wnoutrefresh(log_window);
+
+    werase(resource_window);
+    box(resource_window, 0, 0);
+    mvwprintw(resource_window, 0, 2, " RESOURCES ");
+    int meter_width = COLS / 2 - 4;
+    draw_resource_bar(resource_window, 1, 2, meter_width, "RAM",
+                      snapshot->status_available ? status->ram_used_mb : 0.0,
+                      snapshot->status_available ? status->ram_limit_mb : 0.0);
+    draw_resource_bar(resource_window, 1, COLS / 2 + 1, meter_width, "SWAP",
+                      snapshot->status_available ? status->swap_used_mb : 0.0,
+                      snapshot->status_available ? status->ram_limit_mb : 0.0);
+    mvwprintw(resource_window, 2, 2, "Transport %s | Isolation %s",
+              config->secure_tunnel_enabled ? "enabled" : "disabled",
+              status->isolation_active ? "active" : "inactive");
+    wnoutrefresh(resource_window);
+
+    werase(footer_window);
+    box(footer_window, 0, 0);
+    mvwprintw(footer_window, 1, 1,
+              "[1]Dry [2]Stop [3]Isolate [4]Config [5]NIC [6]Test [7]Dash [8]Stop");
+    mvwprintw(footer_window, 2, 1, "[m]Map [u]USB [e]WG [a]Mem [q]Quit");
+    wnoutrefresh(footer_window);
+    doupdate();
+}
+
 static void stop_monitor(void) {
     if (monitor_pid <= 0) {
         set_message("監視プロセスは起動していません");
@@ -597,16 +867,6 @@ static bool start_monitor(const PanelConfig *config, bool full_isolation) {
         set_message("監視の起動をキャンセルしました");
         return false;
     }
-    if (full_isolation) {
-        const char *privileged_python = getenv("MK1_PYTHON_BIN");
-        if (privileged_python == NULL || privileged_python[0] == '\0') privileged_python = "python3";
-        bool python_ok = strchr(privileged_python, '/') == NULL
-            || mk1_path_chain_is_root_trusted(privileged_python);
-        if (!python_ok || !mk1_path_chain_is_root_trusted("airgap_ai_defender.py")) {
-            set_message("実遮断はroot権限で実行されます。スクリプトとPythonをrootが所有し、group/otherが書き込めない場所に配置してください");
-            return false;
-        }
-    }
     if (full_isolation && !authorize_admin()) return false;
     if (!save_config(config)) return false;
     pid_t child = fork();
@@ -809,8 +1069,10 @@ static void draw_panel(const PanelConfig *config) {
         (void)kill(getpid(), SIGKILL);
         return;
     }
-    PanelStatus status;
-    bool status_available = read_status(&status);
+    PanelSnapshot snapshot;
+    pthread_mutex_lock(&panel_snapshot_mutex);
+    snapshot = panel_snapshot;
+    pthread_mutex_unlock(&panel_snapshot_mutex);
     if (monitor_pid > 0 && !isolation_closed) {
         int child_status;
         pid_t result = waitpid(monitor_pid, &child_status, WNOHANG);
@@ -828,55 +1090,32 @@ static void draw_panel(const PanelConfig *config) {
         }
     }
 
-    erase();
-    attron(A_BOLD);
-    mvprintw(1, 2, "MK1Ai C操作パネル");
-    attroff(A_BOLD);
-    mvprintw(3, 2, "監視NIC: %-16s モード: %-6s RAM基準: %d MB",
-             config->interface, config->mode, config->ram_limit);
-    mvprintw(4, 2, "Colab HTTPS: %s",
-             config->colab_endpoint[0] ? config->colab_endpoint : "未設定");
-    const char *map_mode = config->map_mode == 1 ? "Chrome WebSocket" :
-        config->map_mode == 2 ? "Local offline cache" : "OFF";
-    mvprintw(5, 2, "地図表示: %-20s %s",
-             map_mode, config->map_mode == 1 ? "ws://127.0.0.1:9001/map" : "");
-    mvprintw(6, 2, "監視状態: %s", monitor_pid > 0 ? "起動中" : "停止中");
-    mvprintw(7, 2, "処理速度: %.2f packets/sec   累計: %lld",
-             status_available ? status.packets_per_second : 0.0,
-             status_available ? status.packets_total : 0LL);
-    mvprintw(8, 2, "脅威スコア: %.3f   バックドアリスク: %.3f",
-             status_available ? status.threat_score : 0.0,
-             status_available ? status.backdoor_score : 0.0);
-    if (status_available && strcmp(status.alert, "NONE") != 0) attron(A_BOLD);
-    mvprintw(9, 2, "アラート: %s%s",
-             status_available ? status.alert : "状態待ち",
-             status_available && status.isolation_active ? " (隔離発動)" : "");
-    if (status_available && strcmp(status.alert, "NONE") != 0) attroff(A_BOLD);
-    const char *monitor_mode = !status_available ? "状態未取得" :
-        status.dry_run ? "Dry-Run (遮断なし)" : "実遮断 (管理者権限)";
-    mvprintw(10, 2, "実行モード: %s", monitor_mode);
-    mvprintw(11, 2, "RAM: %.1f / %.0f MB   退避swap: %.1f MB",
-             status_available ? status.ram_used_mb : 0.0,
-             status_available ? status.ram_limit_mb : 0.0,
-             status_available ? status.swap_used_mb : 0.0);
-    mvprintw(12, 2, "USB隔離設定: %s (実遮断モード時のみ有効)",
-             config->usb_guard_enabled ? "有効" : "無効");
-    mvprintw(13, 2, "Encrypted Sandbox Tunnel: %s / PQC送信ゲート: %s",
-             config->secure_tunnel_enabled ? "ON" : "OFF",
-             !status_available ? "状態未取得" :
-             status.secure_tunnel_active ? "許可" : "遮断");
-    mvprintw(14, 2, "メモリ保護: %s / 監視プロセス: %s",
-             config->memory_guard_enabled ? "ON" : "OFF",
-             !status_available ? "状態未取得" :
-             status.memory_guard_active ? "有効" : "無効");
+    draw_panel_windows(config, &snapshot);
+}
 
-    mvprintw(16, 2, "[1] Dry-Run [2] 停止 [3] 実遮断 [4] 設定 [m] 地図 [u] USB [e] WG [a] メモリ");
-    mvprintw(17, 2, "[5] NIC一覧 [6] ローカル検証 [7] HTTPS閲覧開始 [8] 停止");
-    mvprintw(18, 2, "リモート閲覧: %s", dashboard_pid > 0 ? "HTTPSサーバー稼働中 (閲覧専用)" : "停止中");
-    mvprintw(19, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
-    mvprintw(LINES - 2, 2, "状態: %s%s", status_available ? status.state : "ステータス未出力",
-             isolation_closed ? " / 隔離後ローカル復旧が必要" : "");
-    refresh();
+static int mouse_shortcut_key(void) {
+    MEVENT event;
+    if (getmouse(&event) != OK
+        || (event.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED)) == 0
+        || (event.y != LINES - 3 && event.y != LINES - 2)) return ERR;
+    static const int primary_positions[] = {1, 8, 16, 27, 37, 44, 52, 60};
+    static const int primary_keys[] = {'1', '2', '3', '4', '5', '6', '7', '8'};
+    static const int secondary_positions[] = {1, 8, 15, 21, 28};
+    static const int secondary_keys[] = {'m', 'u', 'e', 'a', 'q'};
+    const int *key_positions = event.y == LINES - 3
+        ? primary_positions : secondary_positions;
+    const int *shortcut_keys = event.y == LINES - 3
+        ? primary_keys : secondary_keys;
+    size_t key_count = event.y == LINES - 3
+        ? sizeof(primary_positions) / sizeof(primary_positions[0])
+        : sizeof(secondary_positions) / sizeof(secondary_positions[0]);
+    for (size_t index = 0; index < key_count; index++) {
+        int next_position = index + 1 < key_count ? key_positions[index + 1] : COLS;
+        if (event.x >= key_positions[index] && event.x < next_position) {
+            return shortcut_keys[index];
+        }
+    }
+    return ERR;
 }
 
 int main(void) {
@@ -910,6 +1149,15 @@ int main(void) {
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+        init_pair(COLOR_CRITICAL, COLOR_WHITE, COLOR_RED);
+        init_pair(COLOR_HIGH, COLOR_YELLOW, -1);
+        init_pair(COLOR_INFO, COLOR_CYAN, -1);
+    }
+    mousemask(ALL_MOUSE_EVENTS, NULL);
+    create_panel_windows();
     struct sigaction shutdown_action = {0};
     shutdown_action.sa_handler = handle_shutdown_signal;
     sigemptyset(&shutdown_action.sa_mask);
@@ -922,15 +1170,26 @@ int main(void) {
     pipe_action.sa_handler = SIG_IGN;
     sigemptyset(&pipe_action.sa_mask);
     if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
+        destroy_panel_windows();
         endwin();
         fprintf(stderr, "SIGPIPEハンドラーを設定できません: %s\n", strerror(errno));
         return 1;
     }
+    int thread_error = pthread_create(&telemetry_thread, NULL, telemetry_worker, NULL);
+    if (thread_error != 0) {
+        destroy_panel_windows();
+        endwin();
+        fprintf(stderr, "TUI telemetry workerを起動できません: %s\n",
+                strerror(thread_error));
+        return 1;
+    }
+    telemetry_thread_started = true;
 
     bool running = true;
     while (running && !close_requested) {
         draw_panel(&config);
         int key = getch();
+        if (key == KEY_MOUSE) key = mouse_shortcut_key();
         switch (key) {
             case 'm': {
                 int previous_mode = config.map_mode;
@@ -1002,6 +1261,9 @@ int main(void) {
     (void)request_secure_transport_state(false);
     if (!isolation_closed) stop_monitor();
     stop_dashboard();
+    atomic_store_explicit(&telemetry_stop, true, memory_order_relaxed);
+    if (telemetry_thread_started) pthread_join(telemetry_thread, NULL);
+    destroy_panel_windows();
     endwin();
     if (!key_wiped) {
         fprintf(stderr, "C暗号鍵の破棄に失敗しました。\n");

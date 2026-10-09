@@ -100,7 +100,8 @@ bash ./mk1-panel.sh
 - ChromebookはLinux開発環境 (Crostini) の端末で起動します。macOSはTerminalで起動します。WindowsはWSLとLinuxディストリビューションを用意し、コマンドプロンプトから `mk1-gui.cmd` を実行します (Windowsネイティブ版ではありません)。各環境にCコンパイラ、ncurses、OpenSSL開発ファイルおよび `pkg-config` が必要です。
 - ネイティブCのビルドと実行安全性テストは `make check` で実行できます。Linuxのfork子プロセスで `PR_SET_DUMPABLE` によるptrace拒否を試し、OpenSSL初期化/AES-256-GCMと `OPENSSL_cleanse` のゼロ化を検証します。libsodium・libbpf・liboqsは任意依存としてロード/API可用性/初期化を検査し、未導入の場合はSKIPを明示します。liboqs未検出時はパネルをPQC providerなしでビルドします。必須にする場合は `bash ./mk1-panel.sh --require-oqs` を指定してください。liboqsの開発パッケージがある環境ではC側の実ML-KEM-768 keygen/encapsulate/decapsulateとAES-GCM往復も実行します。`make analyze` はClang静的解析を実行します。
 - `[1]` は起動前警告に同意した後にDry-Run監視を起動します。Dry-Runは異常を検知しても通信を切断しないため、実際の遮断を提供しません。
-- `[3]` は監視開始前に全通信遮断の警告を表示し、続行には `y` と管理者認証が必要です。監視中は検知前の警告待ちやユーザー確認を挟まず、検知後すぐ全ネットワークインターフェースの停止を試行します。停止成功後に操作パネルとリモート画面サーバーを終了します。SSHや遠隔アクセスも例外なく切断する方針で、遠隔復旧経路は提供しません。誤検知やOSの権限・ファイアウォール・カーネルの制限により、遮断に失敗する可能性があります。ハードウェア・カーネルを迂回不能にする「絶対保証」ではありません。
+- `[3]` は監視開始前に全通信遮断の警告を表示し、続行には `y` と管理者認証が必要です。監視中は検知前の警告待ちやユーザー確認を挟まず、検知後に全ネットワークインターフェースの停止を試行します。停止成功後に操作パネルとリモート画面サーバーを終了します。SSHや遠隔アクセスも切断される可能性があり、遠隔復旧経路は提供しません。誤検知やOSの権限・ファイアウォール・カーネルの制限により、遮断に失敗する場合があります。
+- TUIはステータス、脅威イベントログ、RAM/swapメーターを分割表示し、レベル別カラー、対応端末でのマウスショートカット、キーボードガイドを提供します。pthread workerはstatus/logファイルを非同期に読み込み、ncurses描画と入力は単一UIスレッドで行います。テレメトリ更新間隔は約500msで、操作時の認証・設定ダイアログやOSコマンド実行が非同期になる保証ではありません。
 - `[4]` でNIC、RAM監視基準、通常/RSIモード、Colab HTTPS URLを編集できます。`[5]` はNIC一覧、`[6]` はGoogle Driveへ接続しないローカル検証です。監視中は処理パケット/秒、累計、脅威・バックドアリスク、隔離状態、RAM・swapを表示します。設定は `ai_data/panel-config.json` に権限 `0600` で保存し、ログは `ai_data/panel.log` に追記します。
 - `[m]` は地図モードを `OFF` → `Chrome` → `Local` の順に切り替えます。監視中は設定ファイルの変更を監視ループが反映し、OFFでは地図ワーカーを起動しません。Chromeモードは `127.0.0.1:9001/map` のWebSocketで、Chrome拡張Originからの読み取り専用接続だけを受け付けます。`MK1_MAP_EXTENSION_ORIGIN=chrome-extension://<拡張ID>` (カンマ区切りで複数可) を設定するとそのOriginだけに固定されます。未設定の場合は警告を出し、ローカルにインストールされた任意の拡張が接続できるため、使用する拡張IDの固定を推奨します。Localモードは外部通信をせず、イベントを `ai_data/map-events.jsonl` に保存します (Raylib描画はこのMVPには含みません)。
 - 地図イベントは脅威判定後に上限付きの非同期キューへ投入し、配信・保存は遮断処理と別スレッドで行います。イベントにはグローバルIPのみを含め、GeoIPデータセットがない位置、RSSIがない距離、パケットから確実に判別できないOSは `null` / `unknown` のままです。日本の市区町村や海外の行政区画、実座標を推定する機能ではありません。
@@ -187,7 +188,6 @@ sudo bash ./proxmox-transfer-registration.sh 101 100
 本番サインインはPasskeyに加えて、GmailとSMSへ並行送信する別々の6桁コードを両方要求します。メールまたはSMSの送信に失敗した場合はログインできません。メール/SMSは同一端末で閲覧可能な場合があり、暗号学的に独立した物理要素とは限りません。ブラウザー内に追加の2桁コードを表示しても独立要素にならないため、追加MFA因子としては実装していません。成功後の画面/APIは状態・検知アラートの読み取り専用です。設定変更、停止/起動、任意コマンド実行のAPIはありません。セッションは15分無操作または最大2時間で失効し、認証段階が進むたびにIDを再発行します。
 
 このPasskey + SMS OTP + Gmail OTPの3要素認証はHTTPSリモートダッシュボード用です。地図WebSocketはlocalhost上の読み取り専用テレメトリー経路で、リモート公開しないでください。Chromeモードを選んだときだけ `127.0.0.1:9001` をlistenします。
-
 systemdで起動する場合は [mk1-remote-dashboard.service](./mk1-remote-dashboard.service) を両コンテナに配置し、各コンテナの `/etc/mk1ai/remote-dashboard.env` に個別のロール・WireGuardアドレス・URLを設定します。サービスは `mk1ai` 非rootユーザー、`ProtectSystem=strict`、`NoNewPrivileges` で動作します。Pythonアプリはloopbackだけにbindし、NginxのみWireGuardアドレスへbindします。
 
 外部HTTPSは [mk1-remote-nginx.conf.template](./mk1-remote-nginx.conf.template) を実環境用に設定して使います。NginxをOpenSSL 3.5以降で構築し、TLS 1.3の `TLS_AES_256_GCM_SHA384` とハイブリッドPQC鍵交換 `X25519MLKEM768` だけを許可します。対応していないNginx/OpenSSLやクライアントでは接続が成立しません。古い鍵交換へのフォールバックを有効にしないでください。Passkey登録・リモートUIもこのHTTPS終端を通るため、TLSが成立しなければ画面/APIを使用できません。
@@ -476,13 +476,22 @@ Driveに接続できない場合は既存の `ai_data/gdrive_raw/` データ、�
 - **データが学習に使われない**: ファイルが `ai_data/gdrive_raw/` 以下にあるか、拡張子が `.json` / `.jsonl` か、各レコードに10個以上の数値を含む `features` があるか、更新ログを確認します。
 - **ネットワークが切断された**: Dry-Run でない場合、コンソールに出る復旧コマンドを確認し、ローカルコンソールからインターフェースやネットワークサービスを復旧します。リモート接続だけに頼って実行しないでください。
 
+## 開発ビルドと署名付きリリース
+
+通常の開発では、`make check` と unittest は既存のPythonソースをそのまま使い、署名検証やCythonを要求しません。リリース生成だけで `make release` を使います。リリースビルドにはCython 3.0.12、C compiler、OpenSSL、ncurses開発ヘッダー、`strip` が必要です。ビルドは `airgap_ai_defender.py` と `mk1_usb_guard.py` をCython共有ライブラリにし、Cパネルをビルドしてstripした後、Ed25519署名とSHA-256サイドカーを作ります。モデルチェックポイントは自動で収集せず、署名対象に含めるファイルを `MK1AI_MODEL_FILES` にリポジトリ相対パスで改行区切り指定します。
+
+秘密鍵はリポジトリへ保存せず、オフラインで生成して保管してください。CIを使う場合、GitHub Actionsの `release-signing` Environmentに `MK1AI_ED25519_PRIVATE_KEY` secretとしてPEMを登録し、Environmentのデプロイ保護ルールで署名可能なブランチ・タグを制限します。Workflowはmainへのpushと `v*` タグでビルド・署名・検証を行い、タグではGitHub Releaseも作成/更新します。秘密鍵を設定していない場合は署名工程を失敗させます。CI署名は設定済みの長期鍵によるため、Actionsと対象Environmentの保護が信頼境界です。
+
+生成バンドルは `python3 scripts/verify_release.py --bundle dist/mk1ai-release --public-key /trusted/path/release-signing.pub` で検証できます。`scripts/run_release.sh BUNDLE_DIR TRUSTED_PUBLIC_KEY COMMAND [ARG ...]` は検証成功後に指定コマンドを実行します。公開鍵はバンドル同梱版をそのまま信頼せず、信頼済みの別経路で取得・固定してください。アプリを直接起動するとこのランチャー検証を迂回できます。これは共有ライブラリとパネルの署名済みパッケージングであり、全Pythonアプリをスタンドアロン化するものではありません。
+
 ## テスト
 
-テストではPyTorch、NumPy、gdown、requests、psutil、cryptographyを使用します。アプリ本体は一部依存がない場合にstubへフォールバックしますが、その状態では学習・モデル・Drive連携などのテストは実行できません。まだ仮想環境を作成していない場合は、次のように依存を導入してからテストを実行してください。
+テストではPyTorch、NumPy、gdown、requests、psutil、cryptographyを使用します。実PyTorchがない場合はモデル・学習依存のテストをskipし、アプリ本体のstubを実PyTorchの代わりとしてテストしません。secure transportのテストはcryptographyとpqcryptoの両方がある場合だけ実行します。依存不足によるskipは成功を意味しないため、完全なテストには次のように依存を導入してください。
 
 ```bash
 python3 -m venv .venv-mk1
-.venv-mk1/bin/python -m pip install torch numpy psutil requests gdown cryptography
+.venv-mk1/bin/python -m pip install torch numpy psutil requests gdown
+.venv-mk1/bin/python -m pip install -r requirements-secure-transport.txt
 .venv-mk1/bin/python -m unittest discover -s tests -v
 ```
 

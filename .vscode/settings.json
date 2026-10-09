@@ -35,10 +35,6 @@
         "/^if test -e /workspaces/MK1Ai-project\\.zip; then printf 'EXISTS\\\\n'; else printf 'AVAILABLE\\\\n'; fi; du -sh \\. --exclude=\\.git --exclude='\\.venv\\*' --exclude=ai_data 2>/dev/null$/": {
             "approve": true,
             "matchCommandLine": true
-        },
-        "/^/workspaces/MK1Ai/\\.venv-mk1/bin/python -m pytest tests/ -q --ignore=tests/test_mk1_memory_guard\\.c$/": {
-            "approve": true,
-            "matchCommandLine": true
         }
     }
 }
