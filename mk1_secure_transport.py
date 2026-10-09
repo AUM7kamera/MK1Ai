@@ -14,6 +14,7 @@ import socket
 import stat
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -69,11 +70,18 @@ class TunnelControlServer:
             os.unlink(self.path)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(self.path)
+            # umask makes the socket 0600 at creation, so there is no window before chmod.
+            previous_umask = os.umask(0o177)
+            try:
+                listener.bind(self.path)
+            finally:
+                os.umask(previous_umask)
             sudo_uid = os.environ.get("SUDO_UID", "")
             sudo_gid = os.environ.get("SUDO_GID", "")
             if os.geteuid() == 0 and sudo_uid.isdigit() and sudo_gid.isdigit():
-                os.chown(self.path, int(sudo_uid), int(sudo_gid))
+                os.chown(
+                    self.path, int(sudo_uid), int(sudo_gid), follow_symlinks=False,
+                )
             os.chmod(self.path, 0o600)
             socket_stat = os.lstat(self.path)
             self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
@@ -260,6 +268,73 @@ def require_wireguard_full_tunnel(interface: str | None = None) -> str:
     return _verify_wireguard_full_tunnel(interface)
 
 
+_SYSTEM_EXECUTABLE_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+_TRUSTED_UID = 0
+_MAX_HANDSHAKE_AGE_SECONDS = 180
+_HANDSHAKE_FUTURE_SKEW_SECONDS = 5
+_DEFAULT_ROUTE_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/0"),
+    ipaddress.ip_network("::/0"),
+)
+
+
+def _path_entry_is_trusted(entry_stat: os.stat_result) -> bool:
+    return entry_stat.st_uid == _TRUSTED_UID and not (
+        entry_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    )
+
+
+def _trusted_system_executable(name: str) -> str:
+    """Resolve a system tool to an absolute path whose whole chain is root-owned."""
+    for directory in _SYSTEM_EXECUTABLE_DIRS:
+        candidate = os.path.join(directory, name)
+        try:
+            resolved = os.path.realpath(candidate, strict=True)
+            if not stat.S_ISREG(os.stat(resolved).st_mode) or not os.access(resolved, os.X_OK):
+                continue
+            chain = [resolved]
+            while chain[-1] != os.path.dirname(chain[-1]):
+                chain.append(os.path.dirname(chain[-1]))
+            if all(_path_entry_is_trusted(os.stat(entry)) for entry in chain):
+                return resolved
+        except OSError:
+            continue
+    raise SecureTransportError(f"No trusted system executable found for {name}")
+
+
+def _parse_allowed_ips(output: str) -> bool:
+    """True only when exact IPv4 and IPv6 default networks are allowed."""
+    found: set[ipaddress.IPv4Network | ipaddress.IPv6Network] = set()
+    for row in output.splitlines():
+        fields = row.split("\t", 1)
+        if len(fields) != 2:
+            continue
+        for token in re.split(r"[\s,]+", fields[1].strip()):
+            if not token or token == "(none)":
+                continue
+            try:
+                network = ipaddress.ip_network(token, strict=True)
+            except ValueError:
+                continue
+            if network in _DEFAULT_ROUTE_NETWORKS and token in ("0.0.0.0/0", "::/0"):
+                found.add(network)
+    return found == set(_DEFAULT_ROUTE_NETWORKS)
+
+
+def _has_recent_handshake(output: str, now: float) -> bool:
+    for row in output.splitlines():
+        fields = row.split()
+        if len(fields) != 2 or not fields[1].isascii() or not fields[1].isdigit():
+            continue
+        handshake = int(fields[1])
+        if handshake == 0:
+            continue
+        age = now - handshake
+        if -_HANDSHAKE_FUTURE_SKEW_SECONDS <= age <= _MAX_HANDSHAKE_AGE_SECONDS:
+            return True
+    return False
+
+
 def _verify_wireguard_full_tunnel(interface: str | None = None) -> str:
     interface = (interface or os.environ.get("MK1_WIREGUARD_INTERFACE", "wg0")).strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", interface):
@@ -269,37 +344,31 @@ def _verify_wireguard_full_tunnel(interface: str | None = None) -> str:
             "Fail-closed WireGuard route verification currently supports Linux only"
         )
 
+    def run(command: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=3,
+        )
+
     try:
-        peer = subprocess.run(
-            ["wg", "show", interface, "allowed-ips"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        ipv4_route = subprocess.run(
-            ["ip", "route", "get", "1.1.1.1"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        ipv6_route = subprocess.run(
-            ["ip", "-6", "route", "get", "2606:4700:4700::1111"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
+        wg = _trusted_system_executable("wg")
+        ip = _trusted_system_executable("ip")
+        peer = run([wg, "show", interface, "allowed-ips"])
+        handshakes = run([wg, "show", interface, "latest-handshakes"])
+        ipv4_route = run([ip, "route", "get", "1.1.1.1"])
+        ipv6_route = run([ip, "-6", "route", "get", "2606:4700:4700::1111"])
     except (OSError, subprocess.SubprocessError) as exc:
         raise SecureTransportError(
             "Unable to verify an active WireGuard full-tunnel route"
         ) from exc
 
-    allowed_ips = peer.stdout
-    if "0.0.0.0/0" not in allowed_ips or "::/0" not in allowed_ips:
+    if not _parse_allowed_ips(peer.stdout):
         raise SecureTransportError(
             f"WireGuard interface {interface} must allow IPv4 and IPv6 default routes"
+        )
+    if not _has_recent_handshake(handshakes.stdout, time.time()):
+        raise SecureTransportError(
+            f"WireGuard interface {interface} has no peer handshake in the last "
+            f"{_MAX_HANDSHAKE_AGE_SECONDS} seconds"
         )
     if not re.search(rf"\bdev\s+{re.escape(interface)}\b", ipv4_route.stdout):
         raise SecureTransportError("IPv4 default route is not using WireGuard")
@@ -313,7 +382,7 @@ def require_wireguard_address(interface: str, address: str) -> str:
     try:
         expected = ipaddress.ip_address(address)
         result = subprocess.run(
-            ["ip", "-o", "address", "show", "dev", interface],
+            [_trusted_system_executable("ip"), "-o", "address", "show", "dev", interface],
             check=True,
             capture_output=True,
             text=True,

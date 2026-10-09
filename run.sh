@@ -5,9 +5,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 chmod +x "$0" 2>/dev/null || true
 
-mkdir -p ai_data
+if [[ -x "$SCRIPT_DIR/.venv-mk1/bin/python" ]]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv-mk1/bin/python"
+else
+    PYTHON_BIN="${MK1_PYTHON_BIN:-python3}"
+fi
+
+mkdir -m 700 -p ai_data
+chmod 700 ai_data
 CONFIG_PATH="ai_data/config.json"
-python3 - "$CONFIG_PATH" <<'PY'
+"$PYTHON_BIN" - "$CONFIG_PATH" <<'PY'
 import json
 import os
 import sys
@@ -18,9 +25,12 @@ config_path = Path(sys.argv[1])
 try:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
-        config = {}
-except (OSError, json.JSONDecodeError):
+        raise ValueError("configuration must be a JSON object")
+except FileNotFoundError:
     config = {}
+except (OSError, json.JSONDecodeError, ValueError) as exc:
+    print(f"設定ファイルを読み込めません。既存ファイルは変更しません: {exc}", file=sys.stderr)
+    raise SystemExit(1)
 
 saved_endpoint = str(config.get("colab_endpoint", "") or "").strip()
 if saved_endpoint:
@@ -44,12 +54,11 @@ except OSError as exc:
     print(f"対話端末を利用できません。設定は変更せず終了します ({exc})", file=sys.stderr)
     raise SystemExit(1)
 
-config.update({
-    "ram_limit": 1500,
-    "mode": "RSI",
-    "compact_log": True,
-    "colab_endpoint": endpoint_input or saved_endpoint,
-})
+config.setdefault("ram_limit", 1500)
+config.setdefault("mode", "RSI")
+config.setdefault("compact_log", True)
+if endpoint_input:
+    config["colab_endpoint"] = endpoint_input
 
 temporary_path = None
 try:
@@ -70,4 +79,4 @@ except OSError as exc:
     raise SystemExit(1)
 PY
 
-exec python3 airgap_ai_defender.py --mode RSI --ram-limit 1500 --compact-log
+exec "$PYTHON_BIN" airgap_ai_defender.py --config "$CONFIG_PATH"

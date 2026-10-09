@@ -27,6 +27,8 @@ typedef int (*mk1_mlkem768_decapsulate_fn)(
     uint8_t shared_secret[MK1_MLKEM768_SHARED_SECRET_SIZE]
 );
 
+/* ML-KEM-768 establishes a shared secret but does not authenticate its peer;
+ * callers must obtain and verify public keys through a trusted channel. */
 typedef struct {
     void *context;
     mk1_mlkem768_encapsulate_fn encapsulate;

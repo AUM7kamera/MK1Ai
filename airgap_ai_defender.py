@@ -113,7 +113,9 @@ try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
+    TORCH_AVAILABLE = True
 except Exception:  # テスト/最小環境でも import できるように軽量なスタブを提供
+    TORCH_AVAILABLE = False
     class _DummyModule:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -257,18 +259,15 @@ except Exception:  # テスト/最小環境でも import できるように軽�
 
         @staticmethod
         def load(file: Any, *args: Any, **kwargs: Any) -> Any:
-            if hasattr(file, "read"):
-                return pickle.load(file)
-            with open(file, "rb") as model_file:
-                return pickle.load(model_file)
+            del file, args
+            if kwargs.get("weights_only") is True:
+                raise RuntimeError("PyTorch is required for safe weights-only model loading")
+            raise RuntimeError("PyTorch is unavailable; model loading is disabled")
 
         @staticmethod
         def save(value: Any, file: Any, *args: Any, **kwargs: Any) -> None:
-            if hasattr(file, "write"):
-                pickle.dump(value, file)
-            else:
-                with open(file, "wb") as model_file:
-                    pickle.dump(value, model_file)
+            del value, file, args, kwargs
+            raise RuntimeError("PyTorch is unavailable; model saving is disabled")
 
         @staticmethod
         def device(*args: Any, **kwargs: Any) -> Any:
@@ -2582,6 +2581,11 @@ def _usb_guard_process_main(
         log.critical("[USB] root権限がないためUSB隔離ワーカーを停止します。")
         return
     enabled = threading.Event()
+
+    def notify_usb_fatal(reason: str) -> None:
+        log.critical("[USB] %s", reason)
+        stop_event.set()
+
     monitor = USBHotplugMonitor(
         enabled=enabled,
         stop_event=stop_event,
@@ -2593,6 +2597,7 @@ def _usb_guard_process_main(
             interfaces,
             os.path.join(os.path.dirname(os.path.abspath(panel_config_path)), "tunnel-control.sock"),
         ),
+        on_fatal=notify_usb_fatal,
     )
     monitor_thread = threading.Thread(
         target=monitor.run, name="mk1-usb-hotplug", daemon=True,
@@ -6244,6 +6249,9 @@ def main():
     runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
+
+    if args.ignore_model_hash and not TORCH_AVAILABLE:
+        parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
 
     if args.panel_parent_pid < 0:
         parser.error("--panel-parent-pid は0以上で指定してください")

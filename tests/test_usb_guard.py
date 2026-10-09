@@ -3,10 +3,13 @@ import json
 import pathlib
 import shutil
 import subprocess
+import stat
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+import mk1_usb_guard
 from mk1_usb_guard import (
     USBHotplugMonitor,
     disable_network_interfaces,
@@ -58,11 +61,17 @@ class USBGuardTest(unittest.TestCase):
         self.assertEqual(event["ACTION"], "add")
         self.assertEqual(event["DEVPATH"], "/devices/1-2")
 
-    def test_hid_is_blocked_by_deny_all_policy(self):
+    def test_legacy_allowlist_cannot_authorize_spoofable_hid_descriptors(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir) / "usb"
             root.mkdir()
             device = self.make_device(root, device_class="00", interface_class="03", serial="kbd-serial")
+            allowlist = pathlib.Path(temp_dir) / "allowlist.json"
+            allowlist.write_text(json.dumps({
+                "version": 1,
+                "devices": [{"vid": "1234", "pid": "abcd", "serial": "kbd-serial"}],
+            }), encoding="utf-8")
+            allowlist.chmod(0o600)
             monitor = USBHotplugMonitor(
                 enabled=mock.Mock(is_set=mock.Mock(return_value=True)),
                 stop_event=mock.Mock(),
@@ -71,7 +80,8 @@ class USBGuardTest(unittest.TestCase):
 
             with mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
                 self.assertEqual(monitor.handle_uevent(self.add_event(device.device_id)), "blocked")
-            unbind.assert_called_once()
+
+            unbind.assert_called_once_with(root, device)
 
     def test_hid_without_serial_is_blocked_even_if_vid_and_pid_are_known(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -175,18 +185,41 @@ class USBGuardTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 verify_scan_guest(image_dir, public_key)
 
+    def test_scan_guest_rejects_writable_parent_directory(self):
+        image_dir = pathlib.Path("/var/lib/mk1ai/usb-scan-guest")
+        writable_parent = image_dir.parent
+        original_stat = pathlib.Path.stat
+
+        def parent_stat(path, *args, **kwargs):
+            if path == writable_parent:
+                return mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o775)
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(
+            pathlib.Path, "stat", autospec=True, side_effect=parent_stat,
+        ), self.assertRaisesRegex(ValueError, "ancestors"):
+            mk1_usb_guard._verify_root_owned_directory_ancestors(image_dir)
+
     def test_qemu_guest_has_no_network_and_requires_one_valid_verdict(self):
         device = mock.Mock(
             is_storage=True, bus_number=1, device_number=7,
         )
         process = mock.Mock()
-        process.communicate.return_value = (b"MK1_SCAN_RESULT=clean\n", b"")
+        process.stdout = mock.Mock()
+        process.stdout.fileno.return_value = 10
+        process.poll.return_value = 0
         process.returncode = 0
         with mock.patch("mk1_usb_guard.verify_scan_guest", return_value={
             "kernel": pathlib.Path("/trusted/vmlinuz"),
             "initramfs": pathlib.Path("/trusted/initramfs.cpio.gz"),
         }), mock.patch("mk1_usb_guard.shutil.which", return_value="/usr/bin/qemu-system-x86_64"), \
              mock.patch("mk1_usb_guard._trusted_system_executable", return_value="/usr/bin/qemu"), \
+             mock.patch("secrets.token_hex", return_value="test-nonce"), \
+             mock.patch("mk1_usb_guard.select.select", return_value=([process.stdout], [], [])), \
+             mock.patch(
+                 "mk1_usb_guard.os.read",
+                 side_effect=[b"MK1_SCAN_RESULT=test-nonce:clean\n", b""],
+             ), \
              mock.patch("mk1_usb_guard.subprocess.Popen", return_value=process) as popen:
             verdict = scan_usb_storage_in_guest(device, "/images", "/trusted.pub")
 
@@ -195,7 +228,101 @@ class USBGuardTest(unittest.TestCase):
         self.assertIn("-net", command)
         self.assertEqual(command[command.index("-net") + 1], "none")
         self.assertIn("hostbus=1,hostaddr=7", command[-1])
+        self.assertIn("mk1.scan_nonce=test-nonce", command[command.index("-append") + 1])
         self.assertIn("-sandbox", command)
+
+    def test_qemu_scan_rejects_mismatched_or_multiple_verdict_lines(self):
+        device = mock.Mock(is_storage=True, bus_number=1, device_number=7)
+
+        def run_with_output(output):
+            process = mock.Mock()
+            process.stdout = mock.Mock()
+            process.stdout.fileno.return_value = 10
+            process.poll.return_value = 0
+            process.returncode = 0
+            with mock.patch("mk1_usb_guard.verify_scan_guest", return_value={
+                "kernel": pathlib.Path("/trusted/vmlinuz"),
+                "initramfs": pathlib.Path("/trusted/initramfs.cpio.gz"),
+            }), mock.patch("mk1_usb_guard.shutil.which", return_value="/usr/bin/qemu"), \
+                 mock.patch("mk1_usb_guard._trusted_system_executable", return_value="/usr/bin/qemu"), \
+                 mock.patch("secrets.token_hex", return_value="expected"), \
+                 mock.patch("mk1_usb_guard.select.select", return_value=([process.stdout], [], [])), \
+                 mock.patch("mk1_usb_guard.os.read", side_effect=[output, b""]), \
+                 mock.patch("mk1_usb_guard.subprocess.Popen", return_value=process):
+                return scan_usb_storage_in_guest(device, "/images", "/trusted.pub")
+
+        with self.assertRaisesRegex(RuntimeError, "nonce"):
+            run_with_output(b"MK1_SCAN_RESULT=other:clean\n")
+        with self.assertRaisesRegex(RuntimeError, "unique verdict"):
+            run_with_output(
+                b"MK1_SCAN_RESULT=expected:clean\nMK1_SCAN_RESULT=expected:clean\n",
+            )
+
+    def test_qemu_scan_kills_guest_when_output_exceeds_limit(self):
+        device = mock.Mock(is_storage=True, bus_number=1, device_number=7)
+        process = mock.Mock()
+        process.stdout = mock.Mock()
+        process.stdout.fileno.return_value = 10
+        process.poll.return_value = 0
+        process.returncode = -9
+        with mock.patch("mk1_usb_guard.verify_scan_guest", return_value={
+            "kernel": pathlib.Path("/trusted/vmlinuz"),
+            "initramfs": pathlib.Path("/trusted/initramfs.cpio.gz"),
+        }), mock.patch("mk1_usb_guard.shutil.which", return_value="/usr/bin/qemu"), \
+             mock.patch("mk1_usb_guard._trusted_system_executable", return_value="/usr/bin/qemu"), \
+             mock.patch("secrets.token_hex", return_value="expected"), \
+             mock.patch("mk1_usb_guard.MAX_GUEST_OUTPUT_BYTES", 4), \
+             mock.patch("mk1_usb_guard.select.select", return_value=([process.stdout], [], [])), \
+             mock.patch("mk1_usb_guard.os.read", return_value=b"12345"), \
+             mock.patch("mk1_usb_guard.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(RuntimeError, "output limit"):
+                scan_usb_storage_in_guest(device, "/images", "/trusted.pub")
+
+        process.kill.assert_called_once()
+
+    def test_repeated_netlink_errors_keep_guard_enabled_and_notify_parent(self):
+        enabled = threading.Event()
+        enabled.set()
+        fatal = mock.Mock()
+        monitor = USBHotplugMonitor(
+            enabled=enabled,
+            stop_event=threading.Event(),
+            sysfs_root="/missing/usb/sysfs",
+            on_fatal=fatal,
+        )
+
+        for _ in range(3):
+            monitor._recover_netlink_error("mock ENOBUFS")
+
+        self.assertTrue(enabled.is_set())
+        fatal.assert_called_once()
+
+    def test_startup_sysfs_reconciliation_retries_and_notifies_after_repeated_failure(self):
+        enabled = threading.Event()
+        enabled.set()
+        stop_event = threading.Event()
+        fatal = mock.Mock(side_effect=lambda _reason: stop_event.set())
+        monitor = USBHotplugMonitor(
+            enabled=enabled,
+            stop_event=stop_event,
+            sysfs_root="/mock/usb/sysfs",
+            on_fatal=fatal,
+        )
+        netlink_socket = mock.Mock()
+
+        def stop_after_select(*_args):
+            stop_event.set()
+            return [], [], []
+
+        with mock.patch("mk1_usb_guard.list_hid_devices", return_value=[]), \
+             mock.patch("mk1_usb_guard.socket.socket", return_value=netlink_socket), \
+             mock.patch("mk1_usb_guard.select.select", side_effect=stop_after_select), \
+             mock.patch.object(monitor, "_reconcile_sysfs", return_value=False) as reconcile:
+            monitor.run()
+
+        self.assertTrue(enabled.is_set())
+        self.assertGreaterEqual(reconcile.call_count, 3)
+        fatal.assert_called_once()
 
     def test_unapproved_storage_scan_failure_leaves_device_unbound(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -311,7 +438,7 @@ class USBGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir) / "usb"
             root.mkdir()
-            device = self.make_device(root, device_class="03", interface_class="03", serial="")
+            device = self.make_device(root)
             monitor = USBHotplugMonitor(
                 enabled=mock.Mock(),
                 stop_event=mock.Mock(),
@@ -320,11 +447,51 @@ class USBGuardTest(unittest.TestCase):
             for _ in range(monitor._event_queue.maxsize):
                 monitor._event_queue.put_nowait(b"")
 
-            with mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
+            with mock.patch.object(monitor, "_unbind_storage_interfaces"), \
+                 mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
                 self.assertFalse(monitor._enqueue_uevent(self.add_event(device.device_id)))
-
             unbind.assert_called_once_with(root, device)
             self.assertIn(device.device_id, monitor._processed_devices)
+
+    def test_hid_is_unbound_while_storage_scan_worker_is_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir) / "usb"
+            root.mkdir()
+            storage = self.make_device(root, device_id="1-2")
+            hid = self.make_device(
+                root, device_id="1-3", device_class="03", interface_class="03", serial="",
+            )
+            enabled = threading.Event()
+            enabled.set()
+            stopped = threading.Event()
+            monitor = USBHotplugMonitor(
+                enabled=enabled, stop_event=stopped, sysfs_root=root,
+            )
+            scan_started = threading.Event()
+            release_scan = threading.Event()
+
+            def slow_scan(*_args, **_kwargs):
+                scan_started.set()
+                self.assertTrue(release_scan.wait(2))
+                return "clean"
+
+            worker = threading.Thread(target=monitor._event_worker, daemon=True)
+            with mock.patch("mk1_usb_guard.usb_storage_is_mounted", return_value=False), \
+                 mock.patch.object(monitor, "_unbind_storage_interfaces"), \
+                 mock.patch("mk1_usb_guard.scan_usb_storage_in_guest", side_effect=slow_scan), \
+                 mock.patch("mk1_usb_guard.unbind_usb_device", return_value=True) as unbind:
+                worker.start()
+                try:
+                    monitor._enqueue_uevent(self.add_event(storage.device_id))
+                    self.assertTrue(scan_started.wait(2))
+
+                    self.assertTrue(monitor._enqueue_uevent(self.add_event(hid.device_id)))
+                    unbind.assert_called_once_with(root, hid)
+                finally:
+                    release_scan.set()
+                    stopped.set()
+                    worker.join(2)
+                self.assertFalse(worker.is_alive())
 
 
 if __name__ == "__main__":

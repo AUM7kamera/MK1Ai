@@ -1,7 +1,4 @@
-"""Linux USB policy, signed scan-guest verification, and disposable QEMU scans.
-
-Release packaging contact: 山田 悠 (Yu Yamada).
-"""
+"""Linux USB policy, signed scan-guest verification, and disposable QEMU scans."""
 
 from __future__ import annotations
 
@@ -12,6 +9,7 @@ import os
 import queue
 import re
 import select
+import secrets
 import shutil
 import socket
 import stat
@@ -32,6 +30,7 @@ SERIAL_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 MAX_GUEST_KERNEL_BYTES = 128 * 1024 * 1024
 MAX_GUEST_INITRAMFS_BYTES = 768 * 1024 * 1024
 GUEST_TIMEOUT_SECONDS = 180
+MAX_GUEST_OUTPUT_BYTES = 1024 * 1024
 SCAN_RESULT_PREFIX = b"MK1_SCAN_RESULT="
 TRUSTED_EXECUTION_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -166,6 +165,8 @@ def verify_scan_guest(
         or (require_root_owned and image_dir_stat.st_uid != 0)
     ):
         raise ValueError("Scan-guest image directory must be protected and root-owned")
+    if require_root_owned:
+        _verify_root_owned_directory_ancestors(image_dir)
     manifest_path = image_dir / "manifest.json"
     signature_path = image_dir / "manifest.sig"
     public_key_stat = public_key.lstat()
@@ -240,6 +241,15 @@ def verify_scan_guest(
         "kernel": image_dir / "vmlinuz",
         "initramfs": image_dir / "initramfs.cpio.gz",
     }
+
+
+def _verify_root_owned_directory_ancestors(image_dir: Path) -> None:
+    for parent in image_dir.parents:
+        parent_stat = parent.stat()
+        if parent_stat.st_uid != 0 or parent_stat.st_mode & 0o022:
+            raise ValueError(
+                "Scan-guest image directory ancestors must be root-owned and non-writable"
+            )
 
 
 def unbind_usb_device(sysfs_root: str | Path, device: USBDevice) -> bool:
@@ -321,6 +331,7 @@ def scan_usb_storage_in_guest(
     if discovered_qemu is None:
         raise RuntimeError("qemu-system-x86_64 is not installed")
     qemu = _trusted_system_executable(discovered_qemu, "QEMU")
+    scan_nonce = secrets.token_hex(16)
     command = [
         qemu,
         "-nodefaults",
@@ -336,28 +347,49 @@ def scan_usb_storage_in_guest(
         "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
         "-kernel", str(images["kernel"]),
         "-initrd", str(images["initramfs"]),
-        "-append", "console=ttyS0 rdinit=/init panic=1",
+        "-append", f"console=ttyS0 rdinit=/init panic=1 mk1.scan_nonce={scan_nonce}",
         "-device", "qemu-xhci,id=usb",
         "-device", f"usb-host,hostbus={device.bus_number},hostaddr={device.device_number}",
     ]
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         env={"PATH": TRUSTED_EXECUTION_PATH, "HOME": "/"},
     )
+    if process.stdout is None:
+        process.kill()
+        process.wait()
+        raise RuntimeError("Disposable scan guest output pipe was not created")
     deadline = time.monotonic() + timeout_seconds
+    output = bytearray()
+    output_exceeded_limit = False
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or (stop_event is not None and stop_event.is_set()):
                 raise RuntimeError("USB scan guest timed out or was cancelled")
-            try:
-                output, error_output = process.communicate(timeout=min(0.5, remaining))
+            readable, _, _ = select.select(
+                [process.stdout], [], [], min(0.25, remaining),
+            )
+            if readable:
+                chunk = os.read(
+                    process.stdout.fileno(),
+                    min(65_536, MAX_GUEST_OUTPUT_BYTES + 1 - len(output)),
+                )
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > MAX_GUEST_OUTPUT_BYTES:
+                    output_exceeded_limit = True
+                    process.kill()
+                    break
+            elif process.poll() is not None:
                 break
-            except subprocess.TimeoutExpired:
-                continue
+        if output_exceeded_limit:
+            raise RuntimeError("Disposable scan guest exceeded its output limit")
+        process.wait(timeout=max(0.1, deadline - time.monotonic()))
     finally:
         if process.poll() is None:
             process.terminate()
@@ -367,15 +399,21 @@ def scan_usb_storage_in_guest(
                 process.kill()
                 process.wait()
     return_code = process.returncode
-    output = (output or b"") + (error_output or b"")
     reports = [
-        line[len(SCAN_RESULT_PREFIX):].strip()
-        for line in output.splitlines()
+        line
+        for line in bytes(output).splitlines()
         if line.startswith(SCAN_RESULT_PREFIX)
     ]
     if return_code != 0 or len(reports) != 1:
         raise RuntimeError("Disposable scan guest failed or returned no unique verdict")
-    verdict = reports[0].decode("ascii", errors="strict")
+    expected_prefix = SCAN_RESULT_PREFIX + scan_nonce.encode("ascii") + b":"
+    if not reports[0].startswith(expected_prefix):
+        raise RuntimeError("Disposable scan guest returned a mismatched nonce")
+    verdict_bytes = reports[0][len(expected_prefix):]
+    try:
+        verdict = verdict_bytes.decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Disposable scan guest returned an invalid verdict") from exc
     if verdict not in {"clean", "threat", "error"}:
         raise RuntimeError("Disposable scan guest returned an invalid verdict")
     return verdict
@@ -448,6 +486,8 @@ class USBHotplugMonitor:
         trusted_public_key: str | Path = "/etc/mk1ai/usb-scan-signing.pub",
         qemu_binary: str | None = None,
         on_threat: Any = None,
+        on_fatal: Any = None,
+        baseline_allow: bool | None = None,
     ) -> None:
         self.enabled = enabled
         self.stop_event = stop_event
@@ -456,12 +496,19 @@ class USBHotplugMonitor:
         self.trusted_public_key = Path(trusted_public_key)
         self.qemu_binary = qemu_binary
         self.on_threat = on_threat
+        self.on_fatal = on_fatal
+        self.baseline_allow = (
+            os.environ.get("MK1_USB_BASELINE_ALLOW") == "1"
+            if baseline_allow is None else baseline_allow
+        )
         self._processed_devices: set[str] = set()
         self._processed_devices_lock = threading.Lock()
         self._event_queue: queue.Queue[bytes] = queue.Queue(maxsize=64)
+        self._netlink_resync_failures = 0
 
     def run(self) -> None:
         monitor: socket.socket | None = None
+        baseline_checked = False
         worker_thread = threading.Thread(
             target=self._event_worker, name="mk1-usb-policy", daemon=True,
         )
@@ -471,11 +518,31 @@ class USBHotplugMonitor:
                 if monitor is not None:
                     monitor.close()
                     monitor = None
+                baseline_checked = False
                 self._drain_event_queue()
                 with self._processed_devices_lock:
                     self._processed_devices.clear()
                 self.stop_event.wait(0.25)
                 continue
+            if not baseline_checked:
+                baseline_checked = True
+                try:
+                    existing_hids = list_hid_devices(self.sysfs_root)
+                except OSError:
+                    self._recover_netlink_error("USB baseline enumeration failed")
+                    existing_hids = []
+                if existing_hids:
+                    LOGGER.warning(
+                        "USB guard found %d pre-existing HID device(s); baseline unbind may "
+                        "lock out local input devices",
+                        len(existing_hids),
+                    )
+                    if not self.baseline_allow:
+                        self._notify_fatal(
+                            "USB guard refused to unbind pre-existing HID devices; "
+                            "set MK1_USB_BASELINE_ALLOW=1 to opt in",
+                        )
+                        break
             if monitor is None:
                 try:
                     monitor = socket.socket(
@@ -484,24 +551,22 @@ class USBHotplugMonitor:
                     monitor.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262_144)
                     monitor.bind((os.getpid(), 1))
                     monitor.setblocking(False)
-                    try:
-                        for device_path in self.sysfs_root.iterdir():
-                            if identify_usb_device(self.sysfs_root, device_path.name) is None:
-                                continue
-                            self._enqueue_uevent(
-                                (
-                                    "ACTION=add\0SUBSYSTEM=usb\0DEVTYPE=usb_device\0"
-                                    f"DEVPATH=/sys/bus/usb/devices/{device_path.name}\0"
-                                ).encode("ascii")
-                            )
-                    except OSError:
-                        LOGGER.exception("Could not enumerate USB devices after enabling policy")
+                    LOGGER.info("USB uevent monitor started; reconciling current devices")
+                    if not self._reconcile_sysfs():
+                        monitor.close()
+                        monitor = None
+                        self._recover_netlink_error(
+                            "USB startup sysfs reconciliation failed",
+                        )
+                        self.stop_event.wait(0.25)
+                        continue
                 except OSError:
                     LOGGER.exception("Could not start the Linux USB uevent monitor")
                     if monitor is not None:
                         monitor.close()
                     monitor = None
-                    self.enabled.clear()
+                    self._recover_netlink_error("USB uevent socket creation failed")
+                    self.stop_event.wait(0.25)
                     continue
             try:
                 readable, _, _ = select.select([monitor], [], [], 0.25)
@@ -511,12 +576,50 @@ class USBHotplugMonitor:
                 if self.stop_event.is_set():
                     break
                 LOGGER.exception("USB uevent monitor failed")
-                self.enabled.clear()
+                if monitor is not None:
+                    monitor.close()
+                    monitor = None
+                self._recover_netlink_error("USB uevent receive failed")
         if monitor is not None:
             monitor.close()
         worker_thread.join(timeout=5)
         if worker_thread.is_alive():
             LOGGER.error("USB policy worker did not stop")
+
+    def _notify_fatal(self, reason: str) -> None:
+        LOGGER.critical("%s", reason)
+        if self.on_fatal is not None:
+            self.on_fatal(reason)
+
+    def _recover_netlink_error(self, reason: str) -> None:
+        LOGGER.error("%s; re-enumerating USB devices from sysfs", reason)
+        if self._reconcile_sysfs():
+            self._netlink_resync_failures = 0
+            return
+        self._netlink_resync_failures += 1
+        LOGGER.error(
+            "USB sysfs re-enumeration failed (%d consecutive failure(s))",
+            self._netlink_resync_failures,
+        )
+        if self._netlink_resync_failures >= 3:
+            self._notify_fatal(
+                "USB policy cannot re-enumerate sysfs after repeated netlink errors",
+            )
+
+    def _reconcile_sysfs(self) -> bool:
+        try:
+            devices = list(self.sysfs_root.iterdir())
+            for device_path in devices:
+                if identify_usb_device(self.sysfs_root, device_path.name) is not None:
+                    event = (
+                        "ACTION=add\0SUBSYSTEM=usb\0DEVTYPE=usb_device\0"
+                        f"DEVPATH=/sys/bus/usb/devices/{device_path.name}\0"
+                    ).encode("ascii")
+                    self._enqueue_uevent(event)
+        except OSError:
+            LOGGER.exception("Could not enumerate USB sysfs devices")
+            return False
+        return True
 
     def _event_worker(self) -> None:
         while not self.stop_event.is_set():
@@ -542,6 +645,16 @@ class USBHotplugMonitor:
             return True
         if event.get("ACTION") == "remove":
             self.handle_uevent(message)
+            return True
+        device_id = Path(event.get("DEVPATH", "")).name
+        device = identify_usb_device(self.sysfs_root, device_id)
+        if device is None or device.is_hub or device.is_hid or not device.is_storage:
+            try:
+                self.handle_uevent(message)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                LOGGER.exception("Immediate USB policy failed; attempting emergency unbind")
+                self._fail_closed_uevent(message, "immediate USB policy processing failed")
+                return False
             return True
         try:
             self._event_queue.put_nowait(message)
@@ -601,8 +714,16 @@ class USBHotplugMonitor:
         if device.is_hub:
             return "hub_ignored"
 
+        if device.is_hid and (
+            device.device_class not in {"00", "03"}
+            or device.interface_classes - {"03"}
+        ):
+            return self._unbind(device, "composite or non-HID interface is not permitted")
         if device.is_hid:
-            return self._unbind(device, "USB HID devices are denied by policy")
+            return self._unbind(
+                device,
+                "USB HID devices are blocked because descriptors do not authenticate device identity",
+            )
 
         if device.is_storage:
             try:
@@ -680,18 +801,22 @@ class USBHotplugMonitor:
 def _main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Inspect devices blocked by the Linux USB policy")
+    parser = argparse.ArgumentParser(
+        description="Inspect USB HID devices; the USB policy blocks all HID devices",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("list-hid", help="List connected HID devices (all are denied)")
-    args = parser.parse_args()
-
-    if args.command == "list-hid":
-        for device in list_hid_devices():
-            print(
-                f"{device.device_id} VID={device.vendor_id} PID={device.product_id} "
-                f"serial={device.serial or '<missing>'}"
-            )
-        return 0
+    subparsers.add_parser(
+        "list-hid",
+        help="List connected HID descriptors for diagnostics; they are not trusted",
+    )
+    parser.parse_args()
+    print("USB HID devices are always blocked; listed descriptors are not authenticated.")
+    for device in list_hid_devices():
+        print(
+            f"{device.device_id} VID={device.vendor_id} PID={device.product_id} "
+            f"serial={device.serial or '<missing>'}"
+        )
+    return 0
 
 
 if __name__ == "__main__":

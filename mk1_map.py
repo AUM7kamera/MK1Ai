@@ -15,6 +15,7 @@ import select
 import socket
 import threading
 import time
+from collections.abc import Iterable
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ MAX_LOCAL_CACHE_BYTES = 5 * 1024 * 1024
 MAX_CLIENTS = 8
 MAX_HANDSHAKE_BYTES = 8192
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+EXTENSION_ORIGIN_PATTERN = re.compile(r"chrome-extension://[A-Za-z0-9_-]{8,64}")
 
 
 class MapMode(IntEnum):
@@ -96,7 +98,11 @@ def _read_handshake(client: socket.socket) -> bytes:
     return bytes(request)
 
 
-def _accept_websocket(client: socket.socket, expected_host: str) -> bool:
+def _accept_websocket(
+    client: socket.socket,
+    expected_host: str,
+    allowed_origins: frozenset[str] = frozenset(),
+) -> bool:
     try:
         request = _read_handshake(client)
         lines = request.decode("latin-1").split("\r\n")
@@ -122,7 +128,8 @@ def _accept_websocket(client: socket.socket, expected_host: str) -> bool:
             or headers.get("host", "").lower() != expected_host.lower()
             or headers.get("sec-websocket-version") != "13"
             or len(decoded_key) != 16
-            or not re.fullmatch(r"chrome-extension://[A-Za-z0-9_-]{8,64}", origin)
+            or not EXTENSION_ORIGIN_PATTERN.fullmatch(origin)
+            or (allowed_origins and origin not in allowed_origins)
         ):
             return False
         accept = base64.b64encode(
@@ -150,9 +157,24 @@ class MapVisualizationService:
         local_directory: str | Path,
         host: str = "127.0.0.1",
         port: int = 9001,
+        allowed_origins: Iterable[str] | None = None,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("Map WebSocket must bind to 127.0.0.1")
+        if allowed_origins is None:
+            allowed_origins = [
+                item.strip()
+                for item in os.environ.get("MK1_MAP_EXTENSION_ORIGIN", "").split(",")
+                if item.strip()
+            ]
+        self.allowed_origins = frozenset(allowed_origins)
+        if not all(EXTENSION_ORIGIN_PATTERN.fullmatch(item) for item in self.allowed_origins):
+            raise ValueError("Map extension origin must look like chrome-extension://<id>")
+        if not self.allowed_origins:
+            LOGGER.warning(
+                "MK1_MAP_EXTENSION_ORIGIN is not set; any local Chrome extension may "
+                "connect to the loopback map socket",
+            )
         if not 0 <= port <= 65535:
             raise ValueError("Map WebSocket port is invalid")
         self.local_directory = Path(local_directory)
@@ -310,7 +332,7 @@ class MapVisualizationService:
                                 break
                             raise
                         if len(clients) >= MAX_CLIENTS or not _accept_websocket(
-                            client, expected_host,
+                            client, expected_host, self.allowed_origins,
                         ):
                             client.close()
                         else:

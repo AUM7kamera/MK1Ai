@@ -213,8 +213,8 @@ static bool run_wireguard_link_state(const char *interface, bool enabled) {
         return false;
     }
     if (child == 0) {
-        execlp("sudo", "sudo", "-n", "ip", "link", "set", "dev", interface,
-               enabled ? "up" : "down", (char *)NULL);
+        execlp("sudo", "sudo", "-n", "/usr/local/sbin/mk1-wg-link",
+               interface, enabled ? "up" : "down", (char *)NULL);
         _exit(127);
     }
     int status = -1;

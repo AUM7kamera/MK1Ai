@@ -31,9 +31,9 @@ $(BUILD_DIR):
 
 panel: $(BUILD_DIR)/mk1-panel
 
-$(BUILD_DIR)/mk1-panel: mk1_panel.c mk1_memory_guard.c mk1_tunnel.c $(OQS_SOURCE) mk1_memory_guard.h mk1_tunnel.h mk1_tunnel_oqs.h | $(BUILD_DIR)
+$(BUILD_DIR)/mk1-panel: mk1_panel.c mk1_memory_guard.c mk1_path_trust.c mk1_tunnel.c $(OQS_SOURCE) mk1_memory_guard.h mk1_tunnel.h mk1_tunnel_oqs.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -pthread $(NCURSES_CFLAGS) $(OPENSSL_CFLAGS) $(OQS_CFLAGS) \
-		mk1_panel.c mk1_memory_guard.c mk1_tunnel.c $(OQS_SOURCE) $(NCURSES_LIBS) $(OPENSSL_LIBS) $(OQS_LIBS) -o "$@"
+		mk1_panel.c mk1_memory_guard.c mk1_path_trust.c mk1_tunnel.c $(OQS_SOURCE) $(NCURSES_LIBS) $(OPENSSL_LIBS) $(OQS_LIBS) -o "$@"
 
 $(BUILD_DIR)/mk1_test_runner: mk1_test_runner.c mk1_memory_guard.c mk1_tunnel.c $(OQS_SOURCE) mk1_memory_guard.h mk1_tunnel.h mk1_tunnel_oqs.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(OPENSSL_CFLAGS) $(OQS_CFLAGS) $(OQS_RUNNER_FLAGS) -pthread \
@@ -48,14 +48,18 @@ $(BUILD_DIR)/test_mk1_memory_guard: tests/test_mk1_memory_guard.c mk1_memory_gua
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(OPENSSL_CFLAGS) \
 		tests/test_mk1_memory_guard.c mk1_memory_guard.c $(OPENSSL_LIBS) -o "$@"
 
-test: $(BUILD_DIR)/mk1_test_runner $(BUILD_DIR)/test_mk1_tunnel $(BUILD_DIR)/test_mk1_memory_guard
+$(BUILD_DIR)/test_mk1_path_trust: tests/test_mk1_path_trust.c mk1_path_trust.c mk1_path_trust.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -UNDEBUG tests/test_mk1_path_trust.c mk1_path_trust.c -o "$@"
+
+test: $(BUILD_DIR)/mk1_test_runner $(BUILD_DIR)/test_mk1_tunnel $(BUILD_DIR)/test_mk1_memory_guard $(BUILD_DIR)/test_mk1_path_trust
 	"$(BUILD_DIR)/mk1_test_runner"
 	"$(BUILD_DIR)/test_mk1_tunnel"
 	"$(BUILD_DIR)/test_mk1_memory_guard"
+	"$(BUILD_DIR)/test_mk1_path_trust"
 
 analyze: | $(BUILD_DIR)
 	clang --analyze -Xanalyzer -analyzer-output=text $(CPPFLAGS) $(WARNINGS) -pthread $(NCURSES_CFLAGS) $(OPENSSL_CFLAGS) $(OQS_CFLAGS) \
-		mk1_panel.c mk1_memory_guard.c mk1_tunnel.c $(OQS_SOURCE)
+		mk1_panel.c mk1_memory_guard.c mk1_path_trust.c mk1_tunnel.c $(OQS_SOURCE)
 
 check: panel test analyze
 

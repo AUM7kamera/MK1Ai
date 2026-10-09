@@ -4,7 +4,11 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
 report() {
-    printf 'MK1_SCAN_RESULT=%s\n' "$1" >/dev/console
+    scan_nonce="$(sed -n 's/.*mk1\.scan_nonce=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null)"
+    case "$scan_nonce" in
+        ''|*[!a-fA-F0-9]*) scan_nonce="" ;;
+    esac
+    printf 'MK1_SCAN_RESULT=%s:%s\n' "$scan_nonce" "$1" >/dev/console
     sync
     poweroff -f
 }

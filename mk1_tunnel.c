@@ -238,13 +238,16 @@ int mk1_tunnel_encrypt(
     uint8_t tag[MK1_TUNNEL_TAG_SIZE]
 ) {
     EVP_CIPHER_CTX *context = NULL;
+    uint8_t empty_output = 0;
+    uint8_t *output = ciphertext != NULL ? ciphertext : &empty_output;
     int output_length = 0;
+    int aad_length_processed = 0;
     int final_length = 0;
     int result = -1;
 
     if (!buffers_valid(plaintext, plaintext_length, aad, aad_length,
                        ciphertext, ciphertext_capacity, ciphertext_length)
-        || ciphertext == NULL || nonce == NULL || tag == NULL
+        || nonce == NULL || tag == NULL
         || ciphertext_capacity < plaintext_length) {
         errno = EINVAL;
         return -1;
@@ -268,13 +271,23 @@ int mk1_tunnel_encrypt(
     if (RAND_bytes(nonce, MK1_TUNNEL_NONCE_SIZE) != 1
         || EVP_EncryptInit_ex(context, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1
         || EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_IVLEN, MK1_TUNNEL_NONCE_SIZE, NULL) != 1
-        || EVP_EncryptInit_ex(context, NULL, NULL, session_key, nonce) != 1
-        || (aad_length > 0 && EVP_EncryptUpdate(context, NULL, &output_length, aad, (int)aad_length) != 1)
-        || (plaintext_length > 0
-            && EVP_EncryptUpdate(context, ciphertext, &output_length, plaintext, (int)plaintext_length) != 1)
+        || EVP_EncryptInit_ex(context, NULL, NULL, session_key, nonce) != 1) {
+        errno = EIO;
+        goto cleanup;
+    }
+    if (aad_length > 0
+        && EVP_EncryptUpdate(
+            context, NULL, &aad_length_processed, aad, (int)aad_length
+        ) != 1) {
+        errno = EIO;
+        goto cleanup;
+    }
+    output_length = 0;
+    if ((plaintext_length > 0
+            && EVP_EncryptUpdate(context, output, &output_length, plaintext, (int)plaintext_length) != 1)
         || output_length < 0
         || (size_t)output_length > ciphertext_capacity
-        || EVP_EncryptFinal_ex(context, ciphertext + output_length, &final_length) != 1
+        || EVP_EncryptFinal_ex(context, output + output_length, &final_length) != 1
         || final_length < 0
         || (size_t)final_length > ciphertext_capacity - (size_t)output_length
         || EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_GET_TAG, MK1_TUNNEL_TAG_SIZE, tag) != 1) {
@@ -313,13 +326,16 @@ int mk1_tunnel_decrypt(
     size_t *plaintext_length
 ) {
     EVP_CIPHER_CTX *context = NULL;
+    uint8_t empty_output = 0;
+    uint8_t *output = plaintext != NULL ? plaintext : &empty_output;
     int output_length = 0;
+    int aad_length_processed = 0;
     int final_length = 0;
     int result = -1;
 
     if (!buffers_valid(ciphertext, ciphertext_length, aad, aad_length,
                        plaintext, plaintext_capacity, plaintext_length)
-        || plaintext == NULL || nonce == NULL || tag == NULL
+        || nonce == NULL || tag == NULL
         || plaintext_capacity < ciphertext_length) {
         errno = EINVAL;
         return -1;
@@ -340,14 +356,24 @@ int mk1_tunnel_decrypt(
     }
     if (EVP_DecryptInit_ex(context, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1
         || EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_IVLEN, MK1_TUNNEL_NONCE_SIZE, NULL) != 1
-        || EVP_DecryptInit_ex(context, NULL, NULL, session_key, nonce) != 1
-        || (aad_length > 0 && EVP_DecryptUpdate(context, NULL, &output_length, aad, (int)aad_length) != 1)
-        || (ciphertext_length > 0
-            && EVP_DecryptUpdate(context, plaintext, &output_length, ciphertext, (int)ciphertext_length) != 1)
+        || EVP_DecryptInit_ex(context, NULL, NULL, session_key, nonce) != 1) {
+        errno = EBADMSG;
+        goto cleanup;
+    }
+    if (aad_length > 0
+        && EVP_DecryptUpdate(
+            context, NULL, &aad_length_processed, aad, (int)aad_length
+        ) != 1) {
+        errno = EBADMSG;
+        goto cleanup;
+    }
+    output_length = 0;
+    if ((ciphertext_length > 0
+            && EVP_DecryptUpdate(context, output, &output_length, ciphertext, (int)ciphertext_length) != 1)
         || output_length < 0
         || (size_t)output_length > plaintext_capacity
         || EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_TAG, MK1_TUNNEL_TAG_SIZE, (void *)tag) != 1
-        || EVP_DecryptFinal_ex(context, plaintext + output_length, &final_length) != 1
+        || EVP_DecryptFinal_ex(context, output + output_length, &final_length) != 1
         || final_length < 0
         || (size_t)final_length > plaintext_capacity - (size_t)output_length) {
         errno = EBADMSG;

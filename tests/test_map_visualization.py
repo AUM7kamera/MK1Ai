@@ -101,6 +101,49 @@ class MapVisualizationTest(unittest.TestCase):
 
             service.close()
 
+    @staticmethod
+    def _handshake_status(port, origin):
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            client.settimeout(2)
+            key = base64.b64encode(b"0123456789abcdef").decode("ascii")
+            client.sendall((
+                "GET /map HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                f"Origin: {origin}\r\n\r\n"
+            ).encode("ascii"))
+            try:
+                return client.recv(1024)
+            except (ConnectionResetError, socket.timeout):
+                return b""
+
+    def test_pinned_extension_origin_rejects_other_extensions(self):
+        pinned = "chrome-extension://abcdefghijklmnop"
+        with tempfile.TemporaryDirectory() as directory:
+            service = MapVisualizationService(directory, port=0, allowed_origins=[pinned])
+            service.set_mode(MapMode.CHROME)
+            assert service.address is not None
+            port = service.address[1]
+            try:
+                self.assertIn(b"101", self._handshake_status(port, pinned))
+                self.assertNotIn(
+                    b"101",
+                    self._handshake_status(port, "chrome-extension://qrstuvwxyzabcdef"),
+                )
+                self.assertNotIn(
+                    b"101", self._handshake_status(port, pinned.upper()),
+                )
+            finally:
+                service.close()
+
+    def test_invalid_pinned_origin_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "origin"):
+                MapVisualizationService(directory, allowed_origins=["https://example.com"])
+
     def test_non_loopback_bind_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "127.0.0.1"):

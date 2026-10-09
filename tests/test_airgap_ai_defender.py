@@ -1,4 +1,5 @@
 import hashlib
+import builtins
 import importlib.util
 import io
 import json
@@ -52,6 +53,42 @@ requires_aesgcm = unittest.skipUnless(
 
 
 class AirgapSecurityHelpersTest(unittest.TestCase):
+    def test_torch_stub_never_uses_pickle_fallback(self):
+        original_import = builtins.__import__
+
+        def without_torch(name, *args, **kwargs):
+            if name == "torch" or name.startswith("torch."):
+                raise ImportError("torch deliberately unavailable in this test")
+            return original_import(name, *args, **kwargs)
+
+        fallback_spec = importlib.util.spec_from_file_location(
+            "airgap_ai_defender_without_torch", MODULE_PATH,
+        )
+        assert fallback_spec is not None and fallback_spec.loader is not None
+        fallback_module: Any = importlib.util.module_from_spec(fallback_spec)
+        with mock.patch("builtins.__import__", side_effect=without_torch):
+            fallback_spec.loader.exec_module(fallback_module)
+
+        with mock.patch.object(
+            fallback_module.pickle, "load", side_effect=AssertionError("pickle.load called"),
+        ), mock.patch.object(
+            fallback_module.pickle, "dump", side_effect=AssertionError("pickle.dump called"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PyTorch"):
+                fallback_module.torch.load(io.BytesIO(b"unsafe"), weights_only=True)
+            with self.assertRaisesRegex(RuntimeError, "PyTorch"):
+                fallback_module.torch.load(io.BytesIO(b"unsafe"), weights_only=False)
+            with self.assertRaisesRegex(RuntimeError, "PyTorch"):
+                fallback_module.torch.save({}, io.BytesIO())
+
+    def test_ignore_model_hash_is_refused_without_torch(self):
+        with mock.patch.object(module, "TORCH_AVAILABLE", False), \
+             mock.patch.object(module, "_merge_runtime_config", return_value={}), \
+             mock.patch("sys.argv", ["airgap_ai_defender.py", "--ignore-model-hash"]):
+            with self.assertRaises(SystemExit) as error:
+                module.main()
+        self.assertEqual(error.exception.code, 2)
+
     def test_capset_rejects_ids_outside_its_v3_abi(self):
         with mock.patch.object(module.platform, "system", return_value="Linux"):
             self.assertFalse(module._set_linux_capabilities(permitted={64}))

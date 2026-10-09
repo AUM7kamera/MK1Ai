@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -68,7 +68,7 @@ OTP_LIFETIME_SECONDS = 300
 OTP_MAX_ATTEMPTS = 5
 RATE_LIMIT_WINDOW_SECONDS = 300
 RATE_LIMIT_REQUESTS = 12
-COOKIE_NAME = "mk1_session"
+COOKIE_NAME = "__Host-mk1_session"
 
 
 @dataclass(frozen=True)
@@ -108,7 +108,7 @@ class DashboardConfig:
         config = cls(
             host=os.environ.get("MK1_REMOTE_HOST", "127.0.0.1"),
             port=port,
-            origin=os.environ.get("MK1_REMOTE_ORIGIN", ""),
+            origin=os.environ.get("MK1_REMOTE_ORIGIN", "").rstrip("/").lower(),
             rp_id=os.environ.get("MK1_REMOTE_RP_ID", ""),
             rp_name=os.environ.get("MK1_REMOTE_RP_NAME", "MK1Ai Security Console"),
             wireguard_interface=os.environ.get("MK1_WIREGUARD_INTERFACE", "wg0"),
@@ -242,7 +242,7 @@ class DashboardState:
 
         self.lock = threading.RLock()
         self.sessions: dict[str, dict[str, Any]] = {}
-        self.rate_limits: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+        self.rate_limits: OrderedDict[tuple[str, str], deque[float]] = OrderedDict()
         self.bootstrap_token: str | None = None
         if config.role == "enrollment" and not self.has_credentials():
             self.bootstrap_token = self._ensure_bootstrap_token()
@@ -491,14 +491,30 @@ class DashboardState:
                     self.rate_limits.pop(rate_key, None)
             key = (address, route)
             if key not in self.rate_limits and len(self.rate_limits) >= 4096:
-                return False
-            requests = self.rate_limits[key]
+                self.rate_limits.popitem(last=False)
+            requests = self.rate_limits.setdefault(key, deque())
+            self.rate_limits.move_to_end(key)
             while requests and now - requests[0] > RATE_LIMIT_WINDOW_SECONDS:
                 requests.popleft()
             if len(requests) >= RATE_LIMIT_REQUESTS:
                 return False
             requests.append(now)
+            self.rate_limits.move_to_end(key)
             return True
+
+    def rotate_session(
+        self, session_id: str, session: dict[str, Any],
+    ) -> str:
+        now = time.time()
+        with self.lock:
+            if self.sessions.get(session_id) is not session:
+                raise RuntimeError("認証セッションを再発行できません")
+            self.sessions.pop(session_id)
+            new_session_id = secrets.token_urlsafe(32)
+            session["csrf"] = secrets.token_urlsafe(32)
+            session["last_seen"] = now
+            self.sessions[new_session_id] = session
+            return new_session_id
 
     def code_digest(self, code: str, purpose: str) -> str:
         return hmac.new(
@@ -659,6 +675,7 @@ class RemoteDashboardServer(ThreadingHTTPServer):
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "MK1Ai"
     sys_version = ""
+    timeout = 10
 
     @property
     def state(self) -> DashboardState:
@@ -667,7 +684,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format_string: str, *args: Any) -> None:
         del format_string
         status = args[3] if len(args) > 3 else "request"
-        LOGGER.info("remote-dashboard %s %s", self.client_address[0], status)
+        LOGGER.info("remote-dashboard %s %s", self._client_ip(), status)
+
+    def _client_ip(self) -> str:
+        try:
+            remote = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return self.client_address[0]
+        if remote != ipaddress.IPv4Address("127.0.0.1"):
+            return str(remote)
+        forwarded_for = self.headers.get("X-Forwarded-For", "")
+        forwarded_address = forwarded_for.rsplit(",", 1)[-1].strip()
+        try:
+            return str(ipaddress.ip_address(forwarded_address))
+        except ValueError:
+            return str(remote)
 
     def _headers(self, content_type: str = "application/json; charset=utf-8") -> None:
         self.send_header("Content-Type", content_type)
@@ -721,8 +752,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.FORBIDDEN, "Host header is not allowed")
             return False
         origin = self.headers.get("Origin")
-        if (require_origin and origin != self.state.config.origin) or (
-            origin is not None and origin != self.state.config.origin
+        normalized_origin = origin.rstrip("/").lower() if origin is not None else None
+        expected_origin = self.state.config.origin.rstrip("/").lower()
+        if (require_origin and normalized_origin != expected_origin) or (
+            origin is not None and normalized_origin != expected_origin
         ):
             self._error(HTTPStatus.FORBIDDEN, "Origin is not allowed")
             return False
@@ -766,7 +799,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return payload
 
     def _check_rate_limit(self, route: str) -> bool:
-        if self.state.allow_request(self.client_address[0], route):
+        if self.state.allow_request(self._client_ip(), route):
             return True
         self._error(HTTPStatus.TOO_MANY_REQUESTS, "Too many requests")
         return False
@@ -813,28 +846,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._check_host_and_origin(require_origin=True):
             return
-        if not self._check_rate_limit(self.path):
-            return
-        registration_route = self.path in ("/api/register/options", "/api/register/verify")
-        if (self.state.config.role == "enrollment") != registration_route:
+        route = urlsplit(self.path).path
+        registration_routes = {"/api/register/options", "/api/register/verify"}
+        login_routes = {
+            "/api/auth/options", "/api/auth/verify", "/api/otp/verify", "/api/logout",
+        }
+        allowed_routes = registration_routes if self.state.config.role == "enrollment" else login_routes
+        if route not in allowed_routes:
             self._error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        if not self._check_rate_limit(route):
             return
         try:
             payload = self._read_json_body()
-            if self.path == "/api/register/options":
+            if route == "/api/register/options":
                 self._registration_options(payload)
-            elif self.path == "/api/register/verify":
+            elif route == "/api/register/verify":
                 self._registration_verify(payload)
-            elif self.path == "/api/auth/options":
+            elif route == "/api/auth/options":
                 self._authentication_options()
-            elif self.path == "/api/auth/verify":
+            elif route == "/api/auth/verify":
                 self._authentication_verify(payload)
-            elif self.path == "/api/otp/verify":
+            elif route == "/api/otp/verify":
                 self._otp_verify(payload)
-            elif self.path == "/api/logout":
+            elif route == "/api/logout":
                 self._logout(payload)
-            else:
-                self._error(HTTPStatus.NOT_FOUND, "Not found")
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             LOGGER.info("認証リクエストを拒否しました: %s", type(exc).__name__)
             self._error(HTTPStatus.BAD_REQUEST, "Invalid request")
@@ -946,7 +982,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
 
     def _authentication_verify(self, payload: dict[str, Any]) -> None:
-        _, session = self._request_session()
+        old_session_id, session = self._request_session()
         if (
             session is None
             or session.get("stage") != "authentication"
@@ -981,14 +1017,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.state.update_sign_count(credential_id, verification.new_sign_count)
         session.pop("challenge", None)
         self.state.issue_otp(session)
+        if old_session_id is None:
+            raise RuntimeError("認証セッションIDがありません")
+        session_id = self.state.rotate_session(old_session_id, session)
         self._send_json(HTTPStatus.OK, {
-            "stage": "otp",
-            "message": "Passkey verified. Enter both verification codes.",
+            "stage": session["stage"],
+            "message": (
+                "Passkey verified. Enter both verification codes."
+                if session["stage"] == "otp" else "Verification codes could not be sent."
+            ),
             "csrf": session["csrf"],
-        })
+        }, cookie=self._set_session_cookie(session_id))
 
     def _otp_verify(self, payload: dict[str, Any]) -> None:
-        _, session = self._request_session()
+        session_id, session = self._request_session()
         if (
             session is None
             or session.get("stage") != "otp"
@@ -1022,7 +1064,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         session["authenticated_at"] = time.time()
         session.pop("email_code_digest", None)
         session.pop("sms_code_digest", None)
-        self._send_json(HTTPStatus.OK, {"authenticated": True})
+        if session_id is None:
+            raise RuntimeError("認証セッションIDがありません")
+        new_session_id = self.state.rotate_session(session_id, session)
+        self._send_json(
+            HTTPStatus.OK,
+            {"authenticated": True, "csrf": session["csrf"]},
+            cookie=self._set_session_cookie(new_session_id),
+        )
 
     def _logout(self, payload: dict[str, Any]) -> None:
         session_id, session = self._authorized_session(require_csrf=True)
