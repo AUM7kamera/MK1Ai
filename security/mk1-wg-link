@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    printf 'Usage: %s INTERFACE up|down\n' "$0" >&2
+    exit 2
+fi
+
+interface="$1"
+state="$2"
+case "$interface" in
+    ''|*[!A-Za-z0-9_.-]*)
+        printf 'Invalid interface name\n' >&2
+        exit 2
+        ;;
+esac
+if [ "${#interface}" -gt 15 ]; then
+    printf 'Invalid interface name\n' >&2
+    exit 2
+fi
+case "$state" in
+    up|down) ;;
+    *)
+        printf 'State must be up or down\n' >&2
+        exit 2
+        ;;
+esac
+
+exec /usr/sbin/ip link set dev "$interface" "$state"

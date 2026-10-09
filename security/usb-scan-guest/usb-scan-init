@@ -1,0 +1,88 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+report() {
+    scan_nonce="$(sed -n 's/.*mk1\.scan_nonce=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null)"
+    case "$scan_nonce" in
+        ''|*[!a-fA-F0-9]*) scan_nonce="" ;;
+    esac
+    printf 'MK1_SCAN_RESULT=%s:%s\n' "$scan_nonce" "$1" >/dev/console
+    sync
+    poweroff -f
+}
+
+mount -t proc proc /proc 2>/dev/null || report error
+mount -t sysfs sysfs /sys 2>/dev/null || report error
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || report error
+mdev -s
+
+for module in xhci_pci usb_storage uas; do
+    modprobe "$module" 2>/dev/null || :
+done
+for module in vfat exfat ntfs3 ext4 iso9660 udf; do
+    modprobe "$module" 2>/dev/null || :
+done
+
+attempt=0
+disk_found=0
+while [ "$attempt" -lt 15 ]; do
+    for block in /sys/class/block/sd*; do
+        if [ -d "$block" ]; then
+            disk_found=1
+            break
+        fi
+    done
+    [ "$disk_found" -eq 1 ] && break
+    sleep 1
+    attempt=$((attempt + 1))
+done
+[ "$disk_found" -eq 1 ] || report error
+mdev -s
+
+mkdir -p /mnt/usb
+scan_failed=0
+threat_found=0
+
+scan_volume() {
+    device="$1"
+    mount -o ro,nodev,nosuid,noexec "$device" /mnt/usb || {
+        scan_failed=1
+        return
+    }
+    clamscan --recursive --infected --no-summary /mnt/usb >/dev/null 2>&1
+    scan_status=$?
+    umount /mnt/usb || scan_failed=1
+    case "$scan_status" in
+        0) ;;
+        1) threat_found=1 ;;
+        *) scan_failed=1 ;;
+    esac
+}
+
+found_volume=0
+for block in /sys/class/block/sd*; do
+    [ -d "$block" ] || continue
+    [ -f "$block/partition" ] && continue
+    disk_name="${block##*/}"
+    disk_has_partitions=0
+    for partition in /sys/class/block/"$disk_name"[0-9]*; do
+        [ -f "$partition/partition" ] || continue
+        disk_has_partitions=1
+        found_volume=1
+        scan_volume "/dev/${partition##*/}"
+    done
+    if [ "$disk_has_partitions" -eq 0 ]; then
+        found_volume=1
+        scan_volume "/dev/$disk_name"
+    fi
+done
+
+if [ "$threat_found" -eq 1 ]; then
+    report threat
+elif [ "$scan_failed" -eq 1 ] || [ "$found_volume" -eq 0 ]; then
+    report error
+else
+    report clean
+fi
