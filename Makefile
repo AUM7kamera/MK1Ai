@@ -22,7 +22,7 @@ NCURSES_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(NCURSES_PACKAGE))
 NCURSES_LIBS := $(shell $(PKG_CONFIG) --libs $(NCURSES_PACKAGE))
 BUILD_DIR ?= .build
 
-.PHONY: all panel test analyze check clean
+.PHONY: all panel test analyze check release clean
 
 all: panel
 
@@ -62,6 +62,9 @@ analyze: | $(BUILD_DIR)
 		mk1_panel.c mk1_memory_guard.c mk1_path_trust.c mk1_tunnel.c $(OQS_SOURCE)
 
 check: panel test analyze
+
+release:
+	bash scripts/build_release.sh
 
 clean:
 	rm -rf "$(BUILD_DIR)"
