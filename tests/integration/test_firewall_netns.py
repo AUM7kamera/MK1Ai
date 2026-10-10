@@ -213,7 +213,8 @@ finally:
             ["ip", "netns", "exec", self.quarantine_ns, "nft", "-f", "-"],
             check=False,
             input_text=(
-                "destroy table inet mk1ai_quarantine\n"
+                "add table inet mk1ai_quarantine\n"
+                "delete table inet mk1ai_quarantine\n"
                 "add table inet mk1ai_quarantine\n"
                 "add chain inet mk1ai_quarantine duplicate\n"
                 "add rule inet mk1ai_missing input drop\n"
@@ -242,6 +243,23 @@ finally:
                 "mk1ai_egress",
             ).stdout,
         )
+
+    def test_removal_deletes_only_quarantine_table(self):
+        self._apply_policy()
+        code = """
+from mk1_firewall import remove_nft_policy
+raise SystemExit(0 if remove_nft_policy() else 1)
+"""
+        self._in_namespace(self.quarantine_ns, sys.executable, "-c", code)
+        gone = self._run(
+            ["ip", "netns", "exec", self.quarantine_ns, "nft", "list", "table",
+             "inet", "mk1ai_quarantine"], check=False)
+        self.assertNotEqual(gone.returncode, 0)
+        self.assertIn("mk1ai_egress", self._in_namespace(
+            self.quarantine_ns, "nft", "list", "table", "inet", "mk1ai_egress",
+        ).stdout)
+        # removal is idempotent when the table is already absent
+        self._in_namespace(self.quarantine_ns, sys.executable, "-c", code)
 
     def _assert_traffic_policy(self):
         time.sleep(0.1)

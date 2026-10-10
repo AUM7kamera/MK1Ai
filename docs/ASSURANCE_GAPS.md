@@ -127,3 +127,9 @@ prototype is not equivalent to an enforced or verified system property.
 
 Until these gaps are closed and independently evaluated, the implementation
 must be described as a prototype with unverified controls, not an EAL7 TOE.
+
+## nftables legacy compatibility (unverified)
+- The `nft-legacy-netns` CI job (Debian 12 / Ubuntu 22.04) has not been run; the
+  minimum nft version 0.9.0 is untested on older releases.
+- Kernel-side feature availability (inet family, priority -10 hooks) is only
+  verified indirectly through the netns tests.

@@ -65,6 +65,33 @@ jobs:
         run: clang --version
       - name: Bandit (medium and above)
         run: bandit -q -r airgap_ai_defender.py mk1_usb_guard.py mk1_remote_dashboard.py mk1_secure_transport.py mk1_memory_guard.py mk1_map.py mk1_key_derivation.py mk1_key_backup.py mk1_hybrid_kem.py mk1_session_ratchet.py mk1_key_registry.py mk1_quorum.py mk1_quorum_cli.py mk1_external_verifier.py mk1_external_verifier_cli.py --severity-level medium
+  nft-legacy-netns:
+    name: nftables netns (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "ubuntu:22.04"]
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y git iproute2 nftables python3 python3-pip python3-venv
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: nft version
+        run: nft --version
+      - name: Install test dependencies
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -r requirements-key-management.txt -r requirements-remote.txt -r requirements-secure-transport.txt pytest
+      - name: Unit tests for nft rendering
+        run: /tmp/venv/bin/python -m pytest -q tests/test_firewall_nft.py
+      - name: netns integration (applies real rules)
+        run: MK1_RUN_NETNS_TESTS=1 /tmp/venv/bin/python -m pytest -q tests/integration/test_firewall_netns.py
+
   build-sign:
     if: github.event_name != 'pull_request' && (github.event_name != 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-24.04
