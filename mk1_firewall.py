@@ -3,13 +3,66 @@
 from __future__ import annotations
 
 import ipaddress
+ codespace-probable-dollop-pj64p66j94jv29wg6
 import os
 from pathlib import Path
+
+import logging
+import os
+from pathlib import Path
+import re
+ main
 import shutil
 import stat
 import subprocess
 
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
+MIN_NFT_VERSION = (0, 9, 0)
+NFT_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/"}
+_NFT_VERSION_RE = re.compile(r"nftables v(\d+)\.(\d+)\.(\d+)")
+_log = logging.getLogger(__name__)
+last_nft_failure: str | None = None
+
+
+def render_nft_removal() -> str:
+    """Batch that removes only the MK1Ai quarantine table (no ``destroy``)."""
+    return (
+        "add table inet mk1ai_quarantine\n"
+        "delete table inet mk1ai_quarantine\n"
+    )
+
+
+def _fail(reason: str) -> bool:
+    global last_nft_failure
+    last_nft_failure = reason
+    _log.error("[NFT] %s", reason)
+    return False
+
+
+def check_nft_support(path: str) -> str | None:
+    """Return None if nft is usable, else a human-readable reason (fail-closed)."""
+    try:
+        version = subprocess.run(
+            [path, "--version"], text=True, check=False, capture_output=True,
+            timeout=10, env=NFT_ENV,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"nft のバージョンを取得できません: {exc}"
+    match = _NFT_VERSION_RE.search(version.stdout or "")
+    if version.returncode != 0 or match is None:
+        return "nft のバージョンを判定できません"
+    found = tuple(int(part) for part in match.groups())
+    if found < MIN_NFT_VERSION:
+        return (
+            "nft %s は非対応です (必要: %s 以上)"
+            % (".".join(map(str, found)), ".".join(map(str, MIN_NFT_VERSION)))
+        )
+    return None
+
+
+ main
 def is_valid_ip_address(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -64,10 +117,20 @@ def apply_nft_policy(
     )
     try:
         path = _trusted_nft_binary(nft_binary)
+ codespace-probable-dollop-pj64p66j94jv29wg6
     except OSError:
         return False
     if path is None:
         return False
+
+    except OSError as exc:
+        return _fail(f"nft バイナリを信頼できません: {exc}")
+    if path is None:
+        return _fail("nft が見つかりません")
+    unsupported = check_nft_support(path)
+    if unsupported is not None:
+        return _fail(unsupported)
+ main
     try:
         result = subprocess.run(
             [path, "-f", "-"],
@@ -78,9 +141,40 @@ def apply_nft_policy(
             timeout=10,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/"},
         )
+ codespace-probable-dollop-pj64p66j94jv29wg6
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
+
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _fail(f"nft の実行に失敗しました: {exc}")
+    if result.returncode != 0:
+        return _fail("nft バッチが拒否されました (旧ルールは保持): " + (result.stderr or "").strip()[:200])
+    return True
+
+
+def remove_nft_policy(nft_binary: str | None = None) -> bool:
+    """Remove only the quarantine table in one batch; mk1ai_egress is untouched."""
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        return False
+    try:
+        path = _trusted_nft_binary(nft_binary)
+    except OSError as exc:
+        return _fail(f"nft バイナリを信頼できません: {exc}")
+    if path is None:
+        return _fail("nft が見つかりません")
+    unsupported = check_nft_support(path)
+    if unsupported is not None:
+        return _fail(unsupported)
+    try:
+        result = subprocess.run(
+            [path, "-f", "-"], input=render_nft_removal(), text=True,
+            check=False, capture_output=True, timeout=10, env=NFT_ENV,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _fail(f"nft の実行に失敗しました: {exc}")
+    return result.returncode == 0 or _fail("nft 解除バッチが失敗しました")
+ main
 
 
 def _trusted_nft_binary(binary: str | None) -> str | None:
@@ -114,7 +208,14 @@ def render_nft_transaction(
         mode, management_ips, management_ports,
     )
     lines = [
+ codespace-probable-dollop-pj64p66j94jv29wg6
         "destroy table inet mk1ai_quarantine",
+
+        # "add" first makes "delete" succeed on tables that do not exist yet;
+        # "destroy" is avoided because older nft releases reject it.
+        "add table inet mk1ai_quarantine",
+        "delete table inet mk1ai_quarantine",
+ main
         "add table inet mk1ai_quarantine",
         (
             "add chain inet mk1ai_quarantine input "

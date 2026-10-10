@@ -39,10 +39,14 @@ int mk1_tunnel_oqs_provider_init(mk1_mlkem768_provider *provider) {
     provider->context = NULL;
     provider->encapsulate = NULL;
     provider->decapsulate = NULL;
+ codespace-probable-dollop-pj64p66j94jv29wg6
     if (OQS_init() != OQS_SUCCESS) {
         errno = EIO;
         return -1;
     }
+
+    OQS_init();
+ main
 
     OQS_KEM *kem = OQS_KEM_new("ML-KEM-768");
     if (kem == NULL) {
