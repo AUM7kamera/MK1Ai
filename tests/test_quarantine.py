@@ -5,9 +5,18 @@ import os
 import pathlib
 import tempfile
 import unittest
+import base64
 from unittest import mock
 
-from mk1_quarantine import QuarantineError, QuarantineStateStore, STATE_FILE
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from mk1_quarantine import (
+    QuarantineError,
+    QuarantineStateStore,
+    STATE_FILE,
+    _release_message,
+)
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -29,8 +38,8 @@ class QuarantineStateTest(unittest.TestCase):
             expected_uid=self.uid,
             strict_ancestors=False,
             approver_keys=(
-                self.state_directory / "approver-1.pub",
-                self.state_directory / "approver-2.pub",
+                ("node-1", self.state_directory / "approver-1.pub"),
+                ("node-2", self.state_directory / "approver-2.pub"),
             ),
             nft_apply=self.nft_apply,
             nft_remove=self.nft_remove,
@@ -87,17 +96,13 @@ class QuarantineStateTest(unittest.TestCase):
             management_ips=[],
             management_ports=[],
         )
-        signatures = []
-        for name in ("sig-1", "sig-2"):
-            signature = self.state_directory / name
-            signature.write_bytes(b"signature")
-            signatures.append(signature)
+        bundle = self.state_directory / "approvals.json"
+        bundle.write_bytes(b'{"version":1,"approvals":[]}')
 
         with mock.patch.object(self.store, "_verify_approvals") as verify:
             self.assertTrue(self.store.release(
                 challenge_document["challenge"],
-                signatures[0],
-                signatures[1],
+                bundle,
             ))
         verify.assert_called_once()
         self.nft_remove.assert_called_once_with()
@@ -108,15 +113,59 @@ class QuarantineStateTest(unittest.TestCase):
         self.assertTrue(self.store.enforce())
         self.nft_apply.assert_not_called()
 
+    def test_release_checks_real_two_of_three_remote_signer_approvals(self):
+        signer_keys = {
+            f"node-{index}": Ed25519PrivateKey.generate()
+            for index in range(1, 4)
+        }
+        roster = []
+        for signer_id, private_key in signer_keys.items():
+            key_path = self.state_directory / f"{signer_id}.pub"
+            key_path.write_bytes(private_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            ))
+            key_path.chmod(0o600)
+            roster.append((signer_id, key_path))
+        store = QuarantineStateStore(
+            self.state_directory,
+            expected_uid=self.uid,
+            strict_ancestors=False,
+            approver_keys=tuple(roster),
+            nft_apply=self.nft_apply,
+            nft_remove=self.nft_remove,
+            airgap_disable=self.airgap_disable,
+        )
+        challenge = json.loads(store.issue_challenge())
+        message = _release_message(
+            challenge["generation"],
+            challenge["challenge"],
+        )
+        bundle_path = self.state_directory / "signed-approvals.json"
+        bundle_path.write_text(json.dumps({
+            "version": 1,
+            "approvals": [
+                {
+                    "signer_id": signer_id,
+                    "signature": base64.b64encode(
+                        signer_keys[signer_id].sign(message),
+                    ).decode("ascii"),
+                }
+                for signer_id in ("node-1", "node-3")
+            ],
+        }), encoding="ascii")
+
+        self.assertTrue(store.release(challenge["challenge"], bundle_path))
+        self.assertEqual(self.read_state()["state"], "released")
+        self.nft_remove.assert_called_once_with()
+
     def test_missing_stale_or_invalid_approvals_leave_state_quarantined(self):
         first = json.loads(self.store.issue_challenge())
         second = json.loads(self.store.issue_challenge())
-        signature_one = self.state_directory / "one.sig"
-        signature_two = self.state_directory / "two.sig"
-        signature_one.write_bytes(b"one")
-        signature_two.write_bytes(b"two")
+        bundle = self.state_directory / "approvals.json"
+        bundle.write_bytes(b'{"version":1,"approvals":[]}')
         with self.assertRaisesRegex(QuarantineError, "mismatched"):
-            self.store.release(first["challenge"], signature_one, signature_two)
+            self.store.release(first["challenge"], bundle)
         self.assertEqual(self.read_state()["state"], "quarantined")
 
         with mock.patch.object(
@@ -124,20 +173,18 @@ class QuarantineStateTest(unittest.TestCase):
             side_effect=QuarantineError("An operator release signature is invalid"),
         ):
             with self.assertRaisesRegex(QuarantineError, "signature is invalid"):
-                self.store.release(second["challenge"], signature_one, signature_two)
+                self.store.release(second["challenge"], bundle)
         self.assertEqual(self.read_state()["state"], "quarantined")
         self.nft_remove.assert_not_called()
 
     def test_release_firewall_failure_rolls_state_back_to_quarantine(self):
         challenge = json.loads(self.store.issue_challenge())
-        first = self.state_directory / "first.sig"
-        second = self.state_directory / "second.sig"
-        first.write_bytes(b"one")
-        second.write_bytes(b"two")
+        bundle = self.state_directory / "approvals.json"
+        bundle.write_bytes(b'{"version":1,"approvals":[]}')
         self.nft_remove.return_value = False
         with mock.patch.object(self.store, "_verify_approvals"):
             with self.assertRaisesRegex(QuarantineError, "remove nftables"):
-                self.store.release(challenge["challenge"], first, second)
+                self.store.release(challenge["challenge"], bundle)
         self.assertEqual(self.read_state()["state"], "quarantined")
         self.assertEqual(self.nft_apply.call_count, 2)
 

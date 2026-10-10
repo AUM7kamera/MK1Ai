@@ -289,6 +289,11 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertIn("isolation_active=1\n", content)
         self.assertIn("memory_guard_active=1\n", content)
         self.assertIn("alert=AIRGAP\n", content)
+        self.assertIn("effective_profile=unclaimed_S0\n", content)
+        self.assertIn("hardware_trust=none_optional_layer_only\n", content)
+        self.assertIn("mutual_verification=none\n", content)
+        self.assertIn("local_adaptation_enabled=0\n", content)
+        self.assertIn("assurance_warning=full_endpoint_compromise_loses_assurance\n", content)
         self.assertEqual(status_mode, 0o600)
         self.assertEqual(remaining_temporary_files, [])
 
@@ -410,7 +415,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         status = module._format_compact_status(252, 1500, 4.5, 0.05, "Connected", "RSI", True)
         self.assertEqual(
             status,
-            "[STATUS] RAM: 252MB/1500MB | Swap: 4.5MB | Score: 0.05 | Colab: Connected | Model: Disabled | Mode: RSI (Dry-Run)",
+            "[STATUS] RAM: 252MB/1500MB | Swap: 4.5MB | Score: 0.05 | Colab: Connected | Model: Disabled | Mode: RSI (Dry-Run) | Effective profile: unclaimed/S0 | Hardware trust: none (optional layer only) | No mutual verification: full endpoint compromise loses assurance",
         )
 
     def test_derive_cloud_model_urls_from_rsi_endpoint(self):
@@ -524,6 +529,32 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(result["reason"], "PQC public-key pin required")
         secure_request.assert_not_called()
 
+    def test_cloud_model_apply_does_not_enable_local_feedback_when_adaptation_disabled(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        state_dict = model.state_dict()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = os.path.join(temp_dir, "local_adaptation.pth")
+            feedback_dir = pathlib.Path(temp_dir) / "curated"
+            feedback_dir.mkdir()
+            (feedback_dir / "reviewed_feedback.jsonl").write_text(
+                json.dumps({"features": [0.5] * 10, "label": 0}) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(module, "_PENDING_CLOUD_STATE", state_dict), \
+                 mock.patch.object(module, "_PENDING_CLOUD_REVIEWED", True), \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", False), \
+                 mock.patch.object(module, "_HEAD_B_REVIEWED", True), \
+                 mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", {0, 1}), \
+                 mock.patch.object(module, "_MODEL_SYNC_STATUS", "Updated"), \
+                 mock.patch.object(module, "load_raw_data_from_files") as load_feedback, \
+                 mock.patch.object(module, "train_local_whitelist") as train:
+                self.assertTrue(module._apply_pending_cloud_model(model, checkpoint_path))
+
+                self.assertFalse(module._HEAD_B_REVIEWED)
+                self.assertEqual(module._HEAD_B_REVIEWED_LABELS, set())
+                load_feedback.assert_not_called()
+                train.assert_not_called()
+
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -559,6 +590,34 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["block"])
         self.assertNotEqual(result["stage"], "ai")
+
+    def test_high_ai_score_is_advisory_and_cannot_block(self):
+        features = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5]
+        with mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             mock.patch.object(module, "parse_packet_transport", return_value=None), \
+             mock.patch.object(module, "analyze_packet_security_markers", return_value=[]), \
+             mock.patch.object(module, "_compute_behavioral_signature_score", return_value=0.0), \
+             mock.patch.object(module, "_compute_unknown_behavior_score", return_value=0.0):
+            result = module.inspect_packet_pipeline(
+                b"x" * 64,
+                "lo",
+                feature_vector=features,
+                dpi_result={"suspicious": True, "score": 0.99, "findings": []},
+            )
+
+        self.assertFalse(result["block"])
+        self.assertEqual(result["stage"], "advisory")
+        self.assertGreaterEqual(result["advisory"]["ai_score"], 0.88)
+
+    def test_oversized_frame_is_blocked_by_fixed_length_rule(self):
+        result = module.inspect_packet_pipeline(
+            b"x" * (module._MAX_ENFORCED_FRAME_BYTES + 1),
+            "eth0",
+            dpi_result={"suspicious": False},
+        )
+
+        self.assertTrue(result["block"])
+        self.assertEqual(result["stage"], "frame_length")
 
     def test_selected_feature_capture_is_bounded_atomic_and_feature_only(self):
         record = {"features": [0.25] * 10, "label": 0}
@@ -978,6 +1037,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 json.dumps({"features": [0.8] * 10, "label": 1}),
             ]) + "\n", encoding="utf-8")
             with mock.patch.object(module, "download_from_gdrive_folder") as download, \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
                  mock.patch.object(module, "train_local_whitelist") as train:
                 result = module._run_lightweight_training_validation(
                     temp_dir,
@@ -1002,6 +1062,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 json.dumps(record) + "\n", encoding="utf-8",
             )
             with mock.patch.object(module, "download_from_gdrive_folder") as download, \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
                  mock.patch.object(module, "train_local_whitelist") as train:
                 result = module._run_lightweight_training_validation(
                     temp_dir,
@@ -1026,7 +1087,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
             with mock.patch.object(
                 module, "download_from_gdrive_folder", side_effect=download_to_local,
-            ) as download, mock.patch.object(module, "train_local_whitelist") as train:
+            ) as download, mock.patch.object(
+                module, "_LOCAL_ADAPTATION_ENABLED", True,
+            ), mock.patch.object(module, "train_local_whitelist") as train:
                 result = module._run_lightweight_training_validation(
                     temp_dir,
                     "folder-id",
@@ -1038,14 +1101,68 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         download.assert_called_once_with("folder-id", os.path.join(temp_dir, "gdrive_raw"))
         train.assert_called_once()
 
+    def test_validation_refuses_local_adaptation_while_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "download_from_gdrive_folder") as download:
+            result = module._run_lightweight_training_validation(
+                temp_dir,
+                "folder-id",
+                max_samples=1,
+            )
+
+        self.assertEqual(result, 3)
+        download.assert_not_called()
+
+    def test_validation_cli_refuses_before_rsi_or_filesystem_work(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_dir = os.path.join(temp_dir, "data")
+            with mock.patch("sys.argv", [
+                "airgap_ai_defender.py",
+                "--validation-only",
+                "--mode", "RSI",
+                "--local-dir", local_dir,
+            ]), mock.patch.object(module, "_merge_runtime_config", return_value={}), \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", False), \
+                 mock.patch.object(module, "_start_colab_rsi_request") as start_rsi:
+                result = module.main()
+
+        self.assertEqual(result, 3)
+        self.assertFalse(os.path.exists(local_dir))
+        start_rsi.assert_not_called()
+
     def test_training_queue_is_bounded(self):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
+
+    def test_local_adaptation_is_disabled_by_default(self):
+        torch = module.torch
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        original_head_b = model.head_b[0].weight.detach().clone()
+        optimizer = module.torch.optim.SGD(model.parameters(), lr=0.01)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
+            module.train_local_whitelist(
+                model,
+                optimizer,
+                [{"features": [0.2] * 10}, {"features": [0.8] * 10}],
+                checkpoint_path=checkpoint_path,
+            )
+
+            self.assertFalse(module._LOCAL_ADAPTATION_ENABLED)
+            self.assertFalse(pathlib.Path(checkpoint_path).exists())
+            self.assertFalse(pathlib.Path(checkpoint_path + ".sha256").exists())
+            self.assertFalse(module._load_local_adaptation(model, checkpoint_path))
+            torch.testing.assert_close(model.head_b[0].weight, original_head_b)
+
+        with mock.patch.object(module, "_train_queue") as train_queue:
+            self.assertTrue(module._enqueue_training_batch([{"features": [0.2] * 10}]))
+            train_queue.put.assert_not_called()
 
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
              mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
              tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
             model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1074,6 +1191,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
     def test_local_feedback_checkpoint_marks_both_reviewed_classes(self):
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
              mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
              tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
             model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1092,12 +1210,13 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         original_queue = module._train_queue
         full_queue = mock.Mock()
         full_queue.put.side_effect = [queue.Full, None]
-        try:
-            module._train_queue = full_queue
-            self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
-            self.assertEqual(full_queue.put.call_count, 2)
-        finally:
-            module._train_queue = original_queue
+        with mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True):
+            try:
+                module._train_queue = full_queue
+                self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
+                self.assertEqual(full_queue.put.call_count, 2)
+            finally:
+                module._train_queue = original_queue
 
     def test_monitor_candidates_never_enqueue_training_batches(self):
         candidates = []
@@ -1194,12 +1313,35 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             module.evaluate_threat_state("eth0", dry_run=True, score_a=0.1, backdoor_detected=True)
             kill_switch.assert_called_once_with("eth0", True)
 
-    def test_handle_packet_event_triggers_kill_switch_when_threat_active(self):
-        with mock.patch.object(module, "execute_kill_switch") as kill_switch:
+    def test_handle_packet_event_does_not_enforce_advisory_backdoor_score(self):
+        original_triggered = module._KILL_SWITCH_TRIGGERED
+        original_risk = module._BACKDOOR_RISK_SCORE
+        try:
             module._KILL_SWITCH_TRIGGERED = False
             module._BACKDOOR_RISK_SCORE = 0.9
-            module.handle_packet_event(b"\x00", "eth0", dry_run=True)
-            kill_switch.assert_called_once_with("eth0", True)
+            with mock.patch.object(module, "evaluate_threat_state") as evaluate:
+                self.assertFalse(module.handle_packet_event(b"\x00", "eth0", dry_run=True))
+                evaluate.assert_not_called()
+        finally:
+            module._KILL_SWITCH_TRIGGERED = original_triggered
+            module._BACKDOOR_RISK_SCORE = original_risk
+
+    def test_process_backdoor_findings_are_advisory_only(self):
+        original_risk = module._BACKDOOR_RISK_SCORE
+        try:
+            module._BACKDOOR_RISK_SCORE = 0.0
+            with mock.patch.object(module, "evaluate_threat_state") as evaluate:
+                boost = module.apply_backdoor_findings([{
+                    "type": "external_connection",
+                    "pid": 123,
+                    "name": "unknown-process",
+                    "remote": "203.0.113.10:9000",
+                }])
+
+            self.assertGreater(boost, 0.0)
+            evaluate.assert_not_called()
+        finally:
+            module._BACKDOOR_RISK_SCORE = original_risk
 
     def test_is_google_drive_whitelisted_packet_never_bypasses_traffic(self):
         gdrive_packet = self._build_ipv4_tcp_packet("1.2.3.4", "8.8.8.8", 443)
@@ -2315,13 +2457,13 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertFalse(result["suspicious"])
         self.assertLess(result["score"], 0.5)
 
-    def test_inspect_packet_pipeline_blocks_on_dpi_suspicious_payload(self):
+    def test_inspect_packet_pipeline_blocks_on_fixed_payload_signature(self):
         packet = self._build_ipv4_tcp_packet("1.1.1.1", "2.2.2.2", 80)
         suspicious_payload = b"eval(cmd)"
         dpi_result = module.analyze_dpi_payload(packet + suspicious_payload)
         result = module.inspect_packet_pipeline(packet + suspicious_payload, "eth0", dpi_result=dpi_result)
         self.assertTrue(result["block"])
-        self.assertEqual(result["stage"], "dpi")
+        self.assertEqual(result["stage"], "signature")
 
     def test_untrained_model_keeps_independent_packet_risk_score(self):
         packet = self._build_ipv4_tcp_packet("1.1.1.1", "2.2.2.2", 443)

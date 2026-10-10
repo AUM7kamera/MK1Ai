@@ -1,0 +1,87 @@
+free c: channel.
+free user_factor: bitstring [private].
+free hardware_factor: bitstring.
+free fido_factor: bitstring.
+free server_auth_sk: bitstring [private].
+free payload: bitstring [private].
+
+fun derive_root(bitstring, bitstring, bitstring): bitstring.
+fun derive_session(bitstring, bitstring, bitstring, bitstring): bitstring.
+fun pk(bitstring): bitstring.
+fun auth_pk(bitstring): bitstring.
+fun sign_server(bitstring, bitstring): bitstring.
+fun encaps(bitstring, bitstring): bitstring.
+fun request_mac(bitstring, bitstring, bitstring): bitstring.
+fun response_mac(bitstring, bitstring, bitstring): bitstring.
+fun aenc(bitstring, bitstring): bitstring.
+reduc forall sk:bitstring, shared:bitstring;
+  shared_secret_for_server(encaps(pk(sk), shared), sk) = shared.
+reduc forall message:bitstring, sk:bitstring;
+  check_server_signature(sign_server(message, sk), auth_pk(sk)) = message.
+reduc forall message:bitstring, key:bitstring;
+  adec(aenc(message, key), key) = message.
+
+event client_sent(bitstring, bitstring).
+event server_accepted(bitstring, bitstring).
+event server_responded(bitstring, bitstring).
+event client_accepted(bitstring, bitstring).
+event server_consumed(bitstring).
+
+query attacker(payload).
+query nonce:bitstring, ciphertext:bitstring;
+  inj-event(server_accepted(nonce, ciphertext))
+  ==> inj-event(client_sent(nonce, ciphertext)).
+query nonce:bitstring, ciphertext:bitstring;
+  inj-event(client_accepted(nonce, ciphertext))
+  ==> inj-event(server_responded(nonce, ciphertext)).
+
+process
+  out(c, hardware_factor);
+  out(c, fido_factor);
+  let trusted_server_key = auth_pk(server_auth_sk) in
+  (
+    !(
+      new ephemeral_sk:bitstring;
+      new nonce:bitstring;
+      let public_key = pk(ephemeral_sk) in
+      let signed_parameters = sign_server((public_key, nonce), server_auth_sk) in
+      out(c, (trusted_server_key, public_key, nonce, signed_parameters));
+      in(c, (ciphertext:bitstring, tag:bitstring, encrypted_payload:bitstring));
+      let shared = shared_secret_for_server(ciphertext, ephemeral_sk) in
+      let root = derive_root(user_factor, hardware_factor, fido_factor) in
+      let session_key = derive_session(root, shared, nonce, ciphertext) in
+      if tag = request_mac(session_key, nonce, ciphertext) then
+        event server_accepted(nonce, ciphertext);
+        let consumed = adec(encrypted_payload, session_key) in
+        event server_consumed(consumed);
+        event server_responded(nonce, ciphertext);
+        out(c, (nonce, ciphertext, response_mac(session_key, nonce, ciphertext)));
+        in(c, (ack_nonce:bitstring, ack_ciphertext:bitstring, ack_tag:bitstring));
+        if ack_nonce = nonce
+          && ack_ciphertext = ciphertext
+          && ack_tag = response_mac(session_key, nonce, ciphertext) then
+            0
+    )
+    |
+    !(
+      in(c, (received_server_key:bitstring, public_key:bitstring, nonce:bitstring,
+             signature:bitstring));
+      if received_server_key = trusted_server_key then
+        let signed_parameters = check_server_signature(signature, received_server_key) in
+        if signed_parameters = (public_key, nonce) then
+          new shared:bitstring;
+          let ciphertext = encaps(public_key, shared) in
+          let root = derive_root(user_factor, hardware_factor, fido_factor) in
+          let session_key = derive_session(root, shared, nonce, ciphertext) in
+          let tag = request_mac(session_key, nonce, ciphertext) in
+          event client_sent(nonce, ciphertext);
+          out(c, (ciphertext, tag, aenc(payload, session_key)));
+          in(c, (response_nonce:bitstring, response_ciphertext:bitstring,
+                 response_tag:bitstring));
+          if response_nonce = nonce
+            && response_ciphertext = ciphertext
+            && response_tag = response_mac(session_key, nonce, ciphertext) then
+              event client_accepted(response_nonce, response_ciphertext);
+              out(c, (nonce, ciphertext, response_mac(session_key, nonce, ciphertext)))
+    )
+  )

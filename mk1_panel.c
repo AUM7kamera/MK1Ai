@@ -23,6 +23,8 @@
 
 #define CONFIG_PATH "ai_data/panel-config.json"
 #define STATUS_PATH "ai_data/panel-status.txt"
+#define SUDO_PATH "/usr/bin/sudo"
+#define IP_PATH "/usr/sbin/ip"
 #define LOG_PATH "ai_data/panel.log"
 #define TUNNEL_CONTROL_PATH "ai_data/tunnel-control.sock"
 #define VALUE_SIZE 512
@@ -184,8 +186,8 @@ static bool run_wireguard_link_state(const char *interface, bool enabled) {
         return false;
     }
     if (child == 0) {
-        execlp("sudo", "sudo", "-n", "/usr/local/sbin/mk1-wg-link",
-               interface, enabled ? "up" : "down", (char *)NULL);
+        execl(SUDO_PATH, "sudo", "-n", "/usr/local/sbin/mk1-wg-link",
+              interface, enabled ? "up" : "down", (char *)NULL);
         _exit(127);
     }
     int status = -1;
@@ -432,7 +434,7 @@ static bool authorize_admin(void) {
     endwin();
     pid_t child = fork();
     if (child == 0) {
-        execlp("sudo", "sudo", "-v", (char *)NULL);
+        execl(SUDO_PATH, "sudo", "-v", (char *)NULL);
         _exit(127);
     }
     int status = -1;
@@ -627,7 +629,7 @@ static bool start_monitor(const PanelConfig *config, bool full_isolation) {
             fclose(log_file);
         }
         if (full_isolation) {
-            execlp("sudo", "sudo", "-n", python, "airgap_ai_defender.py",
+            execl(SUDO_PATH, "sudo", "-n", python, "airgap_ai_defender.py",
                    "--config", "ai_data/config.json",
                    "--panel-config", CONFIG_PATH,
                    "--panel-parent-pid", parent_pid,
@@ -772,7 +774,7 @@ static void show_interfaces(void) {
         close(descriptors[0]);
         dup2(descriptors[1], STDOUT_FILENO);
         close(descriptors[1]);
-        execlp("ip", "ip", "-br", "link", (char *)NULL);
+        execl(IP_PATH, "ip", "-br", "link", (char *)NULL);
         _exit(127);
     }
     close(descriptors[1]);
@@ -869,11 +871,15 @@ static void draw_panel(const PanelConfig *config) {
              config->memory_guard_enabled ? "ON" : "OFF",
              !status_available ? "状態未取得" :
              status.memory_guard_active ? "有効" : "無効");
+    attron(A_BOLD);
+    mvprintw(15, 2, "実効保証: 未主張/S0 | 相互検証なし | ハードウェア信頼なし(追加層のみ)");
+    mvprintw(16, 2, "警告: 端末完全侵害で端末内の機密性・完全性は保証喪失");
+    attroff(A_BOLD);
 
-    mvprintw(16, 2, "[1] Dry-Run [2] 停止 [3] 実遮断 [4] 設定 [m] 地図 [u] USB [e] WG [a] メモリ");
-    mvprintw(17, 2, "[5] NIC一覧 [6] ローカル検証 [7] HTTPS閲覧開始 [8] 停止");
-    mvprintw(18, 2, "リモート閲覧: %s", dashboard_pid > 0 ? "HTTPSサーバー稼働中 (閲覧専用)" : "停止中");
-    mvprintw(19, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
+    mvprintw(18, 2, "[1] Dry-Run [2] 停止 [3] 実遮断 [4] 設定 [m] 地図 [u] USB [e] WG [a] メモリ");
+    mvprintw(19, 2, "[5] NIC一覧 [6] ローカル検証 [7] HTTPS閲覧開始 [8] 停止");
+    mvprintw(20, 2, "リモート閲覧: %s", dashboard_pid > 0 ? "HTTPSサーバー稼働中 (閲覧専用)" : "停止中");
+    mvprintw(21, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
     mvprintw(LINES - 2, 2, "状態: %s%s", status_available ? status.state : "ステータス未出力",
              isolation_closed ? " / 隔離後ローカル復旧が必要" : "");
     refresh();

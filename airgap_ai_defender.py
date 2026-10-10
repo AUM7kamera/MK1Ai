@@ -554,6 +554,7 @@ _MAINTENANCE_LOCK = threading.Lock()
 _PANEL_PARENT_PID = 0
 _PANEL_FULL_ISOLATION = False
 _RSI_MODE_ACTIVE = False
+_LOCAL_ADAPTATION_ENABLED = False
 _RSI_CONNECTION_STATUS = "Not configured"
 _MODEL_SYNC_STATUS = "Disabled"
 _LAST_THREAT_SCORE = 0.0
@@ -615,6 +616,14 @@ _HEAD_C_OFF_THRESHOLD = 0.50
 _DEFAULT_SWAP_SIZE_MB = 100
 _MANAGEMENT_SAFE_HARBOR_DEFAULT_PORTS = (22,)
 _MANAGEMENT_SAFE_HARBOR_DEFAULT_IPS = ("127.0.0.1", "::1")
+_MAX_ENFORCED_FRAME_BYTES = 65575
+_ENFORCEMENT_SIGNATURES = (
+    b"<script",
+    b"javascript:",
+    b"eval(",
+    b"powershell",
+    b"cmd.exe",
+)
 _TRACE_SEQUENCE = 0
 
 
@@ -2149,6 +2158,8 @@ def _prepare_model_state_dict(state_dict: dict, model) -> dict | None:
 
 def _save_local_adaptation(model, checkpoint_path: str) -> bool:
     """Save the adapted model and its digest using atomic replacement."""
+    if not _LOCAL_ADAPTATION_ENABLED:
+        return False
     directory = os.path.dirname(os.path.abspath(checkpoint_path))
     os.makedirs(directory, exist_ok=True)
     model_temporary = None
@@ -2210,6 +2221,8 @@ def _save_local_adaptation(model, checkpoint_path: str) -> bool:
 def _load_local_adaptation(model, checkpoint_path: str) -> bool:
     """Load a locally trained state only when its sidecar digest and tensors validate."""
     global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    if not _LOCAL_ADAPTATION_ENABLED:
+        return False
     if not os.path.isfile(checkpoint_path):
         return False
     expected_hash = _read_model_hash_from_sidecar(checkpoint_path)
@@ -4225,9 +4238,7 @@ def apply_backdoor_findings(findings: list) -> float:
             log.warning(f"  - PID {finding.get('pid')} の {finding.get('name')} が {finding.get('remote')} へ外部接続を試みています。")
     log.warning("  バックドアとは、攻撃者が正規の手順をすり抜けて後から侵入するための裏口です。")
     log.warning("  しばしば nc / ncat / powershell / python などでポートを開き、遠隔操作に使われます。")
-    log.warning("[ANOMALY_DETECTION / THREAT_INDEX] バックドアの兆候を受け、異常度を急上昇させます。")
-    evaluate_threat_state(_MONITOR_INTERFACE, _DRY_RUN, score_a=0.99,
-                          backdoor_detected=True, backdoor_boost=boost)
+    log.warning("[ADVISORY_ONLY] このプロセス監査結果は助言であり、自動遮断は行いません。")
     return boost
 
 
@@ -4937,6 +4948,8 @@ def train_local_whitelist(model: LightweightMultiTaskAI, optimizer, data: list, 
     これが「破滅的忘却を防ぐ」仕組みです！
     """
     global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    if not _LOCAL_ADAPTATION_ENABLED:
+        return
     labeled_data = []
     for record in data:
         features = record.get("features") if isinstance(record, dict) else None
@@ -5126,7 +5139,7 @@ _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
 def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
-    if not batch:
+    if not batch or not _LOCAL_ADAPTATION_ENABLED:
         return True
     warned = False
     while True:
@@ -5555,18 +5568,32 @@ def _adjust_soft_ai_score(ai_score: float, benign_probability: float, reviewed: 
 
 def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=None, dry_run: bool = False,
                             feature_vector=None, dpi_result: dict | None = None) -> dict:
-    """固定ルールを排し、DPI/AI/入力ベクトルによる連続スコアリングでパケットを評価する。"""
+    """Enforce only fixed input rules; AI and anomaly scores are advisory."""
     global _BACKDOOR_RISK_SCORE
+
+    if len(packet_bytes) > _MAX_ENFORCED_FRAME_BYTES:
+        return {
+            "block": True, "stage": "frame_length", "score": 1.0,
+            "reason": "frame_exceeds_policy_limit",
+        }
 
     if ONI_MODE:
         trace = build_diagnostic_trace(layer=1, threshold=0.01, score=1.0, reason="oni_mode")
         return {"block": True, "stage": "oni", "score": 1.0, "reason": "ONI_MODE enabled", "diagnostic_trace": trace}
 
     dpi_result = dpi_result or analyze_dpi_payload(packet_bytes, interface=interface)
-    if dpi_result.get("suspicious"):
-        trace = build_diagnostic_trace(layer=2, threshold=0.6, score=dpi_result.get("score", 0.0), reason="dpi")
+    payload = extract_payload_bytes(packet_bytes).lower()
+    matched_signature = next(
+        (signature for signature in _ENFORCEMENT_SIGNATURES if signature in payload),
+        None,
+    )
+    if matched_signature is not None:
+        trace = build_diagnostic_trace(layer=2, threshold=1.0, score=1.0, reason="fixed_signature")
         log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="dpi", reason="payload_signature")
-        return {"block": True, "stage": "dpi", "score": dpi_result.get("score", 0.0), "reason": "dpi", "diagnostic_trace": trace}
+        return {
+            "block": True, "stage": "signature", "score": 1.0,
+            "reason": "fixed_payload_signature", "diagnostic_trace": trace,
+        }
 
     transport = parse_packet_transport(packet_bytes)
     if transport and transport.get("parse_error"):
@@ -5624,19 +5651,11 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         except Exception:
             ai_score = 0.0
 
-    if ai_score >= 0.88:
-        trace = build_diagnostic_trace(layer=3, threshold=0.88, score=ai_score, reason="model_score")
-        return {"block": True, "stage": "ai", "score": ai_score, "reason": "model_score", "diagnostic_trace": trace}
-
     math_score = 0.0
     if feature_vector is not None:
         math_score = min(0.99, sum(float(v) for v in feature_vector[:5]) / 5.0)
     elif transport:
         math_score = min(0.99, (0.35 if transport.get("protocol") == socket.IPPROTO_TCP else 0.1))
-
-    if math_score >= 0.88:
-        trace = build_diagnostic_trace(layer=4, threshold=0.88, score=math_score, reason="math_threshold")
-        return {"block": True, "stage": "math", "score": math_score, "reason": "math_threshold", "diagnostic_trace": trace}
 
     behavior_score = _compute_behavioral_signature_score(packet_bytes, transport, dpi_result)
     unknown_score = _compute_unknown_behavior_score(packet_bytes, transport, markers, dpi_result)
@@ -5644,18 +5663,18 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         rule_score, ai_score, math_score, unknown_score, behavior_score,
     )
 
-    if behavior_score >= 0.30 and (unknown_score >= 0.16 or rule_score >= 0.25):
-        trace = build_diagnostic_trace(layer=4, threshold=0.30, score=min(0.99, behavior_score + max(rule_score, ai_score, math_score) * 0.25), reason="behavioral_signature")
-        return {"block": True, "stage": "behavioral_signature", "score": min(0.99, behavior_score + max(rule_score, ai_score, math_score) * 0.25), "reason": "behavioral_signature", "diagnostic_trace": trace}
-
-    if unknown_score >= 0.22 and (rule_score >= 0.2 or ai_score >= 0.2 or math_score >= 0.15):
-        trace = build_diagnostic_trace(layer=4, threshold=0.22, score=min(0.99, unknown_score + max(rule_score, ai_score, math_score) * 0.3), reason="unknown_behavior")
-        return {"block": True, "stage": "unknown_behavior", "score": min(0.99, unknown_score + max(rule_score, ai_score, math_score) * 0.3), "reason": "unknown_behavior", "diagnostic_trace": trace}
-    if composite_score >= 0.80:
-        trace = build_diagnostic_trace(layer=4, threshold=0.8, score=composite_score, reason="composite_scoring")
-        return {"block": True, "stage": "composite", "score": composite_score, "reason": "composite_scoring", "diagnostic_trace": trace}
-
-    return {"block": False, "stage": "pass", "score": max(rule_score, ai_score, math_score, unknown_score), "reason": rule_reason}
+    return {
+        "block": False,
+        "stage": "advisory",
+        "score": max(rule_score, ai_score, math_score, unknown_score, behavior_score, composite_score),
+        "reason": "advisory_scores_only",
+        "advisory": {
+            "ai_score": ai_score,
+            "math_score": math_score,
+            "unknown_score": unknown_score,
+            "behavior_score": behavior_score,
+        },
+    }
 
 
 def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_result: dict | None = None) -> bool:
@@ -5676,7 +5695,7 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
     if pipeline.get("block"):
         stage = pipeline.get("stage")
         score = min(0.99, pipeline.get("score", 0.0))
-        backdoor_detected = stage in {"math", "ai", "blacklist"} or (stage == "dpi" and (score >= 0.72 or dpi_result.get("fast_track", False)))
+        backdoor_detected = stage in {"signature", "frame_length", "blacklist"}
         blocked = evaluate_threat_state(
             interface,
             effective_dry_run,
@@ -5687,16 +5706,6 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
         _publish_threat_map_event(packet_bytes, str(stage or "threat"), score)
         return blocked
 
-    if _BACKDOOR_RISK_SCORE > 0.0:
-        blocked = evaluate_threat_state(
-            interface,
-            effective_dry_run,
-            score_a=min(0.99, 0.5 + _BACKDOOR_RISK_SCORE),
-            backdoor_detected=True,
-            backdoor_boost=_BACKDOOR_RISK_SCORE,
-        )
-        _publish_threat_map_event(packet_bytes, "backdoor_risk", min(0.99, 0.5 + _BACKDOOR_RISK_SCORE))
-        return blocked
     return False
 
 
@@ -5906,6 +5915,9 @@ def _run_lightweight_training_validation(
     model=None,
     fetch_drive: bool = True,
 ) -> int:
+    if not _LOCAL_ADAPTATION_ENABLED:
+        log.error("[検証] ローカル適応学習は署名付きチェックポイント等の対策が未実装のため無効です。")
+        return 3
     if hasattr(torch, "set_num_threads"):
         torch.set_num_threads(1)
 
@@ -6227,9 +6239,11 @@ def _apply_pending_cloud_model(model, local_checkpoint_path: str | None = None) 
     try:
         with _MODEL_ACCESS_LOCK:
             model.load_state_dict(state_dict)
-            _HEAD_B_REVIEWED_LABELS = {0, 1} if reviewed else set()
-            _HEAD_B_REVIEWED = reviewed
-            if local_checkpoint_path:
+            _HEAD_B_REVIEWED_LABELS = (
+                {0, 1} if reviewed and _LOCAL_ADAPTATION_ENABLED else set()
+            )
+            _HEAD_B_REVIEWED = reviewed and _LOCAL_ADAPTATION_ENABLED
+            if local_checkpoint_path and _LOCAL_ADAPTATION_ENABLED:
                 local_dir = os.path.dirname(os.path.abspath(local_checkpoint_path))
                 feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
                 if os.path.isfile(feedback_path):
@@ -6447,6 +6461,9 @@ def _format_compact_status(ram_mb: float, ram_limit_mb: int, swap_mb: float,
         f"[STATUS] RAM: {ram_mb:.0f}MB/{ram_limit_mb}MB | Swap: {swap_mb:.1f}MB"
         f" | Score: {score:.2f} | Colab: {colab_status}"
         f" | Model: {_MODEL_SYNC_STATUS} | Mode: {mode_label}"
+        " | Effective profile: unclaimed/S0"
+        " | Hardware trust: none (optional layer only)"
+        " | No mutual verification: full endpoint compromise loses assurance"
     )
 
 
@@ -6499,6 +6516,11 @@ def _write_panel_status(
         f"rsi_connection_status={_RSI_CONNECTION_STATUS}\n"
         f"training_queue_batches={_train_queue.qsize()}\n"
         f"learning_mode={int(bool(is_learning_mode()))}\n"
+        f"local_adaptation_enabled={int(_LOCAL_ADAPTATION_ENABLED)}\n"
+        "effective_profile=unclaimed_S0\n"
+        "hardware_trust=none_optional_layer_only\n"
+        "mutual_verification=none\n"
+        "assurance_warning=full_endpoint_compromise_loses_assurance\n"
         f"ram_used_mb={max(0.0, ram_used_mb or 0.0):.1f}\n"
         f"ram_limit_mb={max(0, ram_limit_mb or 0)}\n"
         f"swap_used_mb={max(0.0, swap_used_mb or 0.0):.1f}\n"
@@ -6543,6 +6565,10 @@ def main():
     runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
+
+    if args.validation_only and not _LOCAL_ADAPTATION_ENABLED:
+        log.error("[検証] ローカル適応学習は必要な署名・安全対策がないため実行できません。")
+        return 3
 
     if args.ignore_model_hash and not TORCH_AVAILABLE:
         parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
@@ -6923,13 +6949,6 @@ def main():
             # ================================================================
             # 判定ロジック (優先度: 防衛 > 司令 > 学習)
             # ================================================================
-
-            # 【最優先】バックドア/高スコア検知時は即時キルスイッチ
-            if evaluate_threat_state(monitor_interface, dry_run, score_a=effective_score,
-                                     backdoor_detected=_BACKDOOR_RISK_SCORE > 0.0,
-                                     backdoor_boost=_BACKDOOR_RISK_SCORE):
-                time.sleep(5)  # 遮断後の冷却時間
-                continue       # 他の処理を一切スキップ
 
             # 【優先2】Head C > 0.8 → 司令塔がデータ退避を命令
             if c > 0.8 and whitelist_buf:
