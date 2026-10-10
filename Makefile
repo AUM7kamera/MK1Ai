@@ -22,7 +22,11 @@ NCURSES_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(NCURSES_PACKAGE))
 NCURSES_LIBS := $(shell $(PKG_CONFIG) --libs $(NCURSES_PACKAGE))
 BUILD_DIR ?= .build
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+.PHONY: all panel test analyze check check-ci require-oqs clean
+
 .PHONY: all panel test analyze check check-ci require-oqs release clean
+ main
 
 all: panel
 
@@ -68,8 +72,11 @@ require-oqs:
 
 check-ci: require-oqs check
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
 release:
 	bash scripts/build_release.sh
 
+ main
 clean:
 	rm -rf "$(BUILD_DIR)"

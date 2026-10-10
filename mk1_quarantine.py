@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Iterator
 
 from mk1_airgap import disable_all_network_paths
+ codespace-probable-dollop-pj64p66j94jv29wg6
+from mk1_firewall import apply_nft_policy
+
 from mk1_firewall import apply_nft_policy, remove_nft_policy
+ main
 from mk1_quorum import (
     MAX_APPROVAL_BUNDLE_BYTES,
     QuorumError,
@@ -329,7 +333,34 @@ def _read_untrusted_approval_bundle(path: str | Path) -> bytes:
 
 
 def _remove_nft_policy() -> bool:
+ codespace-probable-dollop-pj64p66j94jv29wg6
+    nft = shutil.which("nft", path="/usr/sbin:/usr/bin:/sbin:/bin")
+    if nft is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return False
+    resolved = Path(nft).resolve(strict=True)
+    executable_stat = resolved.stat()
+    if (
+        executable_stat.st_uid != 0
+        or not stat.S_ISREG(executable_stat.st_mode)
+        or executable_stat.st_mode & 0o022
+    ):
+        return False
+    try:
+        result = subprocess.run(
+            [str(resolved), "-f", "-"],
+            input="destroy table inet mk1ai_quarantine\n",
+            text=True,
+            check=False,
+            capture_output=True,
+            timeout=10,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
     return remove_nft_policy()
+ main
 
 
 def _main() -> int:

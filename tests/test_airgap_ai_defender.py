@@ -235,7 +235,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                     module._load_runtime_config(str(config_path)),
                 )
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     @requires_secure_transport
+ main
     def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
         device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
         interfaces = ["eth0", "wlan0"]
@@ -564,7 +567,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(result["reason"], "PQC public-key pin required")
         secure_request.assert_not_called()
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     @requires_torch
+ main
     def test_cloud_model_apply_does_not_enable_local_feedback_when_adaptation_disabled(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         state_dict = model.state_dict()
@@ -591,7 +597,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 load_feedback.assert_not_called()
                 train.assert_not_called()
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     @requires_torch
+ main
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -1179,7 +1188,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     @requires_torch
+ main
     def test_local_adaptation_is_disabled_by_default(self):
         torch = module.torch
         model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1204,7 +1216,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(module._enqueue_training_batch([{"features": [0.2] * 10}]))
             train_queue.put.assert_not_called()
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     @requires_torch
+ main
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
@@ -1256,6 +1271,15 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
     def test_training_enqueue_drops_batch_without_blocking_when_queue_is_full(self):
         original_queue = module._train_queue
+ codespace-probable-dollop-pj64p66j94jv29wg6
+        full_queue = mock.Mock()
+        full_queue.put.side_effect = [queue.Full, None]
+        with mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True):
+            try:
+                module._train_queue = full_queue
+                self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
+                self.assertEqual(full_queue.put.call_count, 2)
+
         full_queue = queue.Queue(maxsize=1)
         queued_batch = [{"features": [0.1] * 10, "label": 0}]
         rejected_batch = [{"features": [0.9] * 10, "label": 1}]
@@ -1267,6 +1291,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 self.assertFalse(module._enqueue_training_batch(rejected_batch))
                 self.assertLess(module.time.monotonic() - started, 0.5)
                 self.assertIs(full_queue.get_nowait(), queued_batch)
+ main
             finally:
                 module._train_queue = original_queue
 
@@ -2252,12 +2277,16 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
         transaction = render_nft_transaction(**payload["nft_policy"])
+ codespace-probable-dollop-pj64p66j94jv29wg6
+        self.assertIn("destroy table inet mk1ai_quarantine", transaction)
+
         self.assertNotIn("destroy", transaction)
         self.assertTrue(transaction.startswith(
             "add table inet mk1ai_quarantine\n"
             "delete table inet mk1ai_quarantine\n"
             "add table inet mk1ai_quarantine\n"
         ))
+ main
         self.assertIn("policy drop", transaction)
         self.assertNotIn("mk1ai_egress", transaction)
         self.assertTrue(payload["require_all_commands"])
@@ -2338,7 +2367,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch("mk1_firewall.os.geteuid", return_value=0), \
              mock.patch("mk1_firewall._trusted_nft_binary", return_value="/usr/sbin/nft"), \
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
              mock.patch("mk1_firewall.check_nft_support", return_value=None), \
+ main
              mock.patch("mk1_firewall.subprocess.run", return_value=completed) as run:
             self.assertTrue(apply_nft_policy(
                 mode="management_safe_harbor",

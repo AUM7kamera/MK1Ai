@@ -12,7 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
 #include <pthread.h>
+ main
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -80,6 +83,8 @@ static volatile sig_atomic_t close_requested = 0;
 static volatile sig_atomic_t isolation_closed = 0;
 static char message[256] = "準備完了";
 static void set_message(const char *text);
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
 static PanelSnapshot panel_snapshot;
 static pthread_mutex_t panel_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t telemetry_thread;
@@ -92,6 +97,7 @@ static WINDOW *resource_window;
 static WINDOW *footer_window;
 static int panel_rows;
 static int panel_columns;
+ main
 
 static void handle_shutdown_signal(int signal_number) {
     if (signal_number == SIGTERM) {
@@ -1082,10 +1088,15 @@ static void draw_panel(const PanelConfig *config) {
         (void)kill(getpid(), SIGKILL);
         return;
     }
+ codespace-probable-dollop-pj64p66j94jv29wg6
+    PanelStatus status;
+    bool status_available = read_status(&status);
+
     PanelSnapshot snapshot;
     pthread_mutex_lock(&panel_snapshot_mutex);
     snapshot = panel_snapshot;
     pthread_mutex_unlock(&panel_snapshot_mutex);
+ main
     if (monitor_pid > 0 && !isolation_closed) {
         int child_status;
         pid_t result = waitpid(monitor_pid, &child_status, WNOHANG);
@@ -1102,6 +1113,61 @@ static void draw_panel(const PanelConfig *config) {
             }
         }
     }
+
+ codespace-probable-dollop-pj64p66j94jv29wg6
+    erase();
+    attron(A_BOLD);
+    mvprintw(1, 2, "MK1Ai C操作パネル");
+    attroff(A_BOLD);
+    mvprintw(3, 2, "監視NIC: %-16s モード: %-6s RAM基準: %d MB",
+             config->interface, config->mode, config->ram_limit);
+    mvprintw(4, 2, "Colab HTTPS: %s",
+             config->colab_endpoint[0] ? config->colab_endpoint : "未設定");
+    const char *map_mode = config->map_mode == 1 ? "Chrome WebSocket" :
+        config->map_mode == 2 ? "Local offline cache" : "OFF";
+    mvprintw(5, 2, "地図表示: %-20s %s",
+             map_mode, config->map_mode == 1 ? "ws://127.0.0.1:9001/map" : "");
+    mvprintw(6, 2, "監視状態: %s", monitor_pid > 0 ? "起動中" : "停止中");
+    mvprintw(7, 2, "処理速度: %.2f packets/sec   累計: %lld",
+             status_available ? status.packets_per_second : 0.0,
+             status_available ? status.packets_total : 0LL);
+    mvprintw(8, 2, "脅威スコア: %.3f   バックドアリスク: %.3f",
+             status_available ? status.threat_score : 0.0,
+             status_available ? status.backdoor_score : 0.0);
+    if (status_available && strcmp(status.alert, "NONE") != 0) attron(A_BOLD);
+    mvprintw(9, 2, "アラート: %s%s",
+             status_available ? status.alert : "状態待ち",
+             status_available && status.isolation_active ? " (隔離発動)" : "");
+    if (status_available && strcmp(status.alert, "NONE") != 0) attroff(A_BOLD);
+    const char *monitor_mode = !status_available ? "状態未取得" :
+        status.dry_run ? "Dry-Run (遮断なし)" : "実遮断 (管理者権限)";
+    mvprintw(10, 2, "実行モード: %s", monitor_mode);
+    mvprintw(11, 2, "RAM: %.1f / %.0f MB   退避swap: %.1f MB",
+             status_available ? status.ram_used_mb : 0.0,
+             status_available ? status.ram_limit_mb : 0.0,
+             status_available ? status.swap_used_mb : 0.0);
+    mvprintw(12, 2, "USB隔離設定: %s (実遮断モード時のみ有効)",
+             config->usb_guard_enabled ? "有効" : "無効");
+    mvprintw(13, 2, "Encrypted Sandbox Tunnel: %s / PQC送信ゲート: %s",
+             config->secure_tunnel_enabled ? "ON" : "OFF",
+             !status_available ? "状態未取得" :
+             status.secure_tunnel_active ? "許可" : "遮断");
+    mvprintw(14, 2, "メモリ保護: %s / 監視プロセス: %s",
+             config->memory_guard_enabled ? "ON" : "OFF",
+             !status_available ? "状態未取得" :
+             status.memory_guard_active ? "有効" : "無効");
+    attron(A_BOLD);
+    mvprintw(15, 2, "実効保証: 未主張/S0 | 相互検証なし | ハードウェア信頼なし(追加層のみ)");
+    mvprintw(16, 2, "警告: 端末完全侵害で端末内の機密性・完全性は保証喪失");
+    attroff(A_BOLD);
+
+    mvprintw(18, 2, "[1] Dry-Run [2] 停止 [3] 実遮断 [4] 設定 [m] 地図 [u] USB [e] WG [a] メモリ");
+    mvprintw(19, 2, "[5] NIC一覧 [6] ローカル検証 [7] HTTPS閲覧開始 [8] 停止");
+    mvprintw(20, 2, "リモート閲覧: %s", dashboard_pid > 0 ? "HTTPSサーバー稼働中 (閲覧専用)" : "停止中");
+    mvprintw(21, 2, "%.*s", COLS > 4 ? COLS - 4 : 0, message);
+    mvprintw(LINES - 2, 2, "状態: %s%s", status_available ? status.state : "ステータス未出力",
+             isolation_closed ? " / 隔離後ローカル復旧が必要" : "");
+    refresh();
 
     draw_panel_windows(config, &snapshot);
 }
@@ -1129,6 +1195,7 @@ static int mouse_shortcut_key(void) {
         }
     }
     return ERR;
+ main
 }
 
 int main(void) {
@@ -1162,6 +1229,8 @@ int main(void) {
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -1171,6 +1240,7 @@ int main(void) {
     }
     mousemask(ALL_MOUSE_EVENTS, NULL);
     create_panel_windows();
+ main
     struct sigaction shutdown_action = {0};
     shutdown_action.sa_handler = handle_shutdown_signal;
     sigemptyset(&shutdown_action.sa_mask);
@@ -1183,11 +1253,16 @@ int main(void) {
     pipe_action.sa_handler = SIG_IGN;
     sigemptyset(&pipe_action.sa_mask);
     if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
         destroy_panel_windows();
+ main
         endwin();
         fprintf(stderr, "SIGPIPEハンドラーを設定できません: %s\n", strerror(errno));
         return 1;
     }
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
     int thread_error = pthread_create(&telemetry_thread, NULL, telemetry_worker, NULL);
     if (thread_error != 0) {
         destroy_panel_windows();
@@ -1197,6 +1272,7 @@ int main(void) {
         return 1;
     }
     telemetry_thread_started = true;
+ main
 
     bool running = true;
     while (running && !close_requested) {

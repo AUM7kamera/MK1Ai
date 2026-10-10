@@ -5113,7 +5113,11 @@ _TRAIN_QUEUE_MAX_BATCHES = 10
 _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
+ codespace-probable-dollop-pj64p66j94jv29wg6
+def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
+
 def _enqueue_training_batch(batch: list) -> bool:
+ main
     if not batch or not _LOCAL_ADAPTATION_ENABLED:
         return True
     try:
@@ -5733,10 +5737,13 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
         else:
             log.error("[AIRGAP] 全経路の無効化を確認できませんでした。隔離完了とは扱いません。")
             return False
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
 
     if containment_mode == "full_isolation" and (management_ports or management_ips):
         containment_mode = "management_safe_harbor"
         log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
+ main
 
     containment_plan = build_containment_plan(
         interface,
@@ -6545,6 +6552,10 @@ def main():
     if args.validation_only and not _LOCAL_ADAPTATION_ENABLED:
         log.error("[検証] ローカル適応学習は必要な署名・安全対策がないため実行できません。")
         return 3
+ codespace-probable-dollop-pj64p66j94jv29wg6
+
+
+ main
     if args.ignore_model_hash and not TORCH_AVAILABLE:
         parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
 
