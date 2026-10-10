@@ -22,7 +22,7 @@ NCURSES_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(NCURSES_PACKAGE))
 NCURSES_LIBS := $(shell $(PKG_CONFIG) --libs $(NCURSES_PACKAGE))
 BUILD_DIR ?= .build
 
-.PHONY: all panel test analyze check release clean
+.PHONY: all panel test analyze check check-ci require-oqs release clean
 
 all: panel
 
@@ -62,6 +62,11 @@ analyze: | $(BUILD_DIR)
 		mk1_panel.c mk1_memory_guard.c mk1_path_trust.c mk1_tunnel.c $(OQS_SOURCE)
 
 check: panel test analyze
+
+require-oqs:
+	@$(PKG_CONFIG) --exists liboqs || { echo "liboqs is required for CI checks" >&2; exit 1; }
+
+check-ci: require-oqs check
 
 release:
 	bash scripts/build_release.sh

@@ -39,10 +39,7 @@ int mk1_tunnel_oqs_provider_init(mk1_mlkem768_provider *provider) {
     provider->context = NULL;
     provider->encapsulate = NULL;
     provider->decapsulate = NULL;
-    if (OQS_init() != OQS_SUCCESS) {
-        errno = EIO;
-        return -1;
-    }
+    OQS_init();
 
     OQS_KEM *kem = OQS_KEM_new("ML-KEM-768");
     if (kem == NULL) {

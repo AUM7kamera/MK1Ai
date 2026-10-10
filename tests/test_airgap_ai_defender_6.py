@@ -141,8 +141,8 @@ class AirgapAI6Test(unittest.TestCase):
         }
         payload = module.generate_absolute_defense_payload(profile)
         self.assertTrue(any(cmd[:4] == ["ip", "link", "set", "eth0"] for cmd in payload["commands"]))
-        self.assertTrue(any(cmd[:2] == ["iptables", "-F"] for cmd in payload["commands"]))
-        self.assertTrue(any(cmd[:2] == ["nft", "flush"] for cmd in payload["commands"]))
+        self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
+        self.assertFalse(any(cmd[0] == "nft" for cmd in payload["commands"]))
 
     def test_self_protection_triggers_kill_switch_on_tamper(self):
         protection = module.SelfProtection("eth0", "eth0", dry_run=True)

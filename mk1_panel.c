@@ -21,10 +21,13 @@
 #include <time.h>
 #include <unistd.h>
 #include "mk1_memory_guard.h"
+#include "mk1_path_trust.h"
 #include "mk1_tunnel.h"
 
 #define CONFIG_PATH "ai_data/panel-config.json"
 #define STATUS_PATH "ai_data/panel-status.txt"
+#define SUDO_PATH "/usr/bin/sudo"
+#define IP_PATH "/usr/sbin/ip"
 #define LOG_PATH "ai_data/panel.log"
 #define TUNNEL_CONTROL_PATH "ai_data/tunnel-control.sock"
 #define VALUE_SIZE 512
@@ -213,8 +216,8 @@ static bool run_wireguard_link_state(const char *interface, bool enabled) {
         return false;
     }
     if (child == 0) {
-        execlp("sudo", "sudo", "-n", "/usr/local/sbin/mk1-wg-link",
-               interface, enabled ? "up" : "down", (char *)NULL);
+        execl(SUDO_PATH, "sudo", "-n", "/usr/local/sbin/mk1-wg-link",
+              interface, enabled ? "up" : "down", (char *)NULL);
         _exit(127);
     }
     int status = -1;
@@ -702,7 +705,7 @@ static bool authorize_admin(void) {
     endwin();
     pid_t child = fork();
     if (child == 0) {
-        execlp("sudo", "sudo", "-v", (char *)NULL);
+        execl(SUDO_PATH, "sudo", "-v", (char *)NULL);
         _exit(127);
     }
     int status = -1;
@@ -867,6 +870,16 @@ static bool start_monitor(const PanelConfig *config, bool full_isolation) {
         set_message("監視の起動をキャンセルしました");
         return false;
     }
+    if (full_isolation) {
+        const char *privileged_python = getenv("MK1_PYTHON_BIN");
+        if (privileged_python == NULL || privileged_python[0] == '\0') privileged_python = "python3";
+        bool python_ok = strchr(privileged_python, '/') == NULL
+            || mk1_path_chain_is_root_trusted(privileged_python);
+        if (!python_ok || !mk1_path_chain_is_root_trusted("airgap_ai_defender.py")) {
+            set_message("実遮断はroot権限で実行されます。スクリプトとPythonをrootが所有し、group/otherが書き込めない場所に配置してください");
+            return false;
+        }
+    }
     if (full_isolation && !authorize_admin()) return false;
     if (!save_config(config)) return false;
     pid_t child = fork();
@@ -887,7 +900,7 @@ static bool start_monitor(const PanelConfig *config, bool full_isolation) {
             fclose(log_file);
         }
         if (full_isolation) {
-            execlp("sudo", "sudo", "-n", python, "airgap_ai_defender.py",
+            execl(SUDO_PATH, "sudo", "-n", python, "airgap_ai_defender.py",
                    "--config", "ai_data/config.json",
                    "--panel-config", CONFIG_PATH,
                    "--panel-parent-pid", parent_pid,
@@ -1032,7 +1045,7 @@ static void show_interfaces(void) {
         close(descriptors[0]);
         dup2(descriptors[1], STDOUT_FILENO);
         close(descriptors[1]);
-        execlp("ip", "ip", "-br", "link", (char *)NULL);
+        execl(IP_PATH, "ip", "-br", "link", (char *)NULL);
         _exit(127);
     }
     close(descriptors[1]);

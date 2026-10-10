@@ -13,8 +13,10 @@ import secrets
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -130,7 +132,11 @@ def identify_usb_device(sysfs_root: str | Path, device_id: str) -> USBDevice | N
         device_class=device_class,
         interface_classes=frozenset(interface_classes),
         is_hid=device_class == "03" or "03" in interface_classes,
-        is_storage=device_class == "08" or "08" in interface_classes,
+        is_storage=(
+            device_class in {"00", "08"}
+            and bool(interface_classes)
+            and interface_classes == {"08"}
+        ),
         is_hub=device_class == "09" and interface_classes <= {"09"},
     )
 
@@ -309,6 +315,55 @@ def usb_storage_is_mounted(
     return False
 
 
+def _read_scan_guest_channel(
+    listener: socket.socket,
+    process: subprocess.Popen,
+    deadline: float,
+    stop_event: Any = None,
+) -> bytes:
+    output = bytearray()
+    connection: socket.socket | None = None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (stop_event is not None and stop_event.is_set()):
+                raise RuntimeError("USB scan guest timed out or was cancelled")
+            monitored = listener if connection is None else connection
+            readable, _, _ = select.select([monitored], [], [], min(0.25, remaining))
+            if not readable:
+                if process.poll() is not None and connection is None:
+                    break
+                continue
+            if connection is None:
+                connection, _ = listener.accept()
+                connection.setblocking(False)
+                _verify_scan_channel_peer(connection, process)
+                continue
+            chunk = connection.recv(
+                min(65_536, MAX_GUEST_OUTPUT_BYTES + 1 - len(output)),
+            )
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > MAX_GUEST_OUTPUT_BYTES:
+                raise RuntimeError("Disposable scan guest exceeded its output limit")
+        return bytes(output)
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _verify_scan_channel_peer(connection: socket.socket, process: subprocess.Popen) -> None:
+    credentials = connection.getsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_PEERCRED,
+        struct.calcsize("3i"),
+    )
+    peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+    if peer_pid != process.pid or peer_uid != os.geteuid():
+        raise RuntimeError("USB scan response channel peer is not the launched QEMU process")
+
+
 def scan_usb_storage_in_guest(
     device: USBDevice,
     image_directory: str | Path,
@@ -332,72 +387,55 @@ def scan_usb_storage_in_guest(
         raise RuntimeError("qemu-system-x86_64 is not installed")
     qemu = _trusted_system_executable(discovered_qemu, "QEMU")
     scan_nonce = secrets.token_hex(16)
-    command = [
-        qemu,
-        "-nodefaults",
-        "-no-user-config",
-        "-machine", "q35,accel=kvm",
-        "-m", "2048",
-        "-smp", "1",
-        "-display", "none",
-        "-monitor", "none",
-        "-serial", "stdio",
-        "-no-reboot",
-        "-net", "none",
-        "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
-        "-kernel", str(images["kernel"]),
-        "-initrd", str(images["initramfs"]),
-        "-append", f"console=ttyS0 rdinit=/init panic=1 mk1.scan_nonce={scan_nonce}",
-        "-device", "qemu-xhci,id=usb",
-        "-device", f"usb-host,hostbus={device.bus_number},hostaddr={device.device_number}",
-    ]
-    process = subprocess.Popen(  # nosec B603 - 信頼済みPATH(TRUSTED_EXECUTION_PATH)で固定されたバイナリ実行
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        env={"PATH": TRUSTED_EXECUTION_PATH, "HOME": "/"},
-    )
-    if process.stdout is None:
-        process.kill()
-        process.wait()
-        raise RuntimeError("Disposable scan guest output pipe was not created")
-    deadline = time.monotonic() + timeout_seconds
-    output = bytearray()
-    output_exceeded_limit = False
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or (stop_event is not None and stop_event.is_set()):
-                raise RuntimeError("USB scan guest timed out or was cancelled")
-            readable, _, _ = select.select(
-                [process.stdout], [], [], min(0.25, remaining),
+    with tempfile.TemporaryDirectory(
+        prefix=f"mk1-scan-{scan_nonce}-",
+        dir="/tmp",
+    ) as channel_directory:
+        channel_path = Path(channel_directory) / "guest-console.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        process: subprocess.Popen | None = None
+        try:
+            listener.bind(str(channel_path))
+            listener.listen(1)
+            command = [
+                qemu,
+                "-nodefaults",
+                "-no-user-config",
+                "-machine", "q35,accel=kvm",
+                "-m", "2048",
+                "-smp", "1",
+                "-display", "none",
+                "-monitor", "none",
+                "-chardev", f"socket,id=scan,path={channel_path}",
+                "-serial", "chardev:scan",
+                "-no-reboot",
+                "-net", "none",
+                "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
+                "-kernel", str(images["kernel"]),
+                "-initrd", str(images["initramfs"]),
+                "-append", "console=ttyS0 rdinit=/init panic=1",
+                "-device", "qemu-xhci,id=usb",
+                "-device", f"usb-host,hostbus={device.bus_number},hostaddr={device.device_number}",
+            ]
+            process = subprocess.Popen(  # nosec B603 - 固定された信頼済みQEMUを直接実行
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={"PATH": TRUSTED_EXECUTION_PATH, "HOME": "/"},
             )
-            if readable:
-                chunk = os.read(
-                    process.stdout.fileno(),
-                    min(65_536, MAX_GUEST_OUTPUT_BYTES + 1 - len(output)),
-                )
-                if not chunk:
-                    break
-                output.extend(chunk)
-                if len(output) > MAX_GUEST_OUTPUT_BYTES:
-                    output_exceeded_limit = True
+            deadline = time.monotonic() + timeout_seconds
+            output = _read_scan_guest_channel(listener, process, deadline, stop_event)
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        finally:
+            listener.close()
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
                     process.kill()
-                    break
-            elif process.poll() is not None:
-                break
-        if output_exceeded_limit:
-            raise RuntimeError("Disposable scan guest exceeded its output limit")
-        process.wait(timeout=max(0.1, deadline - time.monotonic()))
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                    process.wait()
     return_code = process.returncode
     reports = [
         line
@@ -406,10 +444,7 @@ def scan_usb_storage_in_guest(
     ]
     if return_code != 0 or len(reports) != 1:
         raise RuntimeError("Disposable scan guest failed or returned no unique verdict")
-    expected_prefix = SCAN_RESULT_PREFIX + scan_nonce.encode("ascii") + b":"
-    if not reports[0].startswith(expected_prefix):
-        raise RuntimeError("Disposable scan guest returned a mismatched nonce")
-    verdict_bytes = reports[0][len(expected_prefix):]
+    verdict_bytes = reports[0][len(SCAN_RESULT_PREFIX):]
     try:
         verdict = verdict_bytes.decode("ascii", errors="strict")
     except UnicodeDecodeError as exc:
