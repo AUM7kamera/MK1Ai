@@ -103,12 +103,8 @@ static int check_optional_library(const char *const *names, const char *label,
             return 1;
         }
     } else if (strcmp(label, "liboqs") == 0) {
-        int (*oqs_init_fn)(void) = (int (*)(void))symbol;
-        if (oqs_init_fn() != 0) {
-            fprintf(stderr, "FAIL liboqs: OQS_init failed\n");
-            (void)dlclose(handle);
-            return 1;
-        }
+        void (*oqs_init_fn)(void) = (void (*)(void))symbol;
+        oqs_init_fn();
         void *(*kem_new_fn)(const char *) =
             (void *(*)(const char *))dlsym(handle, "OQS_KEM_new");
         void (*kem_free_fn)(void *) =
