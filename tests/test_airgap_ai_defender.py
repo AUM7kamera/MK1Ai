@@ -2252,7 +2252,12 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
         transaction = render_nft_transaction(**payload["nft_policy"])
-        self.assertIn("destroy table inet mk1ai_quarantine", transaction)
+        self.assertNotIn("destroy", transaction)
+        self.assertTrue(transaction.startswith(
+            "add table inet mk1ai_quarantine\n"
+            "delete table inet mk1ai_quarantine\n"
+            "add table inet mk1ai_quarantine\n"
+        ))
         self.assertIn("policy drop", transaction)
         self.assertNotIn("mk1ai_egress", transaction)
         self.assertTrue(payload["require_all_commands"])
@@ -2333,6 +2338,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch("mk1_firewall.os.geteuid", return_value=0), \
              mock.patch("mk1_firewall._trusted_nft_binary", return_value="/usr/sbin/nft"), \
+             mock.patch("mk1_firewall.check_nft_support", return_value=None), \
              mock.patch("mk1_firewall.subprocess.run", return_value=completed) as run:
             self.assertTrue(apply_nft_policy(
                 mode="management_safe_harbor",
