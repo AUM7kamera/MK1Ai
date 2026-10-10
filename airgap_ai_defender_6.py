@@ -1,10 +1,8 @@
-"""
-airgap_ai_defender_6.py
+"""Optional simplified local-monitoring prototype.
 
-100% 完全ローカル自律型 AI 司令塔。
-外部 API を一切使わず、ローカル PyTorch チェックポイントを直接ロードし、
-起動直後にデバイスプロファイルを取得、ブート時ハードニング、
-リソース自律制御、AES 傾向学習、絶対防衛キルスイッチ、自己防衛スレッドを備えます。
+This legacy variant may load a local PyTorch checkpoint and request
+best-effort operating-system network isolation. It does not guarantee
+autonomous protection, complete local operation, or a specific response time.
 """
 
 import argparse
