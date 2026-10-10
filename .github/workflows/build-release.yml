@@ -18,7 +18,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang pkg-config libncurses-dev libssl-dev
-          python3 -m pip install bandit
+          python3 -m pip install -r requirements-secure-transport.txt -r requirements-remote.txt bandit
       - name: Clang static analyzer
         run: make analyze
       - name: Bandit
