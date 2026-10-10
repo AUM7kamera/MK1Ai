@@ -10,5 +10,6 @@ ai_data/remote-dashboard.sqlite3*
 ai_data/remote-bootstrap.token
 ai_data/remote-session.key
 ai_data/owner_profile.dat
+.build/
 *.log
 java_error_in_studio_*.log

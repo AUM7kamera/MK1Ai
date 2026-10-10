@@ -1,6 +1,8 @@
 [Unit]
 Description=MK1Ai authenticated remote dashboard
 After=network-online.target
+Requires=wg-quick@wg0.service
+After=wg-quick@wg0.service
 Wants=network-online.target
 
 [Service]
@@ -9,6 +11,7 @@ User=mk1ai
 Group=mk1ai
 WorkingDirectory=/opt/mk1ai
 EnvironmentFile=/etc/mk1ai/remote-dashboard.env
+Environment=MK1_DATA_DIR=/var/lib/mk1ai/dashboard
 UMask=0077
 ExecStart=/opt/mk1ai/.venv-mk1/bin/python /opt/mk1ai/mk1_remote_dashboard.py
 Restart=on-failure
@@ -20,8 +23,18 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectKernelLogs=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+RestrictNamespaces=yes
 RestrictSUIDSGID=true
-ReadWritePaths=/var/lib/mk1ai
+ReadWritePaths=/var/lib/mk1ai/dashboard
+LimitMEMLOCK=64K
+# Optional on older systemd versions if the target runtime reports unsupported syscalls.
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target

@@ -17,6 +17,15 @@ spec.loader.exec_module(module)
 
 
 class AirgapAI6Test(unittest.TestCase):
+    @staticmethod
+    def _fake_torch(load):
+        # PyTorch 未導入環境では module.torch が None になるため、モジュール参照ごと差し替える
+        return mock.Mock(
+            load=load,
+            device=mock.Mock(return_value="cpu"),
+            cuda=mock.Mock(is_available=mock.Mock(return_value=False)),
+        )
+
     def test_calculate_entropy_returns_shannon_entropy(self):
         self.assertEqual(module.calculate_entropy(b""), 0.0)
         self.assertEqual(module.calculate_entropy(b"aaaa"), 0.0)
@@ -58,14 +67,14 @@ class AirgapAI6Test(unittest.TestCase):
             "head_c.bias": None,
         }
 
+        fake_torch = self._fake_torch(load=mock.Mock(return_value=fake_state))
         with mock.patch.object(module.os.path, "exists", return_value=True), \
              mock.patch.object(module, "_get_expected_model_hash", return_value="deadbeef"), \
              mock.patch.object(module, "_verify_model_hash", return_value=True), \
-             mock.patch.object(module.torch, "load", return_value=fake_state) as load_mock, \
-             mock.patch.object(module.torch, "device", return_value="cpu"):
+             mock.patch.object(module, "torch", fake_torch):
             model = DummyModel()
             self.assertTrue(module.load_local_model(model, "/tmp/local.pth"))
-            load_mock.assert_called()
+            fake_torch.load.assert_called_once_with("/tmp/local.pth", map_location="cpu", weights_only=True)
             self.assertEqual(model.loaded, fake_state)
 
     def test_load_local_model_rejects_mismatched_hash(self):
@@ -73,13 +82,26 @@ class AirgapAI6Test(unittest.TestCase):
             def load_state_dict(self, state_dict):
                 raise AssertionError("should not load")
 
+        fake_torch = self._fake_torch(load=mock.Mock(side_effect=AssertionError("torch.load should not run")))
         with mock.patch.object(module.os.path, "exists", return_value=True), \
              mock.patch.object(module, "_get_expected_model_hash", return_value="expected"), \
              mock.patch.object(module, "_verify_model_hash", return_value=False), \
-             mock.patch.object(module.torch, "load", side_effect=AssertionError("torch.load should not run")) as load_mock:
+             mock.patch.object(module, "torch", fake_torch):
             model = DummyModel()
             self.assertFalse(module.load_local_model(model, "/tmp/local.pth"))
-            load_mock.assert_not_called()
+            fake_torch.load.assert_not_called()
+
+    def test_load_local_model_rejects_missing_expected_hash(self):
+        class DummyModel:
+            def load_state_dict(self, state_dict):
+                raise AssertionError("should not load")
+
+        fake_torch = self._fake_torch(load=mock.Mock(side_effect=AssertionError("torch.load should not run")))
+        with mock.patch.object(module.os.path, "exists", return_value=True), \
+             mock.patch.object(module, "_get_expected_model_hash", return_value=None), \
+             mock.patch.object(module, "torch", fake_torch):
+            self.assertFalse(module.load_local_model(DummyModel(), "/tmp/local.pth"))
+            fake_torch.load.assert_not_called()
 
     def test_get_expected_model_hash_accepts_sha256sum_sidecar_format(self):
         expected_hash = hashlib.sha256(b"model-bytes").hexdigest()
@@ -119,8 +141,8 @@ class AirgapAI6Test(unittest.TestCase):
         }
         payload = module.generate_absolute_defense_payload(profile)
         self.assertTrue(any(cmd[:4] == ["ip", "link", "set", "eth0"] for cmd in payload["commands"]))
-        self.assertTrue(any(cmd[:2] == ["iptables", "-F"] for cmd in payload["commands"]))
-        self.assertTrue(any(cmd[:2] == ["nft", "flush"] for cmd in payload["commands"]))
+        self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
+        self.assertFalse(any(cmd[0] == "nft" for cmd in payload["commands"]))
 
     def test_self_protection_triggers_kill_switch_on_tamper(self):
         protection = module.SelfProtection("eth0", "eth0", dry_run=True)
