@@ -60,7 +60,7 @@ jobs:
       - name: Python tests
         run: python3 -m pytest -q
       - name: nftables namespace integration
-        run: sudo env MK1_RUN_NETNS_TESTS=1 python3 -m pytest -q tests/integration/test_firewall_netns.py
+        run: sudo env MK1_RUN_NETNS_TESTS=1 PYTHONPATH="$(python3 -m site --user-site)" python3 -m pytest -q tests/integration/test_firewall_netns.py
       - name: Clang static analyzer
         run: clang --version
       - name: Bandit (medium and above)
