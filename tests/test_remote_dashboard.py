@@ -1,4 +1,5 @@
 import http.client
+import hashlib
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ from mk1_remote_dashboard import (
     DashboardConfig,
     DashboardHandler,
     DashboardState,
+    LOGIN_HTML,
     RATE_LIMIT_REQUESTS,
     RemoteDashboardServer,
 )
@@ -59,6 +61,54 @@ class RemoteDashboardTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "loopback"):
             replace(self.config, host="0.0.0.0").validate()
 
+    def test_dashboard_always_shows_conservative_assurance_warning(self):
+        page = LOGIN_HTML.decode("utf-8")
+
+        self.assertIn("実効保証: 未主張 / S0", page)
+        self.assertIn("相互検証なし", page)
+        self.assertIn("ハードウェア信頼なし(追加層のみ)", page)
+        self.assertIn("端末完全侵害で端末内の機密性・完全性は保証喪失", page)
+        self.assertIn("ローカル適応学習", page)
+
+    def test_registration_verification_returns_credential_id_fingerprint(self):
+        credential_id = b"enrolled-passkey-id"
+        session = {
+            "stage": "registration",
+            "csrf": "csrf",
+            "challenge": b"challenge",
+            "challenge_expires": 9999999999,
+        }
+        handler = object.__new__(DashboardHandler)
+        dashboard_state = mock.Mock()
+        dashboard_state.config.origin = "https://localhost:8443"
+        dashboard_state.config.rp_id = "localhost"
+        handler.server = mock.Mock(dashboard_state=dashboard_state)
+        handler._request_session = mock.Mock(return_value=("session-id", session))
+        handler._send_json = mock.Mock()
+        verification = mock.Mock(
+            credential_id=credential_id,
+            credential_public_key=b"public-key",
+            sign_count=1,
+        )
+
+        with mock.patch(
+            "mk1_remote_dashboard.parse_registration_credential_json",
+            return_value=object(),
+        ), mock.patch(
+            "mk1_remote_dashboard.verify_registration_response",
+            return_value=verification,
+        ):
+            handler._registration_verify({"csrf": "csrf", "credential": {}})
+
+        dashboard_state.store_credential.assert_called_once_with(
+            credential_id, b"public-key", 1,
+        )
+        response = handler._send_json.call_args.args[1]
+        expected_fingerprint = hashlib.sha256(credential_id).hexdigest()
+        self.assertEqual(response["credential_id_sha256"], expected_fingerprint)
+        self.assertIn(expected_fingerprint, response["message"])
+        self.assertIn("out of band", response["message"])
+
     def test_remote_server_refuses_to_start_without_verified_wireguard(self):
         with mock.patch(
             "mk1_remote_dashboard.require_wireguard_full_tunnel",
@@ -78,6 +128,7 @@ class RemoteDashboardTest(unittest.TestCase):
             "interface=eth0\n"
             "model_sync_status=Loaded\n"
             "training_queue_batches=3\n"
+            "local_adaptation_enabled=0\n"
             "secret_token=do-not-expose\n"
             "threat_score=9000000001\n",
             encoding="ascii",
@@ -90,6 +141,7 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertEqual(result["packets_per_second"], 25.5)
         self.assertEqual(result["packets_total"], 42)
         self.assertEqual(result["alert"], "THREAT")
+        self.assertEqual(result["local_adaptation_enabled"], 0)
         self.assertNotIn("secret_token", result)
         self.assertNotIn("do-not-expose", repr(result))
         self.assertLessEqual(result["threat_score"], 1)

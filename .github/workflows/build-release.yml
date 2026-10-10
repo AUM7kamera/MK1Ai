@@ -5,6 +5,21 @@ on:
   pull_request:
 
 jobs:
+  formal-models:
+    runs-on: ubuntu-latest
+    container:
+      image: ocaml/opam:debian-12-ocaml-5.3@sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install ProVerif system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libexpat1-dev libgtk2.0-dev pkg-config
+      - name: Install pinned ProVerif
+        run: opam install -y --assume-depexts proverif.2.05
+      - name: Verify symbolic models
+        run: opam exec -- sh formal/check-proverif.sh
+
   static-analysis:
     runs-on: ubuntu-latest
     steps:
@@ -29,7 +44,9 @@ jobs:
           sudo ldconfig
           pkg-config --exists liboqs
       - name: Install Python test tools
-        run: python3 -m pip install pytest bandit
+        run: |
+          python3 -m pip install -r requirements-key-management.txt
+          python3 -m pip install pytest bandit
       - name: Native tests and static analysis (liboqs required)
         run: make check-ci
       - name: Python tests
@@ -39,4 +56,4 @@ jobs:
       - name: Clang static analyzer
         run: clang --version
       - name: Bandit (medium and above)
-        run: bandit -q -r airgap_ai_defender.py mk1_usb_guard.py mk1_remote_dashboard.py mk1_secure_transport.py mk1_memory_guard.py mk1_map.py --severity-level medium
+        run: bandit -q -r airgap_ai_defender.py mk1_usb_guard.py mk1_remote_dashboard.py mk1_secure_transport.py mk1_memory_guard.py mk1_map.py mk1_key_derivation.py mk1_key_backup.py mk1_hybrid_kem.py mk1_session_ratchet.py mk1_key_registry.py mk1_quorum.py mk1_quorum_cli.py mk1_external_verifier.py mk1_external_verifier_cli.py --severity-level medium

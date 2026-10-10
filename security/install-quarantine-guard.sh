@@ -11,6 +11,8 @@ repository_root=$(cd -- "$script_dir/.." && pwd)
 install -d -o root -g root -m 0755 /opt/mk1ai
 install -o root -g root -m 0755 "$repository_root/mk1_firewall.py" /opt/mk1ai/mk1_firewall.py
 install -o root -g root -m 0755 "$repository_root/mk1_airgap.py" /opt/mk1ai/mk1_airgap.py
+install -o root -g root -m 0755 "$repository_root/mk1_quorum.py" /opt/mk1ai/mk1_quorum.py
+install -o root -g root -m 0755 "$repository_root/mk1_quorum_cli.py" /opt/mk1ai/mk1_quorum_cli.py
 install -o root -g root -m 0755 "$repository_root/mk1_quarantine.py" /opt/mk1ai/mk1_quarantine.py
 
 install -o root -g root -m 0644 \
@@ -25,7 +27,8 @@ for unit in NetworkManager.service systemd-networkd.service networking.service '
 done
 
 install -d -o root -g root -m 0700 /var/lib/mk1ai-security
+install -d -o root -g root -m 0700 /etc/mk1ai/quorum
 systemctl daemon-reload
 systemctl start mk1ai-quarantine.service
 systemctl enable mk1ai-quarantine.service
-printf 'Quarantine guard installed. Initial state is quarantined; provision two distinct approver public keys out of band.\n'
+printf 'Quarantine guard installed. Initial state is quarantined; provision two or three distinct Ed25519 node public keys out of band. Release requires two valid signatures.\n'

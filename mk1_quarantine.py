@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
-import hashlib
 import hmac
 import json
 import os
@@ -20,18 +19,23 @@ from typing import Iterator
 
 from mk1_airgap import disable_all_network_paths
 from mk1_firewall import apply_nft_policy
+from mk1_quorum import (
+    MAX_APPROVAL_BUNDLE_BYTES,
+    QuorumError,
+    load_trusted_quorum_keys,
+    verify_approval_bundle,
+)
 
 
 STATE_DIRECTORY = Path("/var/lib/mk1ai-security")
 STATE_FILE = "quarantine-state.json"
 LOCK_FILE = "quarantine-state.lock"
 APPROVER_KEYS = (
-    Path("/etc/mk1ai/quarantine-approver-1.pub"),
-    Path("/etc/mk1ai/quarantine-approver-2.pub"),
+    ("node-1", Path("/etc/mk1ai/quorum/node-1.pub")),
+    ("node-2", Path("/etc/mk1ai/quorum/node-2.pub")),
+    ("node-3", Path("/etc/mk1ai/quorum/node-3.pub")),
 )
-OPENSSL_PATHS = ("/usr/bin/openssl", "/usr/local/bin/openssl", "/bin/openssl")
 MAX_STATE_BYTES = 4096
-MAX_SIGNATURE_BYTES = 4096
 
 
 class QuarantineError(RuntimeError):
@@ -45,8 +49,7 @@ class QuarantineStateStore:
         *,
         expected_uid: int = 0,
         strict_ancestors: bool = True,
-        approver_keys: tuple[Path, Path] = APPROVER_KEYS,
-        openssl_path: str | None = None,
+        approver_keys: tuple[tuple[str, Path], ...] = APPROVER_KEYS,
         nft_apply=apply_nft_policy,
         nft_remove=None,
         airgap_disable=disable_all_network_paths,
@@ -56,8 +59,7 @@ class QuarantineStateStore:
         self.lock_path = self.directory / LOCK_FILE
         self.expected_uid = expected_uid
         self.strict_ancestors = strict_ancestors
-        self.approver_keys = approver_keys
-        self.openssl_path = openssl_path
+        self.approver_keys = dict(approver_keys)
         self.nft_apply = nft_apply
         self.nft_remove = nft_remove or _remove_nft_policy
         self.airgap_disable = airgap_disable
@@ -114,8 +116,7 @@ class QuarantineStateStore:
     def release(
         self,
         challenge: str,
-        signature_one: str | Path,
-        signature_two: str | Path,
+        approval_bundle_path: str | Path,
     ) -> bool:
         with self._locked():
             state = self._load_or_initialize()
@@ -127,11 +128,8 @@ class QuarantineStateStore:
             ):
                 raise QuarantineError("Release challenge is absent, stale, or mismatched")
             message = _release_message(state["generation"], pending)
-            signatures = (
-                _read_untrusted_signature(signature_one),
-                _read_untrusted_signature(signature_two),
-            )
-            self._verify_approvals(message, signatures)
+            approval_bundle = _read_untrusted_approval_bundle(approval_bundle_path)
+            self._verify_approvals(message, approval_bundle)
             state["state"] = "released"
             state["generation"] += 1
             state["pending_challenge"] = None
@@ -151,44 +149,21 @@ class QuarantineStateStore:
                 raise QuarantineError("Unable to remove nftables quarantine policy")
             return True
 
-    def _verify_approvals(self, message: bytes, signatures: tuple[bytes, bytes]) -> None:
-        openssl = _trusted_openssl(self.openssl_path, self.expected_uid)
-        key_fingerprints = tuple(
-            _public_key_fingerprint(
-                openssl,
-                path,
-                self.expected_uid,
+    def _verify_approvals(self, message: bytes, approval_bundle: bytes) -> None:
+        try:
+            trusted_keys = load_trusted_quorum_keys(
+                self.approver_keys,
+                expected_uid=self.expected_uid,
                 strict_ancestors=self.strict_ancestors,
             )
-            for path in self.approver_keys
-        )
-        if hmac.compare_digest(key_fingerprints[0], key_fingerprints[1]):
-            raise QuarantineError("The two approver public keys must be distinct")
-        with tempfile.TemporaryDirectory(
-            prefix="mk1ai-release-", dir=self.directory,
-        ) as temporary_directory:
-            temp_path = Path(temporary_directory)
-            message_path = temp_path / "release-message"
-            signature_paths = (temp_path / "approval-1.sig", temp_path / "approval-2.sig")
-            message_path.write_bytes(message)
-            for path, signature in zip(signature_paths, signatures, strict=True):
-                path.write_bytes(signature)
-            for key_path, signature_path in zip(
-                self.approver_keys, signature_paths, strict=True,
-            ):
-                verified = subprocess.run(
-                    [
-                        openssl, "pkeyutl", "-verify", "-pubin",
-                        "-inkey", str(key_path), "-rawin",
-                        "-in", str(message_path), "-sigfile", str(signature_path),
-                    ],
-                    check=False,
-                    capture_output=True,
-                    timeout=10,
-                    env={"PATH": "/usr/bin:/bin", "HOME": "/"},
-                )
-                if verified.returncode != 0:
-                    raise QuarantineError("An operator release signature is invalid")
+            verify_approval_bundle(
+                message,
+                approval_bundle,
+                trusted_keys,
+                threshold=2,
+            )
+        except QuorumError as exc:
+            raise QuarantineError(str(exc)) from exc
 
     def _load_or_initialize(self) -> dict:
         self._verify_directory(create=True)
@@ -320,65 +295,37 @@ def _release_message(generation: int, challenge: str) -> bytes:
     return f"MK1AI-QUARANTINE-RELEASE-v1\n{generation}\n{challenge}\n".encode("ascii")
 
 
-def _read_untrusted_signature(path: str | Path) -> bytes:
-    signature_path = Path(path)
-    signature_stat = signature_path.lstat()
-    if (
-        not stat.S_ISREG(signature_stat.st_mode)
-        or signature_stat.st_size <= 0
-        or signature_stat.st_size > MAX_SIGNATURE_BYTES
-    ):
-        raise QuarantineError("Operator signature file is invalid")
-    return signature_path.read_bytes()
-
-
-def _public_key_fingerprint(
-    openssl: str,
-    path: str | Path,
-    expected_uid: int,
-    *,
-    strict_ancestors: bool,
-) -> bytes:
-    key_path = Path(path)
-    key_stat = key_path.lstat()
-    if (
-        not stat.S_ISREG(key_stat.st_mode)
-        or key_stat.st_uid != expected_uid
-        or key_stat.st_mode & 0o022
-        or key_stat.st_size > 16_384
-    ):
-        raise QuarantineError("Operator public key ownership or mode is invalid")
-    if strict_ancestors:
-        for parent in key_path.parents:
-            parent_stat = parent.stat()
-            if parent_stat.st_uid != expected_uid or parent_stat.st_mode & 0o022:
-                raise QuarantineError("Operator public key has an untrusted parent directory")
-    result = subprocess.run(
-        [openssl, "pkey", "-pubin", "-in", str(key_path), "-outform", "DER"],
-        check=False,
-        capture_output=True,
-        timeout=10,
-        env={"PATH": "/usr/bin:/bin", "HOME": "/"},
-    )
-    if result.returncode != 0 or not result.stdout:
-        raise QuarantineError("Operator public key could not be parsed")
-    return hashlib.sha256(result.stdout).digest()
-
-
-def _trusted_openssl(path: str | None, expected_uid: int) -> str:
-    candidates = [path] if path else list(OPENSSL_PATHS)
-    for candidate in candidates:
-        if candidate is None or not os.path.exists(candidate):
-            continue
-        resolved = Path(candidate).resolve(strict=True)
-        executable_stat = resolved.stat()
+def _read_untrusted_approval_bundle(path: str | Path) -> bytes:
+    bundle_path = Path(path)
+    try:
+        file_descriptor = os.open(
+            bundle_path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise QuarantineError("Operator approval bundle could not be opened") from exc
+    try:
+        bundle_stat = os.fstat(file_descriptor)
         if (
-            stat.S_ISREG(executable_stat.st_mode)
-            and executable_stat.st_uid == expected_uid
-            and not executable_stat.st_mode & 0o022
+            not stat.S_ISREG(bundle_stat.st_mode)
+            or bundle_stat.st_size <= 0
+            or bundle_stat.st_size > MAX_APPROVAL_BUNDLE_BYTES
         ):
-            return str(resolved)
-    raise QuarantineError("A trusted OpenSSL executable is required for release")
+            raise QuarantineError("Operator approval bundle is invalid")
+        chunks: list[bytes] = []
+        remaining = MAX_APPROVAL_BUNDLE_BYTES + 1
+        while remaining:
+            chunk = os.read(file_descriptor, min(remaining, 4096))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        bundle = b"".join(chunks)
+        if len(bundle) > MAX_APPROVAL_BUNDLE_BYTES:
+            raise QuarantineError("Operator approval bundle exceeds its size limit")
+        return bundle
+    finally:
+        os.close(file_descriptor)
 
 
 def _remove_nft_policy() -> bool:
@@ -415,8 +362,7 @@ def _main() -> int:
     commands.add_parser("issue-release-challenge")
     release = commands.add_parser("release")
     release.add_argument("--challenge", required=True)
-    release.add_argument("--signature-1", required=True, type=Path)
-    release.add_argument("--signature-2", required=True, type=Path)
+    release.add_argument("--approval-bundle", required=True, type=Path)
     args = parser.parse_args()
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         parser.error("quarantine operations must run as root")
@@ -427,7 +373,7 @@ def _main() -> int:
         elif args.command == "issue-release-challenge":
             os.write(1, store.issue_challenge())
         else:
-            store.release(args.challenge, args.signature_1, args.signature_2)
+            store.release(args.challenge, args.approval_bundle)
     except (OSError, QuarantineError, subprocess.SubprocessError) as exc:
         parser.error(str(exc))
     return 0
