@@ -1,0 +1,16 @@
+free c: channel.
+free user_factor: bitstring [private].
+free no_hardware_factor: bitstring.
+free no_fido_factor: bitstring.
+free payload: bitstring [private].
+
+fun derive_root(bitstring, bitstring, bitstring): bitstring.
+fun aenc(bitstring, bitstring): bitstring.
+reduc forall message:bitstring, key:bitstring;
+  adec(aenc(message, key), key) = message.
+
+query attacker(payload).
+
+process
+  let root = derive_root(user_factor, no_hardware_factor, no_fido_factor) in
+  out(c, aenc(payload, root))

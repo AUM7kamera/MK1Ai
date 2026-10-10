@@ -66,6 +66,7 @@ except ImportError:
 
 try:
     import psutil
+    from mk1_firewall import apply_nft_policy
 except ImportError:
     psutil = None
 
@@ -460,21 +461,28 @@ def _run_command(cmd: list[str], dry_run: bool = False) -> bool:
 
 def generate_absolute_defense_payload(profile: dict) -> dict:
     commands = []
+    nft_policy = None
     for iface in profile.get("available_interfaces", []):
         commands.append(["ip", "link", "set", iface, "down"])
     if profile.get("tools", {}).get("ip"):
         commands.append(["ip", "route", "replace", "default", "unreachable"])
         commands.append(["ip", "route", "add", "default", "unreachable"])
-    if profile.get("tools", {}).get("iptables"):
+    if profile.get("tools", {}).get("nft"):
+        nft_policy = {
+            "mode": "full_isolation",
+            "management_ips": [],
+            "management_ports": [],
+        }
+    elif profile.get("tools", {}).get("iptables"):
         commands.extend([
-            ["iptables", "-F"],
+            ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
+            ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
+            ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
             ["iptables", "-P", "INPUT", "DROP"],
             ["iptables", "-P", "OUTPUT", "DROP"],
             ["iptables", "-P", "FORWARD", "DROP"],
         ])
-    if profile.get("tools", {}).get("nft"):
-        commands.append(["nft", "flush", "ruleset"])
-    return {"commands": commands, "profile": profile}
+    return {"commands": commands, "nft_policy": nft_policy, "profile": profile}
 
 
 def _is_suspicious_process(proc) -> bool:
@@ -544,6 +552,11 @@ def execute_kill_switch(interface: str, dry_run: bool, profile: dict | None = No
     payload = generate_absolute_defense_payload(profile)
     log.critical(f"[KILL_SWITCH] キルスイッチを発動します: interface={interface}")
     success = True
+    nft_policy = payload.get("nft_policy")
+    if nft_policy is not None and not dry_run:
+        if not apply_nft_policy(**nft_policy):
+            log.critical("[NFT] 単一トランザクションに失敗しました。隔離完了とは扱いません。")
+            success = False
     for cmd in payload["commands"]:
         if not _run_command(cmd, dry_run=dry_run):
             success = False

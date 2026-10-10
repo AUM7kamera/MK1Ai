@@ -30,8 +30,9 @@ pct pull "$registration_ctid" "$profile_source" "$profile_copy"
     exit 1
 }
 
-python3 - "$profile_copy" <<'PY'
+credential_fingerprints=$(python3 - "$profile_copy" <<'PY'
 import base64
+import hashlib
 import json
 import pathlib
 import sys
@@ -76,7 +77,31 @@ for credential in profile["credentials"]:
     if credential_id in seen:
         raise SystemExit("Duplicate credential ID")
     seen.add(credential_id)
+    print(hashlib.sha256(credential_id).hexdigest())
 PY
+)
+
+if [[ ! -t 0 ]]; then
+    printf 'Interactive out-of-band fingerprint confirmation is required.\n' >&2
+    exit 1
+fi
+mapfile -t credential_fingerprint_list <<< "$credential_fingerprints"
+for fingerprint in "${credential_fingerprint_list[@]}"; do
+    [[ $fingerprint =~ ^[0-9a-f]{64}$ ]] || {
+        printf 'Invalid credential fingerprint generated from profile.\n' >&2
+        exit 1
+    }
+    printf 'Credential ID SHA-256: %s\n' "$fingerprint"
+    printf 'Compare with the enrollment result through an independent channel, then type the full fingerprint: '
+    if ! IFS= read -r confirmation; then
+        printf 'Could not read credential fingerprint confirmation.\n' >&2
+        exit 1
+    fi
+    [[ $confirmation == "$fingerprint" ]] || {
+        printf 'Credential fingerprint confirmation failed; refusing transfer.\n' >&2
+        exit 1
+    }
+done
 
 chmod 0400 "$profile_copy"
 profile_sha256=$(sha256sum "$profile_copy")

@@ -11,6 +11,7 @@ import runpy
 import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 import time
 import unittest
@@ -313,6 +314,11 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertIn("isolation_active=1\n", content)
         self.assertIn("memory_guard_active=1\n", content)
         self.assertIn("alert=AIRGAP\n", content)
+        self.assertIn("effective_profile=unclaimed_S0\n", content)
+        self.assertIn("hardware_trust=none_optional_layer_only\n", content)
+        self.assertIn("mutual_verification=none\n", content)
+        self.assertIn("local_adaptation_enabled=0\n", content)
+        self.assertIn("assurance_warning=full_endpoint_compromise_loses_assurance\n", content)
         self.assertEqual(status_mode, 0o600)
         self.assertEqual(remaining_temporary_files, [])
 
@@ -356,14 +362,54 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
     def test_panel_full_isolation_stops_all_nics_before_other_containment_work(self):
         with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(module, "_disable_all_network_interfaces", return_value=True) as stop_all, \
+             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
+             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True), \
+             mock.patch.object(module, "disable_all_network_paths", return_value=True) as stop_all, \
              mock.patch.object(module, "_close_panel_after_airgap") as close_panel, \
              mock.patch.object(module, "profile_environment", side_effect=AssertionError("slow follow-up must not run")), \
              mock.patch.object(module, "execute_generated_payload", side_effect=AssertionError("fallback must not run")):
             module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0", "wlan0"])
 
-        stop_all.assert_called_once_with(["eth0", "wlan0"])
+        stop_all.assert_called_once_with()
         close_panel.assert_called_once_with()
+
+    def test_management_safe_harbor_uses_validated_tcp_policy_without_stopping_nics(self):
+        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
+             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True) as apply, \
+             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
+             mock.patch.object(
+                 module, "disable_all_network_paths",
+                 side_effect=AssertionError("safe-harbor must retain its configured TCP path"),
+             ):
+            self.assertTrue(module.execute_kill_switch(
+                "eth0",
+                dry_run=False,
+                management_ports=[22],
+                management_ips=["192.0.2.10"],
+            ))
+
+        apply.assert_called_once_with(
+            "management_safe_harbor",
+            ["192.0.2.10"],
+            [22],
+        )
+
+    def test_persisted_quarantine_follows_atomic_policy_application(self):
+        events = []
+        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
+             mock.patch.object(
+                 module, "_apply_nft_policy_with_sudo",
+                 side_effect=lambda *args, **kwargs: events.append("firewall") or True,
+             ), \
+             mock.patch.object(
+                 module, "_persist_quarantine_state",
+                 side_effect=lambda: events.append("state") or True,
+             ), \
+             mock.patch.object(module, "disable_all_network_paths", return_value=True), \
+             mock.patch.object(module, "_close_panel_after_airgap"):
+            self.assertTrue(module.execute_kill_switch("eth0", dry_run=False))
+
+        self.assertEqual(events, ["firewall", "state"])
 
     def test_root_privilege_drop_uses_sudo_invoking_user(self):
         passwd_entry = mock.Mock(pw_name="workspace-user")
@@ -394,7 +440,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         status = module._format_compact_status(252, 1500, 4.5, 0.05, "Connected", "RSI", True)
         self.assertEqual(
             status,
-            "[STATUS] RAM: 252MB/1500MB | Swap: 4.5MB | Score: 0.05 | Colab: Connected | Model: Disabled | Mode: RSI (Dry-Run)",
+            "[STATUS] RAM: 252MB/1500MB | Swap: 4.5MB | Score: 0.05 | Colab: Connected | Model: Disabled | Mode: RSI (Dry-Run) | Effective profile: unclaimed/S0 | Hardware trust: none (optional layer only) | No mutual verification: full endpoint compromise loses assurance",
         )
 
     def test_derive_cloud_model_urls_from_rsi_endpoint(self):
@@ -519,6 +565,33 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         secure_request.assert_not_called()
 
     @requires_torch
+    def test_cloud_model_apply_does_not_enable_local_feedback_when_adaptation_disabled(self):
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        state_dict = model.state_dict()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = os.path.join(temp_dir, "local_adaptation.pth")
+            feedback_dir = pathlib.Path(temp_dir) / "curated"
+            feedback_dir.mkdir()
+            (feedback_dir / "reviewed_feedback.jsonl").write_text(
+                json.dumps({"features": [0.5] * 10, "label": 0}) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(module, "_PENDING_CLOUD_STATE", state_dict), \
+                 mock.patch.object(module, "_PENDING_CLOUD_REVIEWED", True), \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", False), \
+                 mock.patch.object(module, "_HEAD_B_REVIEWED", True), \
+                 mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", {0, 1}), \
+                 mock.patch.object(module, "_MODEL_SYNC_STATUS", "Updated"), \
+                 mock.patch.object(module, "load_raw_data_from_files") as load_feedback, \
+                 mock.patch.object(module, "train_local_whitelist") as train:
+                self.assertTrue(module._apply_pending_cloud_model(model, checkpoint_path))
+
+                self.assertFalse(module._HEAD_B_REVIEWED)
+                self.assertEqual(module._HEAD_B_REVIEWED_LABELS, set())
+                load_feedback.assert_not_called()
+                train.assert_not_called()
+
+    @requires_torch
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -555,6 +628,34 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["block"])
         self.assertNotEqual(result["stage"], "ai")
+
+    def test_high_ai_score_is_advisory_and_cannot_block(self):
+        features = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5]
+        with mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             mock.patch.object(module, "parse_packet_transport", return_value=None), \
+             mock.patch.object(module, "analyze_packet_security_markers", return_value=[]), \
+             mock.patch.object(module, "_compute_behavioral_signature_score", return_value=0.0), \
+             mock.patch.object(module, "_compute_unknown_behavior_score", return_value=0.0):
+            result = module.inspect_packet_pipeline(
+                b"x" * 64,
+                "lo",
+                feature_vector=features,
+                dpi_result={"suspicious": True, "score": 0.99, "findings": []},
+            )
+
+        self.assertFalse(result["block"])
+        self.assertEqual(result["stage"], "advisory")
+        self.assertGreaterEqual(result["advisory"]["ai_score"], 0.88)
+
+    def test_oversized_frame_is_blocked_by_fixed_length_rule(self):
+        result = module.inspect_packet_pipeline(
+            b"x" * (module._MAX_ENFORCED_FRAME_BYTES + 1),
+            "eth0",
+            dpi_result={"suspicious": False},
+        )
+
+        self.assertTrue(result["block"])
+        self.assertEqual(result["stage"], "frame_length")
 
     def test_selected_feature_capture_is_bounded_atomic_and_feature_only(self):
         record = {"features": [0.25] * 10, "label": 0}
@@ -981,6 +1082,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 json.dumps({"features": [0.8] * 10, "label": 1}),
             ]) + "\n", encoding="utf-8")
             with mock.patch.object(module, "download_from_gdrive_folder") as download, \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
                  mock.patch.object(module, "train_local_whitelist") as train:
                 result = module._run_lightweight_training_validation(
                     temp_dir,
@@ -1005,6 +1107,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 json.dumps(record) + "\n", encoding="utf-8",
             )
             with mock.patch.object(module, "download_from_gdrive_folder") as download, \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
                  mock.patch.object(module, "train_local_whitelist") as train:
                 result = module._run_lightweight_training_validation(
                     temp_dir,
@@ -1029,7 +1132,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
             with mock.patch.object(
                 module, "download_from_gdrive_folder", side_effect=download_to_local,
-            ) as download, mock.patch.object(module, "train_local_whitelist") as train:
+            ) as download, mock.patch.object(
+                module, "_LOCAL_ADAPTATION_ENABLED", True,
+            ), mock.patch.object(module, "train_local_whitelist") as train:
                 result = module._run_lightweight_training_validation(
                     temp_dir,
                     "folder-id",
@@ -1041,15 +1146,70 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         download.assert_called_once_with("folder-id", os.path.join(temp_dir, "gdrive_raw"))
         train.assert_called_once()
 
+    def test_validation_refuses_local_adaptation_while_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "download_from_gdrive_folder") as download:
+            result = module._run_lightweight_training_validation(
+                temp_dir,
+                "folder-id",
+                max_samples=1,
+            )
+
+        self.assertEqual(result, 3)
+        download.assert_not_called()
+
+    def test_validation_cli_refuses_before_rsi_or_filesystem_work(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_dir = os.path.join(temp_dir, "data")
+            with mock.patch("sys.argv", [
+                "airgap_ai_defender.py",
+                "--validation-only",
+                "--mode", "RSI",
+                "--local-dir", local_dir,
+            ]), mock.patch.object(module, "_merge_runtime_config", return_value={}), \
+                 mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", False), \
+                 mock.patch.object(module, "_start_colab_rsi_request") as start_rsi:
+                result = module.main()
+
+        self.assertEqual(result, 3)
+        self.assertFalse(os.path.exists(local_dir))
+        start_rsi.assert_not_called()
+
     def test_training_queue_is_bounded(self):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
+
+    @requires_torch
+    def test_local_adaptation_is_disabled_by_default(self):
+        torch = module.torch
+        model = module.LightweightMultiTaskAI(input_dim=10)
+        original_head_b = model.head_b[0].weight.detach().clone()
+        optimizer = module.torch.optim.SGD(model.parameters(), lr=0.01)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
+            module.train_local_whitelist(
+                model,
+                optimizer,
+                [{"features": [0.2] * 10}, {"features": [0.8] * 10}],
+                checkpoint_path=checkpoint_path,
+            )
+
+            self.assertFalse(module._LOCAL_ADAPTATION_ENABLED)
+            self.assertFalse(pathlib.Path(checkpoint_path).exists())
+            self.assertFalse(pathlib.Path(checkpoint_path + ".sha256").exists())
+            self.assertFalse(module._load_local_adaptation(model, checkpoint_path))
+            torch.testing.assert_close(model.head_b[0].weight, original_head_b)
+
+        with mock.patch.object(module, "_train_queue") as train_queue:
+            self.assertTrue(module._enqueue_training_batch([{"features": [0.2] * 10}]))
+            train_queue.put.assert_not_called()
 
     @requires_torch
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
              mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
              tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
             model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1079,6 +1239,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
     def test_local_feedback_checkpoint_marks_both_reviewed_classes(self):
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
              mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
+             mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True), \
              tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = str(pathlib.Path(temp_dir) / "local_adaptation.pth")
             model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1099,14 +1260,15 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         queued_batch = [{"features": [0.1] * 10, "label": 0}]
         rejected_batch = [{"features": [0.9] * 10, "label": 1}]
         full_queue.put_nowait(queued_batch)
-        try:
-            module._train_queue = full_queue
-            started = module.time.monotonic()
-            self.assertFalse(module._enqueue_training_batch(rejected_batch))
-            self.assertLess(module.time.monotonic() - started, 0.5)
-            self.assertIs(full_queue.get_nowait(), queued_batch)
-        finally:
-            module._train_queue = original_queue
+        with mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True):
+            try:
+                module._train_queue = full_queue
+                started = module.time.monotonic()
+                self.assertFalse(module._enqueue_training_batch(rejected_batch))
+                self.assertLess(module.time.monotonic() - started, 0.5)
+                self.assertIs(full_queue.get_nowait(), queued_batch)
+            finally:
+                module._train_queue = original_queue
 
     def test_monitor_candidates_never_enqueue_training_batches(self):
         candidates = []
@@ -1203,12 +1365,35 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             module.evaluate_threat_state("eth0", dry_run=True, score_a=0.1, backdoor_detected=True)
             kill_switch.assert_called_once_with("eth0", True)
 
-    def test_handle_packet_event_triggers_kill_switch_when_threat_active(self):
-        with mock.patch.object(module, "execute_kill_switch") as kill_switch:
+    def test_handle_packet_event_does_not_enforce_advisory_backdoor_score(self):
+        original_triggered = module._KILL_SWITCH_TRIGGERED
+        original_risk = module._BACKDOOR_RISK_SCORE
+        try:
             module._KILL_SWITCH_TRIGGERED = False
             module._BACKDOOR_RISK_SCORE = 0.9
-            module.handle_packet_event(b"\x00", "eth0", dry_run=True)
-            kill_switch.assert_called_once_with("eth0", True)
+            with mock.patch.object(module, "evaluate_threat_state") as evaluate:
+                self.assertFalse(module.handle_packet_event(b"\x00", "eth0", dry_run=True))
+                evaluate.assert_not_called()
+        finally:
+            module._KILL_SWITCH_TRIGGERED = original_triggered
+            module._BACKDOOR_RISK_SCORE = original_risk
+
+    def test_process_backdoor_findings_are_advisory_only(self):
+        original_risk = module._BACKDOOR_RISK_SCORE
+        try:
+            module._BACKDOOR_RISK_SCORE = 0.0
+            with mock.patch.object(module, "evaluate_threat_state") as evaluate:
+                boost = module.apply_backdoor_findings([{
+                    "type": "external_connection",
+                    "pid": 123,
+                    "name": "unknown-process",
+                    "remote": "203.0.113.10:9000",
+                }])
+
+            self.assertGreater(boost, 0.0)
+            evaluate.assert_not_called()
+        finally:
+            module._BACKDOOR_RISK_SCORE = original_risk
 
     def test_is_google_drive_whitelisted_packet_never_bypasses_traffic(self):
         gdrive_packet = self._build_ipv4_tcp_packet("1.2.3.4", "8.8.8.8", 443)
@@ -1787,18 +1972,27 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         return ethernet_header + ip_header + tcp_header
 
     def test_execute_kill_switch_runs_all_commands_when_some_fail(self):
-        with mock.patch.object(module, "_run_command_with_sudo", side_effect=[False, True, True, True, True, True, True, True]) as run_cmd, \
-             mock.patch.object(module, "discover_available_interfaces", return_value=["eth0"]), \
-             mock.patch("shutil.which", return_value="/usr/bin/mocked_path"):
+        profile = {
+            "os": {"system": "Linux"},
+            "available_interfaces": ["eth0"],
+            "tools": {"ip": True, "iptables": True, "nft": False},
+            "permissions": {"root": True},
+            "network_layers": ["physical"],
+        }
+        with mock.patch.object(module, "_run_command_with_sudo", side_effect=[False, True, True]) as run_cmd, \
+             mock.patch.object(module, "profile_environment", return_value=profile), \
+             mock.patch.object(module, "_probe_network_connectivity", return_value=False), \
+             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
+             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True):
             module._KILL_SWITCH_TRIGGERED = False
             module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0"])
             self.assertEqual(run_cmd.call_count, 3)
 
             executed_commands = [call.args[0] for call in run_cmd.call_args_list]
             self.assertEqual(executed_commands, [
-                ["iptables", "-I", "INPUT", "-j", "DROP"],
-                ["iptables", "-I", "OUTPUT", "-j", "DROP"],
-                ["iptables", "-I", "FORWARD", "-j", "DROP"],
+                ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
+                ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
+                ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
             ])
 
     def test_build_containment_plan_preserves_management_sessions(self):
@@ -1980,6 +2174,16 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(module._configured_management_route(), {})
             self.assertEqual(module.build_containment_plan("eth0")["mode"], "full_isolation")
 
+    def test_invalid_management_ip_is_not_loaded_from_configuration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({"management_ips": ["not-an-ip"]}, handle)
+
+            config = module._load_runtime_config(config_path)
+
+        self.assertNotIn("management_ips", config)
+
     def _run_kill_switch_with_route(self, route, containment_mode="full_isolation"):
         with mock.patch.object(module, "_PANEL_FULL_ISOLATION", False), \
              mock.patch.object(module, "build_containment_plan", return_value={"mode": "x"}) as build, \
@@ -2035,7 +2239,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertIsNone(module._PRIVILEGED_CAPTURE_PROCESS)
         self.assertFalse(module._PRIVILEGED_AGENT_ACTIVE)
 
-    def test_generate_optimal_kill_payload_includes_nft_flush_when_available(self):
+    def test_generate_optimal_kill_payload_uses_scoped_nft_quarantine(self):
         profile = {
             "os": {"system": "Linux"},
             "available_interfaces": ["eth0"],
@@ -2044,12 +2248,103 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             "network_layers": ["physical"],
         }
         payload = module.generate_optimal_kill_payload(profile, learning_data=["vpn"])
-        self.assertFalse(any(cmd[:2] == ["nft", "flush"] for cmd in payload["commands"]))
-        self.assertTrue(any(
-            cmd[:2] == ["nft", "flush"]
-            for fallback in payload["fallback_payloads"]
-            for cmd in fallback["commands"]
+        from mk1_firewall import render_nft_transaction
+
+        self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
+        transaction = render_nft_transaction(**payload["nft_policy"])
+        self.assertIn("destroy table inet mk1ai_quarantine", transaction)
+        self.assertIn("policy drop", transaction)
+        self.assertNotIn("mk1ai_egress", transaction)
+        self.assertTrue(payload["require_all_commands"])
+
+    def test_safe_harbor_route_reaches_nft_payload(self):
+        profile = {
+            "os": {"system": "Linux"},
+            "available_interfaces": ["eth0"],
+            "tools": {"ip": True, "iptables": True, "nft": True},
+            "permissions": {"root": True},
+            "network_layers": ["physical"],
+        }
+        plan = module.build_containment_plan(
+            "eth0",
+            containment_mode="management_safe_harbor",
+            management_ips=["192.0.2.10", "2001:db8::10"],
+            management_ports=[22, 443],
+        )
+
+        payload = module.generate_optimal_kill_payload(profile, containment_plan=plan)
+
+        self.assertEqual(payload["effective_containment_mode"], "management_safe_harbor")
+        from mk1_firewall import render_nft_transaction
+
+        transaction = render_nft_transaction(**payload["nft_policy"])
+        self.assertIn("ip saddr 192.0.2.10 tcp dport 22 accept", transaction)
+        self.assertIn(
+            "ip6 daddr 2001:db8::10 tcp dport 443 accept",
+            transaction,
+        )
+        self.assertNotIn("udp", transaction)
+        self.assertEqual(payload["nft_policy"]["mode"], "management_safe_harbor")
+        self.assertFalse(any(
+            command[:2] == ["iptables", "-I"]
+            for command in payload["commands"]
         ))
+
+    def test_safe_harbor_rejects_invalid_network_inputs(self):
+        from mk1_firewall import render_nft_transaction
+
+        with self.assertRaises(ValueError):
+            render_nft_transaction(
+                mode="management_safe_harbor",
+                management_ips=["not-an-ip"],
+                management_ports=[22],
+            )
+        with self.assertRaises(ValueError):
+            render_nft_transaction(
+                mode="management_safe_harbor",
+                management_ips=["192.0.2.10"],
+                management_ports=[0],
+            )
+        with self.assertRaises(ValueError):
+            render_nft_transaction(
+                mode="management_safe_harbor",
+                management_ips=["192.0.2.10"] * 17,
+                management_ports=[22] * 16,
+            )
+
+    def test_nft_policy_failure_prevents_isolation_success(self):
+        payload = {
+            "nft_policy": {
+                "mode": "full_isolation",
+                "management_ips": [],
+                "management_ports": [],
+            },
+            "commands": [],
+            "fallback_payloads": [],
+            "require_all_commands": True,
+        }
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=False), \
+             mock.patch.object(module, "_attempt_pure_python_network_barrier", return_value=True):
+            self.assertFalse(module.execute_generated_payload(payload, interface="eth0"))
+
+    def test_nft_policy_is_applied_as_one_stdin_transaction(self):
+        from mk1_firewall import apply_nft_policy
+
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("mk1_firewall.os.geteuid", return_value=0), \
+             mock.patch("mk1_firewall._trusted_nft_binary", return_value="/usr/sbin/nft"), \
+             mock.patch("mk1_firewall.subprocess.run", return_value=completed) as run:
+            self.assertTrue(apply_nft_policy(
+                mode="management_safe_harbor",
+                management_ips=["192.0.2.10"],
+                management_ports=[22],
+            ))
+
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["/usr/sbin/nft", "-f", "-"])
+        self.assertIn("ip saddr 192.0.2.10 tcp dport 22 accept", kwargs["input"])
+        self.assertTrue(kwargs["text"])
 
     def test_memory_manager_check_considers_head_c_score(self):
         temp_swap_dir = "./test_swap"
@@ -2217,13 +2512,13 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertFalse(result["suspicious"])
         self.assertLess(result["score"], 0.5)
 
-    def test_inspect_packet_pipeline_blocks_on_dpi_suspicious_payload(self):
+    def test_inspect_packet_pipeline_blocks_on_fixed_payload_signature(self):
         packet = self._build_ipv4_tcp_packet("1.1.1.1", "2.2.2.2", 80)
         suspicious_payload = b"eval(cmd)"
         dpi_result = module.analyze_dpi_payload(packet + suspicious_payload)
         result = module.inspect_packet_pipeline(packet + suspicious_payload, "eth0", dpi_result=dpi_result)
         self.assertTrue(result["block"])
-        self.assertEqual(result["stage"], "dpi")
+        self.assertEqual(result["stage"], "signature")
 
     def test_untrained_model_keeps_independent_packet_risk_score(self):
         packet = self._build_ipv4_tcp_packet("1.1.1.1", "2.2.2.2", 443)

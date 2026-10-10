@@ -17,6 +17,13 @@ from typing import Any, Iterable, cast
 from urllib.parse import urlparse
 
 from mk1_map import MapMode, MapVisualizationService, build_threat_map_event
+from mk1_airgap import disable_all_network_paths
+from mk1_quarantine import QuarantineError, QuarantineStateStore
+from mk1_firewall import (
+    apply_nft_policy,
+    is_valid_ip_address,
+    validate_nft_policy,
+)
 import mk1_memory_guard
 from mk1_usb_guard import USBHotplugMonitor, disable_network_interfaces
 
@@ -409,7 +416,6 @@ configure_compact_logging(True)
 _ALLOWED_ROOT_COMMANDS = {
     "ip",
     "iptables",
-    "nft",
     "powershell",
     "netsh",
     "ipconfig",
@@ -526,6 +532,7 @@ _MAINTENANCE_LOCK = threading.Lock()
 _PANEL_PARENT_PID = 0
 _PANEL_FULL_ISOLATION = False
 _RSI_MODE_ACTIVE = False
+_LOCAL_ADAPTATION_ENABLED = False
 _RSI_CONNECTION_STATUS = "Not configured"
 _MODEL_SYNC_STATUS = "Disabled"
 _LAST_THREAT_SCORE = 0.0
@@ -587,6 +594,14 @@ _HEAD_C_OFF_THRESHOLD = 0.50
 _DEFAULT_SWAP_SIZE_MB = 100
 _MANAGEMENT_SAFE_HARBOR_DEFAULT_PORTS = (22,)
 _MANAGEMENT_SAFE_HARBOR_DEFAULT_IPS = ("127.0.0.1", "::1")
+_MAX_ENFORCED_FRAME_BYTES = 65575
+_ENFORCEMENT_SIGNATURES = (
+    b"<script",
+    b"javascript:",
+    b"eval(",
+    b"powershell",
+    b"cmd.exe",
+)
 _TRACE_SEQUENCE = 0
 
 
@@ -2121,6 +2136,8 @@ def _prepare_model_state_dict(state_dict: dict, model) -> dict | None:
 
 def _save_local_adaptation(model, checkpoint_path: str) -> bool:
     """Save the adapted model and its digest using atomic replacement."""
+    if not _LOCAL_ADAPTATION_ENABLED:
+        return False
     directory = os.path.dirname(os.path.abspath(checkpoint_path))
     os.makedirs(directory, exist_ok=True)
     model_temporary = None
@@ -2182,6 +2199,8 @@ def _save_local_adaptation(model, checkpoint_path: str) -> bool:
 def _load_local_adaptation(model, checkpoint_path: str) -> bool:
     """Load a locally trained state only when its sidecar digest and tensors validate."""
     global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    if not _LOCAL_ADAPTATION_ENABLED:
+        return False
     if not os.path.isfile(checkpoint_path):
         return False
     expected_hash = _read_model_hash_from_sidecar(checkpoint_path)
@@ -2522,6 +2541,7 @@ def _validate_packet_queue_item(item) -> bool:
 def _execute_root_command(cmd: list, dry_run: bool = False) -> bool:
     if dry_run:
         return True
+
     if not _validate_command_tokens(cmd):
         log.error("    → 安全性チェックに失敗したコマンドを拒否しました。")
         return False
@@ -2534,6 +2554,43 @@ def _execute_root_command(cmd: list, dry_run: bool = False) -> bool:
         stderr = (completed.stderr or completed.stdout or "").strip()
         if stderr:
             log.error(f"    → 実行失敗: {stderr}")
+        return False
+    return True
+
+
+def _apply_nft_policy_with_sudo(
+    mode: str,
+    management_ips: list[str] | tuple[str, ...] = (),
+    management_ports: list[int] | tuple[int, ...] = (),
+    *,
+    dry_run: bool = False,
+) -> bool:
+    try:
+        policy = validate_nft_policy(mode, management_ips, management_ports)
+    except (TypeError, ValueError) as exc:
+        log.error("[NFT] 隔離ポリシーを拒否しました: %s", exc)
+        return False
+    if dry_run:
+        log.critical("[NFT] Dry-Run: 隔離ポリシーはカーネルへ適用されません。")
+        return True
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        log.error("[NFT] 特権ワーカーが利用できないため、隔離完了とは扱いません。")
+        return False
+    if not apply_nft_policy(
+        mode=policy[0],
+        management_ips=policy[1],
+        management_ports=policy[2],
+    ):
+        log.error("[NFT] 単一トランザクションの適用に失敗しました。隔離完了とは扱いません。")
+        return False
+    return True
+
+
+def _persist_quarantine_state() -> bool:
+    try:
+        QuarantineStateStore().mark_quarantined()
+    except (OSError, QuarantineError) as exc:
+        log.critical("[QUARANTINE] 永続状態を記録できません。隔離完了とは扱いません: %s", exc)
         return False
     return True
 
@@ -3302,14 +3359,21 @@ def _build_network_containment_plan(profile: dict, learning_data=None) -> dict:
     os_family = "linux" if os_name not in {"windows", "win32", "win64", "darwin", "mac", "macos"} else os_name
 
     commands = []
+    nft_policy = None
     if os_family == "linux":
         for iface in interfaces:
             commands.append(["ip", "link", "set", iface, "down"])
         if tools.get("nft"):
-            commands.append(["nft", "flush", "ruleset"])
-        if tools.get("iptables"):
+            nft_policy = {
+                "mode": "full_isolation",
+                "management_ips": [],
+                "management_ports": [],
+            }
+        elif tools.get("iptables"):
             commands.extend([
-                ["iptables", "-F"],
+                ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
+                ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
+                ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
                 ["iptables", "-P", "INPUT", "DROP"],
                 ["iptables", "-P", "OUTPUT", "DROP"],
                 ["iptables", "-P", "FORWARD", "DROP"],
@@ -3329,6 +3393,8 @@ def _build_network_containment_plan(profile: dict, learning_data=None) -> dict:
         "strategy": "best_effort_network_isolation",
         "reason": "利用可能なOSネットワーク制御コマンドの実行計画",
         "commands": commands,
+        "nft_policy": nft_policy,
+        "require_all_commands": bool(os_family == "linux" and tools.get("nft")),
         "profile": profile,
         "policy_vector": env_signal,
     }
@@ -3470,7 +3536,11 @@ def _ai_command_policy_vector(profile: dict, learning_data=None) -> tuple[dict, 
     return env_signal, ranked
 
 
-def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
+def generate_optimal_kill_payload(
+    profile: dict,
+    learning_data=None,
+    containment_plan: dict | None = None,
+) -> dict:
     """環境ベクトルを AI 入力として読み込み、最適なキルチェーンを学習・生成する。"""
     env_signal, ranked = _ai_command_policy_vector(profile, learning_data)
     layers = set(profile.get("network_layers", []))
@@ -3488,16 +3558,37 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
 
     primary_commands = []
     fallback_payloads = []
+    nft_policy = None
+    management_safe_harbor = (
+        isinstance(containment_plan, dict)
+        and containment_plan.get("mode") == "management_safe_harbor"
+    )
 
     if os_family == "linux":
-        if tools.get("iptables"):
+        if tools.get("nft"):
+            nft_policy = {
+                "mode": (
+                    "management_safe_harbor"
+                    if management_safe_harbor
+                    else "full_isolation"
+                ),
+                "management_ips": (
+                    (containment_plan or {}).get("allowed_ips", [])
+                    if management_safe_harbor else []
+                ),
+                "management_ports": (
+                    (containment_plan or {}).get("allowed_ports", [])
+                    if management_safe_harbor else []
+                ),
+            }
+        elif tools.get("iptables"):
+            if management_safe_harbor:
+                log.error("[SAFE_HARBOR] nftablesが利用できないため、管理経路を許可せず全面遮断に切り替えます。")
             primary_commands.extend([
-                ["iptables", "-I", "INPUT", "-j", "DROP"],
-                ["iptables", "-I", "OUTPUT", "-j", "DROP"],
-                ["iptables", "-I", "FORWARD", "-j", "DROP"],
+                ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
+                ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
+                ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
             ])
-        elif tools.get("nft"):
-            primary_commands.append(["nft", "flush", "ruleset"])
         elif tools.get("ip"):
             primary_commands.extend([
                 ["ip", "route", "replace", "default", "unreachable"],
@@ -3527,9 +3618,11 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
         elif family == "darwin_airport_disable":
             continue
 
-    if not primary_commands and os_family == "linux" and tools.get("iptables"):
+    if not primary_commands and nft_policy is None and os_family == "linux" and tools.get("iptables"):
         primary_commands.extend([
-            ["iptables", "-F"],
+            ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
+            ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
+            ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
             ["iptables", "-P", "INPUT", "DROP"],
             ["iptables", "-P", "OUTPUT", "DROP"],
             ["iptables", "-P", "FORWARD", "DROP"],
@@ -3544,7 +3637,9 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
             {
                 "name": "legacy_firewall_drop",
                 "commands": [
-                    ["iptables", "-F"],
+                    ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
+                    ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
+                    ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
                     ["iptables", "-P", "INPUT", "DROP"],
                     ["iptables", "-P", "OUTPUT", "DROP"],
                     ["iptables", "-P", "FORWARD", "DROP"],
@@ -3555,12 +3650,6 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
                 "commands": [
                     ["ip", "route", "replace", "default", "unreachable"],
                     ["ip", "route", "add", "default", "unreachable"],
-                ],
-            },
-            {
-                "name": "nft_flush_ruleset",
-                "commands": [
-                    ["nft", "flush", "ruleset"],
                 ],
             },
         ])
@@ -3585,6 +3674,13 @@ def generate_optimal_kill_payload(profile: dict, learning_data=None) -> dict:
         "strategy": "self_optimizing_kill_chain",
         "reason": f"AI policy vector={env_signal} に基づき、{os_family} 環境で最も効果的な切断経路を学習生成しました。",
         "commands": primary_commands,
+        "require_all_commands": bool(os_family == "linux" and tools.get("nft")),
+        "nft_policy": nft_policy,
+        "effective_containment_mode": (
+            "management_safe_harbor"
+            if management_safe_harbor and os_family == "linux" and tools.get("nft")
+            else "full_isolation"
+        ),
         "fallback_payloads": fallback_payloads,
         "profile": profile,
         "policy_vector": env_signal,
@@ -3630,14 +3726,26 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
     commands = payload.get("commands", [])
     fallback_payloads = payload.get("fallback_payloads", [])
     profile = payload.get("profile", {})
+    nft_policy = payload.get("nft_policy")
 
     log.info("[DYNAMIC_EXECUTION] 遮断処理を実行します。")
     if dry_run:
+        if nft_policy:
+            log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
         for cmd in commands:
             log.critical(f"    - 予定: {' '.join(cmd)}")
         return True
 
     success_count = 0
+    if nft_policy is not None:
+        if not _apply_nft_policy_with_sudo(
+            nft_policy.get("mode"),
+            nft_policy.get("management_ips", []),
+            nft_policy.get("management_ports", []),
+        ):
+            _attempt_pure_python_network_barrier(interface, available_interfaces)
+            return False
+        success_count += 1
     for cmd in commands:
         log.info(f"    - 実行: {' '.join(cmd)}")
         if _run_command_with_sudo(cmd, dry_run=False):
@@ -3645,6 +3753,12 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
             log.critical("    → 遮断コマンド成功")
         else:
             log.error(f"    → コマンド失敗: {' '.join(cmd)}")
+
+    expected_successes = len(commands) + (1 if nft_policy is not None else 0)
+    if payload.get("require_all_commands") and success_count != expected_successes:
+        log.error("[DYNAMIC_EXECUTION] 必須の隔離ルールをすべて適用できなかったため、隔離完了とは扱いません。")
+        _attempt_pure_python_network_barrier(interface, available_interfaces)
+        return False
 
     if payload.get("python_snippet"):
         log.warning("[DYNAMIC_EXECUTION] Python スニペットの exec 実行は無効化され、構造化なフォールバック経路に切り替えます。")
@@ -4102,9 +4216,7 @@ def apply_backdoor_findings(findings: list) -> float:
             log.warning(f"  - PID {finding.get('pid')} の {finding.get('name')} が {finding.get('remote')} へ外部接続を試みています。")
     log.warning("  バックドアとは、攻撃者が正規の手順をすり抜けて後から侵入するための裏口です。")
     log.warning("  しばしば nc / ncat / powershell / python などでポートを開き、遠隔操作に使われます。")
-    log.warning("[ANOMALY_DETECTION / THREAT_INDEX] バックドアの兆候を受け、異常度を急上昇させます。")
-    evaluate_threat_state(_MONITOR_INTERFACE, _DRY_RUN, score_a=0.99,
-                          backdoor_detected=True, backdoor_boost=boost)
+    log.warning("[ADVISORY_ONLY] このプロセス監査結果は助言であり、自動遮断は行いません。")
     return boost
 
 
@@ -4813,6 +4925,8 @@ def train_local_whitelist(model: LightweightMultiTaskAI, optimizer, data: list, 
     これが「破滅的忘却を防ぐ」仕組みです！
     """
     global _HEAD_B_REVIEWED, _HEAD_B_REVIEWED_LABELS
+    if not _LOCAL_ADAPTATION_ENABLED:
+        return
     labeled_data = []
     for record in data:
         features = record.get("features") if isinstance(record, dict) else None
@@ -5000,7 +5114,7 @@ _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
 def _enqueue_training_batch(batch: list) -> bool:
-    if not batch:
+    if not batch or not _LOCAL_ADAPTATION_ENABLED:
         return True
     try:
         _train_queue.put_nowait(batch)
@@ -5426,18 +5540,32 @@ def _adjust_soft_ai_score(ai_score: float, benign_probability: float, reviewed: 
 
 def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=None, dry_run: bool = False,
                             feature_vector=None, dpi_result: dict | None = None) -> dict:
-    """固定ルールを排し、DPI/AI/入力ベクトルによる連続スコアリングでパケットを評価する。"""
+    """Enforce only fixed input rules; AI and anomaly scores are advisory."""
     global _BACKDOOR_RISK_SCORE
+
+    if len(packet_bytes) > _MAX_ENFORCED_FRAME_BYTES:
+        return {
+            "block": True, "stage": "frame_length", "score": 1.0,
+            "reason": "frame_exceeds_policy_limit",
+        }
 
     if ONI_MODE:
         trace = build_diagnostic_trace(layer=1, threshold=0.01, score=1.0, reason="oni_mode")
         return {"block": True, "stage": "oni", "score": 1.0, "reason": "ONI_MODE enabled", "diagnostic_trace": trace}
 
     dpi_result = dpi_result or analyze_dpi_payload(packet_bytes, interface=interface)
-    if dpi_result.get("suspicious"):
-        trace = build_diagnostic_trace(layer=2, threshold=0.6, score=dpi_result.get("score", 0.0), reason="dpi")
+    payload = extract_payload_bytes(packet_bytes).lower()
+    matched_signature = next(
+        (signature for signature in _ENFORCEMENT_SIGNATURES if signature in payload),
+        None,
+    )
+    if matched_signature is not None:
+        trace = build_diagnostic_trace(layer=2, threshold=1.0, score=1.0, reason="fixed_signature")
         log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="dpi", reason="payload_signature")
-        return {"block": True, "stage": "dpi", "score": dpi_result.get("score", 0.0), "reason": "dpi", "diagnostic_trace": trace}
+        return {
+            "block": True, "stage": "signature", "score": 1.0,
+            "reason": "fixed_payload_signature", "diagnostic_trace": trace,
+        }
 
     transport = parse_packet_transport(packet_bytes)
     if transport and transport.get("parse_error"):
@@ -5495,19 +5623,11 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         except Exception:
             ai_score = 0.0
 
-    if ai_score >= 0.88:
-        trace = build_diagnostic_trace(layer=3, threshold=0.88, score=ai_score, reason="model_score")
-        return {"block": True, "stage": "ai", "score": ai_score, "reason": "model_score", "diagnostic_trace": trace}
-
     math_score = 0.0
     if feature_vector is not None:
         math_score = min(0.99, sum(float(v) for v in feature_vector[:5]) / 5.0)
     elif transport:
         math_score = min(0.99, (0.35 if transport.get("protocol") == socket.IPPROTO_TCP else 0.1))
-
-    if math_score >= 0.88:
-        trace = build_diagnostic_trace(layer=4, threshold=0.88, score=math_score, reason="math_threshold")
-        return {"block": True, "stage": "math", "score": math_score, "reason": "math_threshold", "diagnostic_trace": trace}
 
     behavior_score = _compute_behavioral_signature_score(packet_bytes, transport, dpi_result)
     unknown_score = _compute_unknown_behavior_score(packet_bytes, transport, markers, dpi_result)
@@ -5515,18 +5635,18 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         rule_score, ai_score, math_score, unknown_score, behavior_score,
     )
 
-    if behavior_score >= 0.30 and (unknown_score >= 0.16 or rule_score >= 0.25):
-        trace = build_diagnostic_trace(layer=4, threshold=0.30, score=min(0.99, behavior_score + max(rule_score, ai_score, math_score) * 0.25), reason="behavioral_signature")
-        return {"block": True, "stage": "behavioral_signature", "score": min(0.99, behavior_score + max(rule_score, ai_score, math_score) * 0.25), "reason": "behavioral_signature", "diagnostic_trace": trace}
-
-    if unknown_score >= 0.22 and (rule_score >= 0.2 or ai_score >= 0.2 or math_score >= 0.15):
-        trace = build_diagnostic_trace(layer=4, threshold=0.22, score=min(0.99, unknown_score + max(rule_score, ai_score, math_score) * 0.3), reason="unknown_behavior")
-        return {"block": True, "stage": "unknown_behavior", "score": min(0.99, unknown_score + max(rule_score, ai_score, math_score) * 0.3), "reason": "unknown_behavior", "diagnostic_trace": trace}
-    if composite_score >= 0.80:
-        trace = build_diagnostic_trace(layer=4, threshold=0.8, score=composite_score, reason="composite_scoring")
-        return {"block": True, "stage": "composite", "score": composite_score, "reason": "composite_scoring", "diagnostic_trace": trace}
-
-    return {"block": False, "stage": "pass", "score": max(rule_score, ai_score, math_score, unknown_score), "reason": rule_reason}
+    return {
+        "block": False,
+        "stage": "advisory",
+        "score": max(rule_score, ai_score, math_score, unknown_score, behavior_score, composite_score),
+        "reason": "advisory_scores_only",
+        "advisory": {
+            "ai_score": ai_score,
+            "math_score": math_score,
+            "unknown_score": unknown_score,
+            "behavior_score": behavior_score,
+        },
+    }
 
 
 def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_result: dict | None = None) -> bool:
@@ -5547,7 +5667,7 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
     if pipeline.get("block"):
         stage = pipeline.get("stage")
         score = min(0.99, pipeline.get("score", 0.0))
-        backdoor_detected = stage in {"math", "ai", "blacklist"} or (stage == "dpi" and (score >= 0.72 or dpi_result.get("fast_track", False)))
+        backdoor_detected = stage in {"signature", "frame_length", "blacklist"}
         blocked = evaluate_threat_state(
             interface,
             effective_dry_run,
@@ -5558,16 +5678,6 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
         _publish_threat_map_event(packet_bytes, str(stage or "threat"), score)
         return blocked
 
-    if _BACKDOOR_RISK_SCORE > 0.0:
-        blocked = evaluate_threat_state(
-            interface,
-            effective_dry_run,
-            score_a=min(0.99, 0.5 + _BACKDOOR_RISK_SCORE),
-            backdoor_detected=True,
-            backdoor_boost=_BACKDOOR_RISK_SCORE,
-        )
-        _publish_threat_map_event(packet_bytes, "backdoor_risk", min(0.99, 0.5 + _BACKDOOR_RISK_SCORE))
-        return blocked
     return False
 
 
@@ -5596,13 +5706,33 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
     if available_interfaces is None:
         available_interfaces = discover_available_interfaces()
 
+    if containment_mode == "full_isolation" and (management_ports or management_ips):
+        containment_mode = "management_safe_harbor"
+        log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
+
+    if not dry_run:
+        policy_applied = _apply_nft_policy_with_sudo(
+            containment_mode,
+            management_ips or (),
+            management_ports or (),
+        )
+        state_persisted = _persist_quarantine_state()
+        if not policy_applied or not state_persisted:
+            disable_all_network_paths()
+            log.error("[AIRGAP] nftables隔離または永続状態を確認できません。隔離完了とは扱いません。")
+            return False
+
     if _PANEL_FULL_ISOLATION and not dry_run:
-        if _disable_all_network_interfaces(available_interfaces):
-            log.critical("[AIRGAP] 全ネットワークインターフェースの停止を確認しました。")
+        if containment_mode != "full_isolation":
+            log.warning("[AIRGAP] TCP管理safe-harborを適用しました。NIC停止は行いません。")
+            return True
+        if disable_all_network_paths():
+            log.critical("[AIRGAP] NIC・無線・USBネットワーク・モデム・Thunderboltの無効化を確認しました。")
             _close_panel_after_airgap()
+            return True
         else:
-            log.error("[AIRGAP] 全インターフェースの停止を確認できませんでした。隔離完了とは扱いません。")
-        return
+            log.error("[AIRGAP] 全経路の無効化を確認できませんでした。隔離完了とは扱いません。")
+            return False
 
     if containment_mode == "full_isolation" and (management_ports or management_ips):
         containment_mode = "management_safe_harbor"
@@ -5615,7 +5745,11 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
         management_ips=management_ips,
     )
     profile = profile_environment()
-    payload = generate_optimal_kill_payload(profile, learning_data=["bridge", "vpn", "unreachable", "iptables", "dbus"])
+    payload = generate_optimal_kill_payload(
+        profile,
+        learning_data=["bridge", "vpn", "unreachable", "iptables", "dbus"],
+        containment_plan=containment_plan,
+    )
 
     log.info("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] 隔離処理を実行します。")
     log.info(f"[CONTAINMENT_PLAN] {json.dumps(containment_plan, sort_keys=True)}")
@@ -5757,6 +5891,9 @@ def _run_lightweight_training_validation(
     model=None,
     fetch_drive: bool = True,
 ) -> int:
+    if not _LOCAL_ADAPTATION_ENABLED:
+        log.error("[検証] ローカル適応学習は署名付きチェックポイント等の対策が未実装のため無効です。")
+        return 3
     if hasattr(torch, "set_num_threads"):
         torch.set_num_threads(1)
 
@@ -6078,9 +6215,11 @@ def _apply_pending_cloud_model(model, local_checkpoint_path: str | None = None) 
     try:
         with _MODEL_ACCESS_LOCK:
             model.load_state_dict(state_dict)
-            _HEAD_B_REVIEWED_LABELS = {0, 1} if reviewed else set()
-            _HEAD_B_REVIEWED = reviewed
-            if local_checkpoint_path:
+            _HEAD_B_REVIEWED_LABELS = (
+                {0, 1} if reviewed and _LOCAL_ADAPTATION_ENABLED else set()
+            )
+            _HEAD_B_REVIEWED = reviewed and _LOCAL_ADAPTATION_ENABLED
+            if local_checkpoint_path and _LOCAL_ADAPTATION_ENABLED:
                 local_dir = os.path.dirname(os.path.abspath(local_checkpoint_path))
                 feedback_path = os.path.join(local_dir, "curated", "reviewed_feedback.jsonl")
                 if os.path.isfile(feedback_path):
@@ -6221,7 +6360,7 @@ def _load_runtime_config(config_path: str) -> dict:
             isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536 for port in value
         ),
         "management_ips": lambda value: isinstance(value, list) and all(
-            isinstance(ip, str) and bool(ip.strip()) for ip in value
+            is_valid_ip_address(ip) for ip in value
         ),
         "mode": lambda value: isinstance(value, str) and value in {"normal", "RSI", "rsi"},
         "update_interval": lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 1,
@@ -6298,6 +6437,9 @@ def _format_compact_status(ram_mb: float, ram_limit_mb: int, swap_mb: float,
         f"[STATUS] RAM: {ram_mb:.0f}MB/{ram_limit_mb}MB | Swap: {swap_mb:.1f}MB"
         f" | Score: {score:.2f} | Colab: {colab_status}"
         f" | Model: {_MODEL_SYNC_STATUS} | Mode: {mode_label}"
+        " | Effective profile: unclaimed/S0"
+        " | Hardware trust: none (optional layer only)"
+        " | No mutual verification: full endpoint compromise loses assurance"
     )
 
 
@@ -6350,6 +6492,11 @@ def _write_panel_status(
         f"rsi_connection_status={_RSI_CONNECTION_STATUS}\n"
         f"training_queue_batches={_train_queue.qsize()}\n"
         f"learning_mode={int(bool(is_learning_mode()))}\n"
+        f"local_adaptation_enabled={int(_LOCAL_ADAPTATION_ENABLED)}\n"
+        "effective_profile=unclaimed_S0\n"
+        "hardware_trust=none_optional_layer_only\n"
+        "mutual_verification=none\n"
+        "assurance_warning=full_endpoint_compromise_loses_assurance\n"
         f"ram_used_mb={max(0.0, ram_used_mb or 0.0):.1f}\n"
         f"ram_limit_mb={max(0, ram_limit_mb or 0)}\n"
         f"swap_used_mb={max(0.0, swap_used_mb or 0.0):.1f}\n"
@@ -6395,6 +6542,9 @@ def main():
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
 
+    if args.validation_only and not _LOCAL_ADAPTATION_ENABLED:
+        log.error("[検証] ローカル適応学習は必要な署名・安全対策がないため実行できません。")
+        return 3
     if args.ignore_model_hash and not TORCH_AVAILABLE:
         parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
 
@@ -6774,13 +6924,6 @@ def main():
             # ================================================================
             # 判定ロジック (優先度: 防衛 > 司令 > 学習)
             # ================================================================
-
-            # 【最優先】バックドア/高スコア検知時は即時キルスイッチ
-            if evaluate_threat_state(monitor_interface, dry_run, score_a=effective_score,
-                                     backdoor_detected=_BACKDOOR_RISK_SCORE > 0.0,
-                                     backdoor_boost=_BACKDOOR_RISK_SCORE):
-                time.sleep(5)  # 遮断後の冷却時間
-                continue       # 他の処理を一切スキップ
 
             # 【優先2】Head C > 0.8 → 司令塔がデータ退避を命令
             if c > 0.8 and whitelist_buf:

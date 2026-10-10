@@ -1,0 +1,27 @@
+[Unit]
+Description=MK1Ai persistent fail-closed network quarantine
+DefaultDependencies=no
+RequiresMountsFor=/var/lib/mk1ai-security
+After=local-fs.target
+Before=network-pre.target NetworkManager.service systemd-networkd.service networking.service wg-quick@wg0.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/mk1ai/mk1_quarantine.py enforce
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_MODULE CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+ReadWritePaths=/var/lib/mk1ai-security /etc/modprobe.d
+
+[Install]
+WantedBy=multi-user.target
