@@ -129,7 +129,7 @@ def _accept_websocket(
             or headers.get("sec-websocket-version") != "13"
             or len(decoded_key) != 16
             or not EXTENSION_ORIGIN_PATTERN.fullmatch(origin)
-            or (allowed_origins and origin not in allowed_origins)
+            or origin not in allowed_origins
         ):
             return False
         accept = base64.b64encode(
@@ -172,8 +172,8 @@ class MapVisualizationService:
             raise ValueError("Map extension origin must look like chrome-extension://<id>")
         if not self.allowed_origins:
             LOGGER.warning(
-                "MK1_MAP_EXTENSION_ORIGIN is not set; any local Chrome extension may "
-                "connect to the loopback map socket",
+                "MK1_MAP_EXTENSION_ORIGIN is not set; map WebSocket connections "
+                "will be rejected until an extension origin is pinned",
             )
         if not 0 <= port <= 65535:
             raise ValueError("Map WebSocket port is invalid")

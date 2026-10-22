@@ -62,7 +62,10 @@ class MapVisualizationTest(unittest.TestCase):
 
     def test_chrome_mode_serves_websocket_only_on_loopback(self):
         with tempfile.TemporaryDirectory() as directory:
-            service = MapVisualizationService(directory, port=0)
+            extension_origin = "chrome-extension://abcdefghijklmnop"
+            service = MapVisualizationService(
+                directory, port=0, allowed_origins=[extension_origin],
+            )
             service.set_mode(MapMode.CHROME)
             assert service.address is not None
             host, port = service.address
@@ -78,7 +81,7 @@ class MapVisualizationTest(unittest.TestCase):
                     "Connection: keep-alive, Upgrade\r\n"
                     f"Sec-WebSocket-Key: {key}\r\n"
                     "Sec-WebSocket-Version: 13\r\n"
-                    "Origin: chrome-extension://abcdefghijklmnop\r\n\r\n"
+                    f"Origin: {extension_origin}\r\n\r\n"
                 )
                 client.sendall(request.encode("ascii"))
                 response = bytearray()
@@ -135,6 +138,20 @@ class MapVisualizationTest(unittest.TestCase):
                 )
                 self.assertNotIn(
                     b"101", self._handshake_status(port, pinned.upper()),
+                )
+            finally:
+                service.close()
+
+    def test_unpinned_extension_origin_is_rejected(self):
+        origin = "chrome-extension://abcdefghijklmnop"
+        with tempfile.TemporaryDirectory() as directory:
+            service = MapVisualizationService(directory, port=0, allowed_origins=[])
+            service.set_mode(MapMode.CHROME)
+            assert service.address is not None
+            try:
+                self.assertNotIn(
+                    b"101",
+                    self._handshake_status(service.address[1], origin),
                 )
             finally:
                 service.close()
