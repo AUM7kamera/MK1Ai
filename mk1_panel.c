@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "mk1_memory_guard.h"
+#include "mk1_path_trust.h"
 #include "mk1_tunnel.h"
 
 #define CONFIG_PATH "ai_data/panel-config.json"
@@ -1174,8 +1175,8 @@ int main(void) {
         return 1;
     }
     setlocale(LC_ALL, "");
-    if (mkdir("ai_data", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
-        fprintf(stderr, "ai_dataを作成できません: %s\n", strerror(errno));
+    if (!mk1_ensure_private_directory("ai_data")) {
+        fprintf(stderr, "ai_dataを安全な権限で準備できません: %s\n", strerror(errno));
         return 1;
     }
     PanelConfig config;

@@ -9,4 +9,11 @@
  */
 int mk1_path_chain_is_root_trusted(const char *path);
 
+/*
+ * Creates the directory as owner-only when absent, then validates the opened
+ * path without following a final symlink and enforces mode 0700. The directory
+ * must be owned by the effective user; returns 0 on any error.
+ */
+int mk1_ensure_private_directory(const char *path);
+
 #endif

@@ -2,6 +2,8 @@
 
 #include "mk1_path_trust.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,4 +48,39 @@ int mk1_path_chain_is_root_trusted(const char *path) {
     char resolved[PATH_MAX];
     if (realpath(path, resolved) == NULL) return 0;
     return absolute_chain_is_trusted(lexical) && absolute_chain_is_trusted(resolved);
+}
+
+int mk1_ensure_private_directory(const char *path) {
+    if (path == NULL || path[0] == '\0') {
+        errno = EINVAL;
+        return 0;
+    }
+    if (mkdir(path, S_IRWXU) != 0 && errno != EEXIST) return 0;
+
+    int descriptor = open(
+        path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+    );
+    if (descriptor < 0) return 0;
+
+    struct stat info;
+    int result = 0;
+    if (fstat(descriptor, &info) != 0) {
+        goto done;
+    }
+    if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid()) {
+        errno = EPERM;
+        goto done;
+    }
+    if (fchmod(descriptor, S_IRWXU) != 0) {
+        goto done;
+    }
+    result = 1;
+
+done:
+    {
+        int saved_errno = errno;
+        close(descriptor);
+        errno = saved_errno;
+    }
+    return result;
 }

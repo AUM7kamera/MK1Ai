@@ -18,6 +18,7 @@ conformance claim, or statement that a goal is "achieved".
 | Runtime config schema | 修正・ローカルテスト済み | Configuration reads are capped at 64 KiB; unknown keys, invalid values, malformed/deep JSON, and read errors are rejected rather than partially ignored at startup. Invalid live panel updates are logged and do not replace the last applied tunnel, memory-guard, or map settings. |
 | CI workflow integrity | 部分修正・静的確認済み | Removed stray Markdown fences from the workflow and pinned all seven `uses:` references to verified action commit SHAs. YAML parses locally; GitHub Actions execution remains unverified. |
 | Tunnel control IPC | 部分修正・ローカルテスト済み | The UNIX socket now requires Linux `SO_PEERCRED` UID match and a parent directory owned by the service/operator with no group/world write permission. Unauthorized peer and writable-parent regression tests pass. |
+| Panel data directory permissions | 修正・ネイティブテスト済み | C panel now creates/opens `ai_data` without following a final symlink, requires the effective-user owner, and enforces mode `0700` before reading or writing configuration/log data. Native tests cover creation, restrictive repair, symlink refusal, and non-directory refusal. |
 
 ## A. nftables compatibility
 - `destroy table` removed from `mk1_firewall.py` / `mk1_quarantine.py`.
@@ -52,6 +53,7 @@ and CI statements must not be treated as current results until refreshed.
 - `python3 -m pytest -q`: 325 passed, 17 skipped, 58 subtests passed.
 - `python3 -m pytest -q tests/test_map_visualization.py`: 8 passed.
 - `.github/workflows/build-release.yml`: YAML parse passed; every `uses:` reference is SHA-pinned. CI has not been run.
+- `make check`: native build, tests, and Clang static analyzer passed. liboqs and C ML-KEM-768 checks were skipped because liboqs is unavailable.
 - `python3 -m py_compile airgap_ai_defender.py mk1_map.py mk1_firewall.py mk1_quarantine.py`:
   passed.
 - `make panel`: fresh rebuild passed with `-Wall -Wextra -Werror`.
