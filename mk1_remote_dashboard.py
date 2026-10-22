@@ -68,6 +68,7 @@ OTP_LIFETIME_SECONDS = 300
 OTP_MAX_ATTEMPTS = 5
 RATE_LIMIT_WINDOW_SECONDS = 300
 RATE_LIMIT_REQUESTS = 12
+MAX_RATE_LIMIT_KEYS = 4096
 COOKIE_NAME = "__Host-mk1_session"
 
 
@@ -490,8 +491,8 @@ class DashboardState:
                 if not history:
                     self.rate_limits.pop(rate_key, None)
             key = (address, route)
-            if key not in self.rate_limits and len(self.rate_limits) >= 4096:
-                self.rate_limits.popitem(last=False)
+            if key not in self.rate_limits and len(self.rate_limits) >= MAX_RATE_LIMIT_KEYS:
+                return False
             requests = self.rate_limits.setdefault(key, deque())
             self.rate_limits.move_to_end(key)
             while requests and now - requests[0] > RATE_LIMIT_WINDOW_SECONDS:

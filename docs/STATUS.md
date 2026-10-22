@@ -19,6 +19,7 @@ conformance claim, or statement that a goal is "achieved".
 | CI workflow integrity | 部分修正・静的確認済み | Removed stray Markdown fences from the workflow and pinned all seven `uses:` references to verified action commit SHAs. YAML parses locally; GitHub Actions execution remains unverified. |
 | Tunnel control IPC | 部分修正・ローカルテスト済み | The UNIX socket now requires Linux `SO_PEERCRED` UID match and a parent directory owned by the service/operator with no group/world write permission. Unauthorized peer and writable-parent regression tests pass. |
 | Panel data directory permissions | 修正・ネイティブテスト済み | C panel now creates/opens `ai_data` without following a final symlink, requires the effective-user owner, and enforces mode `0700` before reading or writing configuration/log data. Native tests cover creation, restrictive repair, symlink refusal, and non-directory refusal. |
+| Remote dashboard rate-limit capacity | 修正・ローカルテスト済み | The in-memory per-client/per-route rate-limit table now rejects new keys at capacity instead of evicting an existing client's active bucket. Existing buckets remain effective under key churn; entries are reclaimed after the configured window. Focused dashboard tests pass. The bound is process-local and does not coordinate across workers/restarts. |
 
 ## A. nftables compatibility
 - `destroy table` removed from `mk1_firewall.py` / `mk1_quarantine.py`.

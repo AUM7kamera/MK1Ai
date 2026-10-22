@@ -16,6 +16,7 @@ from mk1_remote_dashboard import (
     DashboardHandler,
     DashboardState,
     LOGIN_HTML,
+    MAX_RATE_LIMIT_KEYS,
     RATE_LIMIT_REQUESTS,
     RemoteDashboardServer,
 )
@@ -193,13 +194,17 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertFalse(state.allow_request("192.0.2.1", "/api/auth/options"))
         self.assertTrue(state.allow_request("192.0.2.1", "/api/session"))
 
-    def test_rate_limit_evicts_old_keys_instead_of_rejecting_every_new_client(self):
+    def test_rate_limit_capacity_preserves_existing_buckets_and_rejects_new_keys(self):
         state = DashboardState(self.config)
 
-        for index in range(4097):
+        for index in range(MAX_RATE_LIMIT_KEYS):
             self.assertTrue(state.allow_request(f"192.0.2.{index}", "/api/status"))
 
-        self.assertTrue(state.allow_request("192.0.2.0", "/api/status"))
+        for _ in range(RATE_LIMIT_REQUESTS - 1):
+            self.assertTrue(state.allow_request("192.0.2.0", "/api/status"))
+        self.assertFalse(state.allow_request("192.0.2.0", "/api/status"))
+        self.assertFalse(state.allow_request("198.51.100.1", "/api/status"))
+        self.assertEqual(len(state.rate_limits), MAX_RATE_LIMIT_KEYS)
 
     def test_forwarded_client_ip_is_trusted_only_from_loopback(self):
         loopback_handler = object.__new__(DashboardHandler)
