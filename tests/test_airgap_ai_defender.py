@@ -1,5 +1,6 @@
 import hashlib
 import builtins
+import contextlib
 import importlib.util
 import io
 import json
@@ -51,6 +52,11 @@ requires_gdrive_dependencies = unittest.skipUnless(
 requires_aesgcm = unittest.skipUnless(
     AESGCM_AVAILABLE, "cryptography AES-GCM is required for encrypted spill tests",
 )
+
+
+def write_private_config(path: pathlib.Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
 
 
 class AirgapSecurityHelpersTest(unittest.TestCase):
@@ -125,7 +131,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "config.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
+            write_private_config(config_path, json.dumps(config))
             loaded = module._load_runtime_config(str(config_path))
 
         args = module._build_argument_parser(loaded).parse_args([])
@@ -145,19 +151,157 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertFalse(overridden.ignore_model_hash)
         self.assertFalse(overridden.compact_log)
 
+    def test_runtime_config_rejects_unknown_keys_and_invalid_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            for config in (
+                {"interface": "eth0", "unexpected": True},
+                {"ram_limit": 0},
+            ):
+                write_private_config(config_path, json.dumps(config))
+                with self.subTest(config=config), self.assertRaises(module.RuntimeConfigError):
+                    module._load_runtime_config(str(config_path))
+
+    def test_runtime_config_rejects_malformed_json_and_non_object_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            for invalid_content in ('{"mode":', "[]", "null"):
+                write_private_config(config_path, invalid_content)
+                with self.subTest(invalid_content=invalid_content), \
+                     self.assertRaises(module.RuntimeConfigError):
+                    module._load_runtime_config(str(config_path))
+
+    def test_runtime_config_rejects_files_over_the_size_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            config_path.write_bytes(b" " * (module._MAX_RUNTIME_CONFIG_BYTES + 1))
+            config_path.chmod(0o600)
+            with self.assertRaisesRegex(module.RuntimeConfigError, "サイズが上限"):
+                module._load_runtime_config(str(config_path))
+
+    def test_runtime_config_rejects_symlinks_and_group_writable_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = pathlib.Path(temp_dir)
+            target_path = directory / "target.json"
+            write_private_config(target_path, "{}")
+            link_path = directory / "config-link.json"
+            link_path.symlink_to(target_path)
+            with self.assertRaises(module.RuntimeConfigError):
+                module._load_runtime_config(str(link_path))
+
+            target_path.chmod(0o620)
+            try:
+                with self.assertRaisesRegex(module.RuntimeConfigError, "書込可能"):
+                    module._load_runtime_config(str(target_path))
+            finally:
+                target_path.chmod(0o600)
+
+    def test_main_refuses_invalid_runtime_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            write_private_config(config_path, json.dumps({"unknown_setting": True}))
+            error_output = io.StringIO()
+            with mock.patch("sys.argv", ["airgap_ai_defender.py", "--config", str(config_path)]), \
+                 contextlib.redirect_stderr(error_output), \
+                 self.assertRaises(SystemExit) as raised:
+                module.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("未知の設定キー", error_output.getvalue())
+
+    def test_invalid_live_panel_config_preserves_last_applied_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            write_private_config(config_path, json.dumps({"map_mode": 99}))
+            with self.assertLogs("AirgapAI", level="ERROR") as captured:
+                loaded = module._load_panel_runtime_config(
+                    str(config_path), True, False, module.MapMode.CHROME,
+                )
+
+        self.assertEqual(loaded, {
+            "secure_tunnel_enabled": 1,
+            "memory_guard_enabled": 0,
+            "map_mode": int(module.MapMode.CHROME),
+        })
+        self.assertIn("最後に適用した設定を維持", captured.output[0])
+
+    def test_active_isolation_requires_exact_confirmation_and_shows_scope(self):
+        terminal = type("Terminal", (), {"isatty": lambda self: True})()
+        with mock.patch.object(module.sys, "stdin", terminal), \
+             mock.patch("builtins.print") as display:
+            self.assertTrue(module._confirm_active_isolation(
+                "eth0",
+                ["eth0", "wlan0", "lo"],
+                ["192.0.2.10"],
+                [22],
+                input_func=lambda _: module._ACTIVE_ISOLATION_CONFIRMATION,
+            ))
+
+        preview = "\n".join(str(call.args[0]) for call in display.call_args_list)
+        self.assertIn("eth0, wlan0", preview)
+        self.assertIn("management_safe_harbor", preview)
+        self.assertIn("192.0.2.10", preview)
+
+    def test_active_isolation_refuses_noninteractive_or_wrong_confirmation(self):
+        noninteractive = type("Terminal", (), {"isatty": lambda self: False})()
+        with mock.patch.object(module.sys, "stdin", noninteractive), \
+             mock.patch("builtins.print"):
+            self.assertFalse(module._confirm_active_isolation(
+                "eth0", ["eth0"], [], [],
+                input_func=lambda _: self.fail("must not prompt without a TTY"),
+            ))
+
+        terminal = type("Terminal", (), {"isatty": lambda self: True})()
+        with mock.patch.object(module.sys, "stdin", terminal), \
+             mock.patch("builtins.print"):
+            self.assertFalse(module._confirm_active_isolation(
+                "eth0", ["eth0"], [], [],
+                input_func=lambda _: "yes",
+            ))
+
+    def test_panel_active_isolation_confirmation_is_exact(self):
+        with mock.patch("builtins.print"):
+            self.assertTrue(module._confirm_active_isolation(
+                "eth0",
+                ["eth0"],
+                [],
+                [],
+                panel_parent_pid=123,
+                panel_confirmation=module._ACTIVE_ISOLATION_CONFIRMATION,
+            ))
+            self.assertFalse(module._confirm_active_isolation(
+                "eth0",
+                ["eth0"],
+                [],
+                [],
+                panel_parent_pid=123,
+                panel_confirmation="yes",
+            ))
+
+    def test_cli_rejects_active_isolation_until_per_event_approval_is_implemented(self):
+        error_output = io.StringIO()
+        with mock.patch.object(module, "_merge_runtime_config", return_value={}), \
+             mock.patch.object(module.sys, "argv", ["airgap_ai_defender.py", "--no-dry-run"]), \
+             contextlib.redirect_stderr(error_output), \
+             self.assertRaises(SystemExit) as raised:
+            module.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("イベントごとの管理者承認機能が未実装", error_output.getvalue())
+
     def test_panel_config_overrides_runtime_config_without_discarding_other_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime_path = pathlib.Path(temp_dir) / "config.json"
             panel_path = pathlib.Path(temp_dir) / "panel-config.json"
-            runtime_path.write_text(json.dumps({
+            write_private_config(runtime_path, json.dumps({
                 "interface": "eth0",
                 "drive_id": "folder-id",
                 "colab_endpoint": "https://colab.example.test/rsi",
-            }), encoding="utf-8")
-            panel_path.write_text(json.dumps({
+            }))
+            write_private_config(panel_path, json.dumps({
                 "interface": "wg0",
                 "ram_limit": 900,
-            }), encoding="utf-8")
+            }))
 
             config = module._merge_runtime_config(str(runtime_path), str(panel_path))
 
@@ -170,90 +314,72 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for mode in (0, 1, 2):
-                config_path.write_text(json.dumps({"map_mode": mode}), encoding="utf-8")
+                write_private_config(config_path, json.dumps({"map_mode": mode}))
                 self.assertEqual(module._load_runtime_config(str(config_path))["map_mode"], mode)
 
-            config_path.write_text(json.dumps({"map_mode": True}), encoding="utf-8")
-            self.assertNotIn("map_mode", module._load_runtime_config(str(config_path)))
+            write_private_config(config_path, json.dumps({"map_mode": True}))
+            with self.assertRaisesRegex(module.RuntimeConfigError, "map_mode"):
+                module._load_runtime_config(str(config_path))
 
     def test_usb_guard_config_accepts_only_integer_toggle_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for enabled in (0, 1):
-                config_path.write_text(json.dumps({"usb_guard_enabled": enabled}), encoding="utf-8")
+                write_private_config(config_path, json.dumps({"usb_guard_enabled": enabled}))
                 self.assertEqual(
                     module._load_runtime_config(str(config_path))["usb_guard_enabled"],
                     enabled,
                 )
 
             for invalid in (True, 2, "1"):
-                config_path.write_text(json.dumps({"usb_guard_enabled": invalid}), encoding="utf-8")
-                self.assertNotIn(
-                    "usb_guard_enabled",
-                    module._load_runtime_config(str(config_path)),
-                )
+                write_private_config(config_path, json.dumps({"usb_guard_enabled": invalid}))
+                with self.assertRaisesRegex(module.RuntimeConfigError, "usb_guard_enabled"):
+                    module._load_runtime_config(str(config_path))
 
     def test_secure_tunnel_config_accepts_only_integer_toggle_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for enabled in (0, 1):
-                config_path.write_text(
-                    json.dumps({"secure_tunnel_enabled": enabled}), encoding="utf-8",
-                )
+                write_private_config(config_path, json.dumps({"secure_tunnel_enabled": enabled}))
                 self.assertEqual(
                     module._load_runtime_config(str(config_path))["secure_tunnel_enabled"],
                     enabled,
                 )
 
             for invalid in (True, 2, "1"):
-                config_path.write_text(
-                    json.dumps({"secure_tunnel_enabled": invalid}), encoding="utf-8",
-                )
-                self.assertNotIn(
-                    "secure_tunnel_enabled",
-                    module._load_runtime_config(str(config_path)),
-                )
+                write_private_config(config_path, json.dumps({"secure_tunnel_enabled": invalid}))
+                with self.assertRaisesRegex(module.RuntimeConfigError, "secure_tunnel_enabled"):
+                    module._load_runtime_config(str(config_path))
 
     def test_memory_guard_config_accepts_only_integer_toggle_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for enabled in (0, 1):
-                config_path.write_text(
-                    json.dumps({"memory_guard_enabled": enabled}), encoding="utf-8",
-                )
+                write_private_config(config_path, json.dumps({"memory_guard_enabled": enabled}))
                 self.assertEqual(
                     module._load_runtime_config(str(config_path))["memory_guard_enabled"],
                     enabled,
                 )
 
             for invalid in (True, 2, "1"):
-                config_path.write_text(
-                    json.dumps({"memory_guard_enabled": invalid}), encoding="utf-8",
-                )
-                self.assertNotIn(
-                    "memory_guard_enabled",
-                    module._load_runtime_config(str(config_path)),
-                )
+                write_private_config(config_path, json.dumps({"memory_guard_enabled": invalid}))
+                with self.assertRaisesRegex(module.RuntimeConfigError, "memory_guard_enabled"):
+                    module._load_runtime_config(str(config_path))
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
-    @requires_secure_transport
- main
-    def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
+    def test_usb_guest_threat_does_not_bypass_operator_approval_gate(self):
         device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
         interfaces = ["eth0", "wlan0"]
-        with mock.patch.object(module, "discover_available_interfaces", return_value=interfaces), \
-             mock.patch.object(module, "disable_network_interfaces", return_value=True) as barrier, \
-             mock.patch.object(
-                 module.mk1_secure_transport, "request_transport_state", return_value=True,
-             ) as key_wipe:
+        transport = mock.Mock()
+        with mock.patch("mk1_usb_guard.disable_network_interfaces", return_value=True) as barrier, \
+             mock.patch.object(module, "mk1_secure_transport", transport):
             module._usb_scan_threat_response(device, "error", interfaces)
             barrier.assert_not_called()
 
             module._usb_scan_threat_response(device, "threat", interfaces, "/tmp/tunnel.sock")
 
-        barrier.assert_called_once_with(interfaces)
-        key_wipe.assert_called_once_with("/tmp/tunnel.sock", False)
+        barrier.assert_not_called()
+        transport.request_transport_state.assert_not_called()
 
     def test_usb_guard_is_a_separate_privileged_worker_only_in_full_isolation(self):
         processes = [mock.Mock(), mock.Mock(), mock.Mock()]
@@ -312,6 +438,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             remaining_temporary_files = list(pathlib.Path(temp_dir).glob(".panel-status.*.tmp"))
 
         self.assertIn("state=STOPPED\n", content)
+        self.assertRegex(content, r"(?m)^sampled_at=[0-9]+$")
         self.assertIn("packets_per_second=12.50\n", content)
         self.assertIn("packets_total=42\n", content)
         self.assertIn("isolation_active=1\n", content)
@@ -324,6 +451,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertIn("assurance_warning=full_endpoint_compromise_loses_assurance\n", content)
         self.assertEqual(status_mode, 0o600)
         self.assertEqual(remaining_temporary_files, [])
+
+    def test_panel_status_reports_pending_approval_without_claiming_isolation(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", False), \
+             mock.patch.object(module, "_ISOLATION_APPROVAL_PENDING", True):
+            module._write_panel_status(temp_dir, 0, 0, "Normal", False)
+            content = (pathlib.Path(temp_dir) / "panel-status.txt").read_text(
+                encoding="ascii",
+            )
+
+        self.assertIn("isolation_active=0\n", content)
+        self.assertIn("isolation_approval_pending=1\n", content)
+        self.assertIn("alert=APPROVAL_REQUIRED\n", content)
 
     def test_airgap_closes_only_the_panel_process_in_its_ancestry(self):
         ancestor = mock.Mock(pid=4321)
@@ -363,56 +503,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(run_command.call_count, 2)
 
-    def test_panel_full_isolation_stops_all_nics_before_other_containment_work(self):
-        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
-             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True), \
-             mock.patch.object(module, "disable_all_network_paths", return_value=True) as stop_all, \
-             mock.patch.object(module, "_close_panel_after_airgap") as close_panel, \
-             mock.patch.object(module, "profile_environment", side_effect=AssertionError("slow follow-up must not run")), \
-             mock.patch.object(module, "execute_generated_payload", side_effect=AssertionError("fallback must not run")):
-            module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0", "wlan0"])
-
-        stop_all.assert_called_once_with()
-        close_panel.assert_called_once_with()
-
-    def test_management_safe_harbor_uses_validated_tcp_policy_without_stopping_nics(self):
-        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True) as apply, \
-             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
-             mock.patch.object(
-                 module, "disable_all_network_paths",
-                 side_effect=AssertionError("safe-harbor must retain its configured TCP path"),
-             ):
-            self.assertTrue(module.execute_kill_switch(
-                "eth0",
-                dry_run=False,
-                management_ports=[22],
-                management_ips=["192.0.2.10"],
+    def test_active_isolation_is_refused_until_per_event_approval_exists(self):
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo") as apply_policy, \
+             mock.patch.object(module, "_persist_quarantine_state") as persist_state, \
+             mock.patch.object(module, "disable_all_network_paths") as disable_paths, \
+             mock.patch.object(module, "execute_generated_payload") as execute_payload:
+            self.assertFalse(module.execute_kill_switch(
+                "eth0", dry_run=False, available_interfaces=["eth0", "wlan0"],
             ))
 
-        apply.assert_called_once_with(
-            "management_safe_harbor",
-            ["192.0.2.10"],
-            [22],
-        )
-
-    def test_persisted_quarantine_follows_atomic_policy_application(self):
-        events = []
-        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(
-                 module, "_apply_nft_policy_with_sudo",
-                 side_effect=lambda *args, **kwargs: events.append("firewall") or True,
-             ), \
-             mock.patch.object(
-                 module, "_persist_quarantine_state",
-                 side_effect=lambda: events.append("state") or True,
-             ), \
-             mock.patch.object(module, "disable_all_network_paths", return_value=True), \
-             mock.patch.object(module, "_close_panel_after_airgap"):
-            self.assertTrue(module.execute_kill_switch("eth0", dry_run=False))
-
-        self.assertEqual(events, ["firewall", "state"])
+        apply_policy.assert_not_called()
+        persist_state.assert_not_called()
+        disable_paths.assert_not_called()
+        execute_payload.assert_not_called()
 
     def test_root_privilege_drop_uses_sudo_invoking_user(self):
         passwd_entry = mock.Mock(pw_name="workspace-user")
@@ -567,10 +670,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(result["reason"], "PQC public-key pin required")
         secure_request.assert_not_called()
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_cloud_model_apply_does_not_enable_local_feedback_when_adaptation_disabled(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         state_dict = model.state_dict()
@@ -597,10 +698,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 load_feedback.assert_not_called()
                 train.assert_not_called()
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -727,17 +826,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, 0)
 
-    def test_ensure_dependencies_uses_cpu_torch_and_continues_when_install_fails(self):
+    def test_ensure_dependencies_reports_missing_without_runtime_install(self):
+        stderr = io.StringIO()
         with mock.patch.object(module.importlib.util, "find_spec", return_value=None), \
-             mock.patch.object(module.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
-            available = module.ensure_dependencies()
+             mock.patch.object(module.subprocess, "run") as run, \
+             contextlib.redirect_stderr(stderr):
+            availability = module.ensure_dependencies()
 
-        self.assertEqual(available, {"torch": False, "psutil": False, "cryptography": False})
-        torch_command = run.call_args_list[0].args[0]
-        self.assertIn("--extra-index-url", torch_command)
-        self.assertIn("https://download.pytorch.org/whl/cpu", torch_command)
-        self.assertIn("300", torch_command)
-        self.assertEqual(run.call_args.kwargs["timeout"], 1800)
+        self.assertEqual(
+            availability,
+            {"torch": False, "psutil": False, "cryptography": False},
+        )
+        run.assert_not_called()
+        self.assertEqual(stderr.getvalue().count("起動時のパッケージ導入は行わず"), 3)
 
     def test_load_raw_data_from_files_yields_bounded_json_and_jsonl_batches(self):
         records = [
@@ -1188,10 +1289,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_local_adaptation_is_disabled_by_default(self):
         torch = module.torch
         model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1216,10 +1315,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(module._enqueue_training_batch([{"features": [0.2] * 10}]))
             train_queue.put.assert_not_called()
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
@@ -1271,15 +1368,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
     def test_training_enqueue_drops_batch_without_blocking_when_queue_is_full(self):
         original_queue = module._train_queue
- codespace-probable-dollop-pj64p66j94jv29wg6
-        full_queue = mock.Mock()
-        full_queue.put.side_effect = [queue.Full, None]
-        with mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True):
-            try:
-                module._train_queue = full_queue
-                self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
-                self.assertEqual(full_queue.put.call_count, 2)
-
         full_queue = queue.Queue(maxsize=1)
         queued_batch = [{"features": [0.1] * 10, "label": 0}]
         rejected_batch = [{"features": [0.9] * 10, "label": 1}]
@@ -1291,7 +1379,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 self.assertFalse(module._enqueue_training_batch(rejected_batch))
                 self.assertLess(module.time.monotonic() - started, 0.5)
                 self.assertIs(full_queue.get_nowait(), queued_batch)
- main
             finally:
                 module._train_queue = original_queue
 
@@ -1389,6 +1476,31 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             module._BACKDOOR_RISK_SCORE = 0.8
             module.evaluate_threat_state("eth0", dry_run=True, score_a=0.1, backdoor_detected=True)
             kill_switch.assert_called_once_with("eth0", True)
+
+    def test_active_threat_detection_sets_pending_approval_without_isolating(self):
+        original_pending = module._ISOLATION_APPROVAL_PENDING
+        original_triggered = module._KILL_SWITCH_TRIGGERED
+        original_last_trigger = module._LAST_KILL_SWITCH_TRIGGER
+        try:
+            module._ISOLATION_APPROVAL_PENDING = False
+            module._KILL_SWITCH_TRIGGERED = False
+            module._LAST_KILL_SWITCH_TRIGGER = 0.0
+            with mock.patch.object(module, "_dispatch_privileged_command") as dispatch, \
+                 mock.patch.object(module, "execute_kill_switch") as execute, \
+                 mock.patch.object(module, "mk1_secure_transport") as transport:
+                self.assertTrue(module.evaluate_threat_state(
+                    "eth0", dry_run=False, score_a=0.99, backdoor_detected=True,
+                ))
+
+            self.assertTrue(module._ISOLATION_APPROVAL_PENDING)
+            self.assertFalse(module._KILL_SWITCH_TRIGGERED)
+            dispatch.assert_not_called()
+            execute.assert_not_called()
+            transport.set_transport_enabled.assert_not_called()
+        finally:
+            module._ISOLATION_APPROVAL_PENDING = original_pending
+            module._KILL_SWITCH_TRIGGERED = original_triggered
+            module._LAST_KILL_SWITCH_TRIGGER = original_last_trigger
 
     def test_handle_packet_event_does_not_enforce_advisory_backdoor_score(self):
         original_triggered = module._KILL_SWITCH_TRIGGERED
@@ -1767,8 +1879,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 "protocols": [],
                 "entropy": 0.0,
             }
-            module.log_full_packet_inspection(b"first", "lo", result, "test", "one", log_path)
-            module.log_full_packet_inspection(b"second", "lo", result, "test", "two", log_path)
+            with mock.patch.object(module, "FULL_PACKET_INSPECTION", True):
+                module.log_full_packet_inspection(b"first", "lo", result, "test", "one", log_path)
+                module.log_full_packet_inspection(b"second", "lo", result, "test", "two", log_path)
 
             self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(os.path.dirname(log_path)).st_mode & 0o777, 0o700)
@@ -1776,11 +1889,65 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 records = [json.loads(line) for line in handle]
             self.assertEqual([record["reason"] for record in records], ["one", "two"])
 
+    def test_suspicious_packet_is_not_persisted_when_full_inspection_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "packet_logs", "inspection.log")
+            suspicious_result = {
+                "suspicious": True,
+                "findings": [{"type": "signature", "token": "private-data"}],
+                "attack_signatures": ["test-signature"],
+                "protocols": ["HTTP"],
+                "entropy": 0.0,
+            }
+            with mock.patch.object(module, "FULL_PACKET_INSPECTION", False):
+                module.log_full_packet_inspection(
+                    b"private packet payload", "eth0", suspicious_result,
+                    "dpi", "payload_signature", log_path,
+                )
+
+            self.assertFalse(os.path.exists(log_path))
+
+    def test_packet_inspection_log_redacts_finding_tokens(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "packet_logs", "inspection.log")
+            token = "sensitive-signature-token"
+            result = {
+                "suspicious": True,
+                "findings": [{
+                    "type": "signature",
+                    "token": token,
+                    "description": "known marker",
+                    "offset": 7,
+                }],
+                "attack_signatures": ["known marker"],
+                "protocols": ["HTTP"],
+                "entropy": 0.0,
+            }
+            with mock.patch.object(module, "FULL_PACKET_INSPECTION", True), \
+                 mock.patch.object(module, "log") as logger:
+                module.log_full_packet_inspection(
+                    b"example payload", "eth0", result,
+                    "dpi", "payload_signature", log_path,
+                )
+
+            serialized_record = pathlib.Path(log_path).read_text(encoding="utf-8")
+            self.assertNotIn(token, serialized_record)
+            self.assertNotIn(token, str(logger.warning.call_args_list))
+            self.assertEqual(result["findings"][0]["token"], token)
+            record = json.loads(serialized_record)
+            self.assertEqual(record["findings"], [{
+                "type": "signature",
+                "description": "known marker",
+                "offset": 7,
+            }])
+            self.assertEqual(record["dpi"]["findings"], record["findings"])
+
     def test_packet_inspection_log_preparation_assigns_drop_target(self):
         target = mock.Mock(pw_uid=1234, pw_gid=2345, pw_name="workspace-user")
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = os.path.join(temp_dir, "ai_data", "packet_logs", "inspection.log")
             with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path), \
+                 mock.patch.object(module, "FULL_PACKET_INSPECTION", True), \
                  mock.patch.object(module.os, "geteuid", return_value=0), \
                   mock.patch.dict(module.os.environ, {"SUDO_UID": "1234"}, clear=False), \
                  mock.patch.object(module.pwd, "getpwuid", return_value=target), \
@@ -1810,7 +1977,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 "protocols": [],
                 "entropy": 0.0,
             }
-            with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path):
+            with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path), \
+                 mock.patch.object(module, "FULL_PACKET_INSPECTION", True):
                 module._prepare_packet_inspection_log()
                 try:
                     os.chmod(directory, 0)
@@ -1996,30 +2164,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         tcp_header = struct.pack("!HHIIHHHH", 12345, dst_port, 0, 0, 5, 2, 0, 0)
         return ethernet_header + ip_header + tcp_header
 
-    def test_execute_kill_switch_runs_all_commands_when_some_fail(self):
-        profile = {
-            "os": {"system": "Linux"},
-            "available_interfaces": ["eth0"],
-            "tools": {"ip": True, "iptables": True, "nft": False},
-            "permissions": {"root": True},
-            "network_layers": ["physical"],
-        }
-        with mock.patch.object(module, "_run_command_with_sudo", side_effect=[False, True, True]) as run_cmd, \
-             mock.patch.object(module, "profile_environment", return_value=profile), \
-             mock.patch.object(module, "_probe_network_connectivity", return_value=False), \
-             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
-             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True):
-            module._KILL_SWITCH_TRIGGERED = False
-            module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0"])
-            self.assertEqual(run_cmd.call_count, 3)
-
-            executed_commands = [call.args[0] for call in run_cmd.call_args_list]
-            self.assertEqual(executed_commands, [
-                ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
-                ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
-                ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
-            ])
-
     def test_build_containment_plan_preserves_management_sessions(self):
         plan = module.build_containment_plan(
             "eth0",
@@ -2174,18 +2318,13 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             register.assert_called_once()
             self.assertTrue(module._ONI_SIGNAL_ALLOWED)
 
-    def test_pure_python_barrier_non_linux_returns_false(self):
-        with mock.patch.object(module.platform, "system", return_value="Windows"), \
-             mock.patch.object(module, "disable_network_interfaces") as disable:
-            self.assertFalse(module._attempt_pure_python_network_barrier("eth0", ["eth0"]))
-            disable.assert_not_called()
-
     def test_configured_management_route_is_loaded_and_passed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = os.path.join(temp_dir, "config.json")
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump({"management_ports": [22, 443], "management_ips": ["10.0.0.5"],
                            "allow_oni_signal": True}, handle)
+            os.chmod(config_path, 0o600)
             config = module._load_runtime_config(config_path)
         self.assertEqual(config["management_ports"], [22, 443])
         self.assertTrue(config["allow_oni_signal"])
@@ -2199,15 +2338,15 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(module._configured_management_route(), {})
             self.assertEqual(module.build_containment_plan("eth0")["mode"], "full_isolation")
 
-    def test_invalid_management_ip_is_not_loaded_from_configuration(self):
+    def test_invalid_management_ip_rejects_configuration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = os.path.join(temp_dir, "config.json")
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump({"management_ips": ["not-an-ip"]}, handle)
+            os.chmod(config_path, 0o600)
 
-            config = module._load_runtime_config(config_path)
-
-        self.assertNotIn("management_ips", config)
+            with self.assertRaisesRegex(module.RuntimeConfigError, "management_ips"):
+                module._load_runtime_config(config_path)
 
     def _run_kill_switch_with_route(self, route, containment_mode="full_isolation"):
         with mock.patch.object(module, "_PANEL_FULL_ISOLATION", False), \
@@ -2277,16 +2416,12 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
         transaction = render_nft_transaction(**payload["nft_policy"])
- codespace-probable-dollop-pj64p66j94jv29wg6
-        self.assertIn("destroy table inet mk1ai_quarantine", transaction)
-
         self.assertNotIn("destroy", transaction)
         self.assertTrue(transaction.startswith(
             "add table inet mk1ai_quarantine\n"
             "delete table inet mk1ai_quarantine\n"
             "add table inet mk1ai_quarantine\n"
         ))
- main
         self.assertIn("policy drop", transaction)
         self.assertNotIn("mk1ai_egress", transaction)
         self.assertTrue(payload["require_all_commands"])
@@ -2346,7 +2481,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 management_ports=[22] * 16,
             )
 
-    def test_nft_policy_failure_prevents_isolation_success(self):
+    def test_active_generated_payload_is_refused_before_network_changes(self):
         payload = {
             "nft_policy": {
                 "mode": "full_isolation",
@@ -2357,9 +2492,48 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             "fallback_payloads": [],
             "require_all_commands": True,
         }
-        with mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=False), \
-             mock.patch.object(module, "_attempt_pure_python_network_barrier", return_value=True):
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo") as apply_policy, \
+             mock.patch.object(module, "_run_command_with_sudo") as run_command:
             self.assertFalse(module.execute_generated_payload(payload, interface="eth0"))
+
+        apply_policy.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_generated_payload_dry_run_only_previews_without_applying(self):
+        payload = {
+            "nft_policy": {
+                "mode": "full_isolation",
+                "management_ips": [],
+                "management_ports": [],
+            },
+            "commands": [["ip", "link", "set", "eth0", "down"]],
+        }
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo") as apply_policy, \
+             mock.patch.object(module, "_run_command_with_sudo") as run_command:
+            self.assertTrue(module.execute_generated_payload(payload, dry_run=True))
+
+        apply_policy.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_kill_switch_does_not_escalate_to_all_paths_on_policy_or_state_failure(self):
+        for policy_result, state_result in ((False, True), (True, False)):
+            with self.subTest(policy_result=policy_result, state_result=state_result), \
+                 mock.patch.object(
+                     module, "_apply_nft_policy_with_sudo", return_value=policy_result,
+                 ), \
+                 mock.patch.object(
+                     module, "_persist_quarantine_state", return_value=state_result,
+                 ), \
+                 mock.patch.object(
+                     module, "disable_all_network_paths",
+                     side_effect=AssertionError("failure must not broaden isolation"),
+                 ) as disable_paths:
+                self.assertFalse(module.execute_kill_switch(
+                    "eth0",
+                    dry_run=False,
+                    available_interfaces=["eth0", "wlan0"],
+                ))
+                disable_paths.assert_not_called()
 
     def test_nft_policy_is_applied_as_one_stdin_transaction(self):
         from mk1_firewall import apply_nft_policy
@@ -2367,10 +2541,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch("mk1_firewall.os.geteuid", return_value=0), \
              mock.patch("mk1_firewall._trusted_nft_binary", return_value="/usr/sbin/nft"), \
- codespace-probable-dollop-pj64p66j94jv29wg6
-
              mock.patch("mk1_firewall.check_nft_support", return_value=None), \
- main
              mock.patch("mk1_firewall.subprocess.run", return_value=completed) as run:
             self.assertTrue(apply_nft_policy(
                 mode="management_safe_harbor",
@@ -2459,14 +2630,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         payload = module.generate_optimal_kill_payload(profile, learning_data=["windows"])
         self.assertTrue(any(command[:1] == ["powershell"] for command in payload["commands"]))
 
-    def test_execute_generated_payload_falls_back_when_primary_fails(self):
+    def test_execute_generated_payload_refuses_active_fallbacks_until_approved(self):
         payload = {
             "commands": [["ip", "link", "set", "eth0", "down"]],
             "fallback_payloads": [{"commands": [["echo", "fallback"]]}],
         }
         with mock.patch.object(module, "_run_command_with_sudo", side_effect=[False, True]) as run_cmd:
-            module.execute_generated_payload(payload, dry_run=False)
-            self.assertGreaterEqual(run_cmd.call_count, 2)
+            self.assertFalse(module.execute_generated_payload(payload, dry_run=False))
+            run_cmd.assert_not_called()
 
     def test_handle_admin_recovery_signal_requires_authorized_token(self):
         original_token = getattr(module, "_ADMIN_RECOVERY_TOKEN", None)
@@ -2479,6 +2650,49 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             run_cmd.assert_not_called()
         finally:
             module._ADMIN_RECOVERY_TOKEN = original_token
+
+    def test_admin_recovery_keeps_pending_state_when_interface_restore_fails(self):
+        original_token = module._ADMIN_RECOVERY_TOKEN
+        original_pending = module._ISOLATION_APPROVAL_PENDING
+        original_triggered = module._KILL_SWITCH_TRIGGERED
+        try:
+            module._ADMIN_RECOVERY_TOKEN = "secret-token"
+            module._ISOLATION_APPROVAL_PENDING = True
+            module._KILL_SWITCH_TRIGGERED = False
+            with mock.patch.object(module, "_run_command_with_sudo", return_value=False) as run:
+                result = module.handle_admin_recovery_signal(
+                    "secret-token",
+                    interface="eth0",
+                    available_interfaces=["eth0", "wlan0"],
+                )
+
+            self.assertTrue(result["authorized"])
+            self.assertFalse(result["recovered"])
+            self.assertEqual(result["reason"], "recovery_command_failed")
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(module._ISOLATION_APPROVAL_PENDING)
+        finally:
+            module._ADMIN_RECOVERY_TOKEN = original_token
+            module._ISOLATION_APPROVAL_PENDING = original_pending
+            module._KILL_SWITCH_TRIGGERED = original_triggered
+
+    def test_admin_recovery_refuses_to_clear_state_without_known_interfaces(self):
+        original_token = module._ADMIN_RECOVERY_TOKEN
+        original_pending = module._ISOLATION_APPROVAL_PENDING
+        try:
+            module._ADMIN_RECOVERY_TOKEN = "secret-token"
+            module._ISOLATION_APPROVAL_PENDING = True
+            with mock.patch.object(module, "_run_command_with_sudo") as run:
+                result = module.handle_admin_recovery_signal("secret-token")
+
+            self.assertTrue(result["authorized"])
+            self.assertFalse(result["recovered"])
+            self.assertEqual(result["reason"], "no_interfaces")
+            run.assert_not_called()
+            self.assertTrue(module._ISOLATION_APPROVAL_PENDING)
+        finally:
+            module._ADMIN_RECOVERY_TOKEN = original_token
+            module._ISOLATION_APPROVAL_PENDING = original_pending
 
     def test_packet_inspection_pipeline_blocks_immediately_in_oni_mode(self):
         original_oni_mode = module.ONI_MODE

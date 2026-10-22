@@ -128,6 +128,38 @@ class SecureTransportTest(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_tunnel_control_rejects_a_peer_with_an_unapproved_uid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "tunnel-control.sock"
+            server = secure_transport.TunnelControlServer(str(path))
+            server.start()
+            server._allowed_uid = secure_transport.os.geteuid() + 1
+            try:
+                with mock.patch.object(secure_transport, "set_transport_enabled") as set_enabled:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(str(path))
+                        client.sendall(b"T0")
+                        self.assertEqual(client.recv(1), b"0")
+                    set_enabled.assert_not_called()
+            finally:
+                server.close()
+
+    def test_tunnel_control_refuses_an_untrusted_parent_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = pathlib.Path(temp_dir)
+            directory.chmod(0o777)
+            server = secure_transport.TunnelControlServer(
+                str(directory / "tunnel-control.sock"),
+            )
+            try:
+                with self.assertRaisesRegex(
+                    secure_transport.SecureTransportError,
+                    "untrusted tunnel control directory",
+                ):
+                    server.start()
+            finally:
+                directory.chmod(0o700)
+
     def test_tunnel_control_socket_is_private_from_the_moment_it_is_bound(self):
         import os
 

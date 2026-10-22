@@ -87,6 +87,7 @@ class LauncherScriptTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout.decode(errors="replace"))
             self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), config)
             self.assertEqual(data_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
             self.assertIn("airgap_ai_defender.py --config ai_data/config.json", (
                 root / "python.log"
             ).read_text(encoding="utf-8"))

@@ -1,6 +1,9 @@
 ai_data/gdrive_raw/
 ai_data/wireguard/
 ai_data/config.json
+ai_data/curated/curated_data.jsonl
+ai_data/local_adaptation.pth
+ai_data/local_adaptation.pth.sha256
 __pycache__/
 *.pyc
 .venv/

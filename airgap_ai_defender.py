@@ -25,7 +25,7 @@ from mk1_firewall import (
     validate_nft_policy,
 )
 import mk1_memory_guard
-from mk1_usb_guard import USBHotplugMonitor, disable_network_interfaces
+from mk1_usb_guard import USBHotplugMonitor
 
 try:
     import mk1_secure_transport
@@ -55,51 +55,18 @@ _CODE_EXECUTION_CONTEXT = (
 _UNSAFE_SHELL_CHARS_RE = re.compile(r"[;&|`$<>\\\n\r\t\f\v]")
 
 def ensure_dependencies() -> dict[str, bool]:
-    """不足ライブラリの導入を試みる。失敗時は呼び出し元のstubへフォールバックする。"""
-    packages = {
-        "torch": "torch",
-        "psutil": "psutil",
-        "cryptography": "cryptography",
-    }
-    availability = {}
-    for module_name, package_name in packages.items():
+    """Report optional dependency availability without installing packages at runtime."""
+    availability: dict[str, bool] = {}
+    for module_name in ("torch", "psutil", "cryptography"):
         try:
             availability[module_name] = importlib.util.find_spec(module_name) is not None
         except (ImportError, ValueError):
             availability[module_name] = False
 
-        if availability[module_name]:
-            continue
-
-        command = [
-            sys.executable, "-m", "pip", "install",
-            "--disable-pip-version-check", "--retries", "3", "--timeout", "300",
-        ]
-        if module_name == "torch":
-            command.extend([
-                "--extra-index-url", "https://download.pytorch.org/whl/cpu",
-            ])
-        command.append(package_name)
-        try:
-            print(f"[DEPENDENCIES] {package_name} をインストールします。", file=sys.stderr)
-            result = subprocess.run(
-                command,
-                check=False,
-                timeout=1800,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            availability[module_name] = result.returncode == 0
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(
-                f"[DEPENDENCIES] {package_name} を導入できません。stub/安全な代替処理で続行します ({exc})",
-                file=sys.stderr,
-            )
-            availability[module_name] = False
-
         if not availability[module_name]:
             print(
-                f"[DEPENDENCIES] {package_name} が利用できません。機能を制限して続行します。",
+                f"[DEPENDENCIES] {module_name} がありません。起動時のパッケージ導入は行わず、"
+                "該当機能を制限して続行します。",
                 file=sys.stderr,
             )
     return availability
@@ -442,8 +409,10 @@ import signal as _signal_module
 _CRYPTO_LOG_COOLDOWN = 0.0
 _BACKDOOR_RISK_SCORE = 0.0
 _KILL_SWITCH_TRIGGERED = False
+_ISOLATION_APPROVAL_PENDING = False
 _KILL_SWITCH_COOLDOWN_SEC = 5.0
 _LAST_KILL_SWITCH_TRIGGER = 0.0
+_ACTIVE_ISOLATION_CONFIRMATION = "ENABLE ACTIVE ISOLATION"
 _MONITOR_INTERFACE = "eth0"
 _DRY_RUN = True
 
@@ -522,6 +491,7 @@ FULL_PACKET_INSPECTION = str(os.environ.get("FULL_PACKET_INSPECTION", "")).lower
 _DPI_WINDOW_SIZE = 256
 _DPI_SAMPLE_STRIDE = 128
 _DPI_MAX_SAMPLE_WINDOWS = 32
+_MAX_RUNTIME_CONFIG_BYTES = 64 * 1024
 _FULL_PACKET_INSPECTION_LOG_PATH = os.path.join("./ai_data", "packet_logs", "full_packet_inspection.log")
 _FULL_PACKET_INSPECTION_LOG_FD = None
 _FULL_PACKET_INSPECTION_LOG_FD_PATH = None
@@ -1865,20 +1835,27 @@ def analyze_dpi_payload(packet_bytes: bytes, payload: bytes | None = None, inter
 
 def log_full_packet_inspection(packet_bytes: bytes, interface: str | None, dpi_result: dict, stage: str, reason: str, log_path: str | None = None):
     """異常疑惑パケットの完全なヘッダー・DPI詳細をログ/ファイルへ保存する。"""
-    if not (FULL_PACKET_INSPECTION or dpi_result.get("suspicious")):
+    if not FULL_PACKET_INSPECTION:
         return
 
     path = log_path or _FULL_PACKET_INSPECTION_LOG_PATH
 
     transport = parse_packet_transport(packet_bytes)
-    findings = dpi_result.get("findings", [])
+    findings = [
+        {key: value for key, value in finding.items() if key != "token"}
+        if isinstance(finding, dict) else finding
+        for finding in dpi_result.get("findings", [])
+    ]
+    safe_dpi_result = dict(dpi_result)
+    if "findings" in safe_dpi_result:
+        safe_dpi_result["findings"] = findings
     record = {
         "timestamp": time.time(),
         "interface": interface,
         "stage": stage,
         "reason": reason,
         "transport": transport,
-        "dpi": dpi_result,
+        "dpi": safe_dpi_result,
         "findings": findings,
         "hex_dump": " ".join(f"{b:02x}" for b in packet_bytes[:256]),
     }
@@ -1920,7 +1897,9 @@ def log_full_packet_inspection(packet_bytes: bytes, interface: str | None, dpi_r
         log.warning(f"  - protocols={', '.join(dpi_result['protocols'])}")
     for finding in findings[:8]:
         if finding.get("type") == "signature":
-            log.warning(f"  - offset={finding.get('offset')} type={finding.get('description')} token={finding.get('token')}")
+            log.warning(
+                f"  - offset={finding.get('offset')} type={finding.get('description')}",
+            )
         elif finding.get("type") == "entropy":
             log.warning(f"  - offset={finding.get('offset')} entropy={finding.get('entropy', 0.0):.3f} high_entropy_window")
 
@@ -2640,18 +2619,13 @@ def _usb_scan_threat_response(
     if verdict != "threat":
         return
     log.critical(
-        "[USB] MicroVMが脅威を検出: %s (%s:%s)。iproute2によるNIC遮断を試みます。",
+        "[USB] MicroVMが脅威判定を返しました: %s (%s:%s)。",
         device.device_id, device.vendor_id, device.product_id,
     )
-    if (
-        tunnel_control_path
-        and mk1_secure_transport is not None
-        and not mk1_secure_transport.request_transport_state(tunnel_control_path, False)
-    ):
-        log.critical("[USB] 暗号化トンネル鍵消去IPCを確認できません。")
-    current_interfaces = discover_available_interfaces() or interfaces
-    if not disable_network_interfaces(current_interfaces):
-        log.critical("[USB] iproute2で全NICを遮断できませんでした。USBデバイスは論理切断済みです。")
+    log.error(
+        "[USB] イベントごとの管理者承認機能が未実装のため、"
+        "トンネル変更・NIC遮断は実行しません。"
+    )
 
 
 def _usb_guard_process_main(
@@ -2753,7 +2727,7 @@ def _is_suspicious_executable_path(exe_path: str) -> bool:
     lowercase = exe_path.lower()
     if " (deleted)" in lowercase:
         return True
-    suspicious_dirs = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/var/run/", "/mnt/", "/proc/self/fd/")
+    suspicious_dirs = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/var/run/", "/mnt/", "/proc/self/fd/")  # nosec B108: these are path-matching indicators, not filesystem operations
     if any(lowercase.startswith(prefix) for prefix in suspicious_dirs):
         return True
     trusted_dirs = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/", "/lib/", "/lib64/", "/usr/lib/", "/usr/local/bin/", "/usr/local/sbin/")
@@ -2785,7 +2759,7 @@ def _is_suspicious_process_command(process_identifier: int | str, cmdline: str =
 
     suspicious_tokens = [
         "nc", "ncat", "socat", "curl", "wget", "python -c", "python3 -c", "bash -c", "powershell", "pwsh", "cmd.exe",
-        "ssh ", "perl", "ruby", "start-process", "/tmp/", "/var/tmp/", "/dev/shm/", "curl -", "wget -"
+        "ssh ", "perl", "ruby", "start-process", "/tmp/", "/var/tmp/", "/dev/shm/", "curl -", "wget -"  # nosec B108: suspicious command-line indicators
     ]
     if any(token in lowered for token in suspicious_tokens):
         return True
@@ -3719,74 +3693,23 @@ def _probe_network_connectivity() -> bool | None:
 
 
 def execute_generated_payload(payload: dict, dry_run: bool = False, available_interfaces=None, interface: str | None = None) -> bool:
-    """生成済みペイロードを動的に実行し、必要ならフォールバック戦略へ切り替える。"""
+    """Preview a generated policy; active execution waits for per-event approval."""
+    if not dry_run:
+        log.error(
+            "[DYNAMIC_EXECUTION] イベントごとの管理者承認機能が未実装のため、"
+            "実遮断ペイロードを拒否しました。"
+        )
+        return False
     if not payload:
         return False
 
     commands = payload.get("commands", [])
-    fallback_payloads = payload.get("fallback_payloads", [])
-    profile = payload.get("profile", {})
     nft_policy = payload.get("nft_policy")
-
-    log.info("[DYNAMIC_EXECUTION] 遮断処理を実行します。")
-    if dry_run:
-        if nft_policy:
-            log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
-        for cmd in commands:
-            log.critical(f"    - 予定: {' '.join(cmd)}")
-        return True
-
-    success_count = 0
-    if nft_policy is not None:
-        if not _apply_nft_policy_with_sudo(
-            nft_policy.get("mode"),
-            nft_policy.get("management_ips", []),
-            nft_policy.get("management_ports", []),
-        ):
-            _attempt_pure_python_network_barrier(interface, available_interfaces)
-            return False
-        success_count += 1
+    log.info("[DYNAMIC_EXECUTION] Dry-Runのため隔離ポリシーは適用しません。")
+    if nft_policy:
+        log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
     for cmd in commands:
-        log.info(f"    - 実行: {' '.join(cmd)}")
-        if _run_command_with_sudo(cmd, dry_run=False):
-            success_count += 1
-            log.critical("    → 遮断コマンド成功")
-        else:
-            log.error(f"    → コマンド失敗: {' '.join(cmd)}")
-
-    expected_successes = len(commands) + (1 if nft_policy is not None else 0)
-    if payload.get("require_all_commands") and success_count != expected_successes:
-        log.error("[DYNAMIC_EXECUTION] 必須の隔離ルールをすべて適用できなかったため、隔離完了とは扱いません。")
-        _attempt_pure_python_network_barrier(interface, available_interfaces)
-        return False
-
-    if payload.get("python_snippet"):
-        log.warning("[DYNAMIC_EXECUTION] Python スニペットの exec 実行は無効化され、構造化なフォールバック経路に切り替えます。")
-
-    if not success_count:
-        if _attempt_pure_python_network_barrier(interface, available_interfaces):
-            log.warning("[FALLBACK_BARRIER] iproute2/netlinkによる遮断を適用しました。")
-            return True
-
-    connectivity_state = _probe_network_connectivity()
-    if connectivity_state is True:
-        log.warning("[SELF_LEARNING] ping で依然として到達性が確認されたため、フォールバック戦略へ切り替えます。")
-    elif connectivity_state is False:
-        log.info("[DYNAMIC_EXECUTION] 生成ロジック適用後に到達性の低下を確認しました。")
-
-    if success_count == 0 or connectivity_state is True:
-        if _attempt_pure_python_network_barrier(interface, available_interfaces):
-            log.warning("[FALLBACK_BARRIER] iproute2/netlinkによる遮断を適用しました。")
-            return True
-
-    if success_count == 0 or (connectivity_state is True and success_count == 0):
-        log.warning("[SELF_LEARNING] 生成戦略が不十分だったため、フォールバック戦略を試します。")
-        for fallback_payload in fallback_payloads:
-            log.info(f"  - フォールバック: {fallback_payload.get('name', 'unnamed')}")
-            if execute_generated_payload(fallback_payload, dry_run=False, available_interfaces=available_interfaces, interface=interface):
-                return True
-        return False
-
+        log.critical(f"    - 予定: {' '.join(cmd)}")
     return True
 
 
@@ -5113,11 +5036,7 @@ _TRAIN_QUEUE_MAX_BATCHES = 10
 _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
- codespace-probable-dollop-pj64p66j94jv29wg6
-def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
-
 def _enqueue_training_batch(batch: list) -> bool:
- main
     if not batch or not _LOCAL_ADAPTATION_ENABLED:
         return True
     try:
@@ -5219,22 +5138,6 @@ def _run_command_with_sudo(cmd: list, dry_run: bool = False) -> bool:
     return _execute_root_command(cmd, dry_run=dry_run)
 
 
-def _attempt_pure_python_network_barrier(interface: str | None = None, available_interfaces=None) -> bool:
-    """信頼済みiproute2/netlink経由でインターフェース停止を試みる。"""
-    interfaces = []
-    if available_interfaces:
-        interfaces = list(available_interfaces)
-    if interface and interface not in interfaces:
-        interfaces.insert(0, interface)
-    interfaces = [iface for iface in interfaces if iface and iface != "lo"]
-    if not interfaces:
-        return False
-
-    if platform.system().lower() != "linux":
-        return False
-    return disable_network_interfaces(interfaces)
-
-
 def _load_admin_recovery_token() -> str:
     """環境変数またはローカルトークンファイルから管理者復旧トークンを取得する。"""
     if _ADMIN_RECOVERY_TOKEN:
@@ -5268,22 +5171,37 @@ def handle_admin_recovery_signal(token: str | None = None, interface: str | None
         interfaces = [iface for iface in available_interfaces if iface and iface != "lo"]
     if interface and interface not in interfaces:
         interfaces.insert(0, interface)
+    if not interfaces:
+        log.error("[RECOVERY_API] 復旧対象のインターフェースを確認できません。状態を変更しません。")
+        return {
+            "authorized": True,
+            "recovered": False,
+            "reason": "no_interfaces",
+            "commands": [],
+        }
 
-    commands = []
-    if interface:
-        commands.append(["ip", "link", "set", interface, "up"])
-    for iface in interfaces:
-        if iface and iface != "lo" and iface != interface:
-            commands.append(["ip", "link", "set", iface, "up"])
-    if commands:
-        for cmd in commands:
-            _run_command_with_sudo(cmd, dry_run=False)
-    else:
-        _run_command_with_sudo(["ip", "link", "set", "lo", "up"], dry_run=False)
+    commands = [
+        ["ip", "link", "set", iface, "up"]
+        for iface in interfaces
+    ]
+    results = [
+        _run_command_with_sudo(cmd, dry_run=False)
+        for cmd in commands
+    ]
+    if not all(results):
+        log.error("[RECOVERY_API] 一部の復旧コマンドが失敗しました。状態を解除しません。")
+        return {
+            "authorized": True,
+            "recovered": False,
+            "reason": "recovery_command_failed",
+            "commands": commands,
+        }
 
     with _CONTAINMENT_LOCK:
-        global _KILL_SWITCH_TRIGGERED, _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _BACKDOOR_RISK_SCORE
+        global _KILL_SWITCH_TRIGGERED, _ISOLATION_APPROVAL_PENDING
+        global _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _BACKDOOR_RISK_SCORE
         _KILL_SWITCH_TRIGGERED = False
+        _ISOLATION_APPROVAL_PENDING = False
         _LAST_KILL_SWITCH_TRIGGER = 0.0
         _anomaly_counter = 0
         _BACKDOOR_RISK_SCORE = 0.0
@@ -5311,8 +5229,9 @@ def _apply_anomaly_decay(now: float | None = None) -> tuple[float, bool]:
 
 def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float = 0.0,
                           backdoor_detected: bool = False, backdoor_boost: float = 0.0) -> bool:
-    """バックドア/異常スコアを評価して必要なら即座にキルスイッチを発動する。"""
-    global _KILL_SWITCH_TRIGGERED, _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _LAST_THREAT_SCORE
+    """Threats are advisory; active isolation waits for per-event operator approval."""
+    global _ISOLATION_APPROVAL_PENDING, _LAST_KILL_SWITCH_TRIGGER
+    global _anomaly_counter, _LAST_THREAT_SCORE
     _LAST_THREAT_SCORE = max(0.0, min(0.99, float(score_a)))
 
     if is_learning_mode() and (backdoor_detected or backdoor_boost > 0.0 or score_a >= 0.95):
@@ -5345,17 +5264,25 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
         if should_trigger:
             if effective_dry_run:
                 log.warning("[MAINTENANCE] メンテナンス状態のため、遮断処理は Dry-Run として扱います。")
-            elif mk1_secure_transport is not None:
-                mk1_secure_transport.set_transport_enabled(False)
-            log.info(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
             _KILL_SWITCH_EVENT.set()
-            management_route = _configured_management_route()
-            if not _dispatch_privileged_command(
-                "kill_switch", interface=interface, dry_run=effective_dry_run, **management_route,
-            ):
-                execute_kill_switch(interface, effective_dry_run, **management_route)
-            _KILL_SWITCH_TRIGGERED = True
             _LAST_KILL_SWITCH_TRIGGER = now
+            if effective_dry_run:
+                log.info(
+                    "脅威イベントを検出しました。Dry-Runのため実遮断は行いません "
+                    "(score=%.3f, backdoor=%s, consecutive=%d)",
+                    effective_score, backdoor_detected, _anomaly_counter,
+                )
+                management_route = _configured_management_route()
+                if not _dispatch_privileged_command(
+                    "kill_switch", interface=interface, dry_run=True, **management_route,
+                ):
+                    execute_kill_switch(interface, True, **management_route)
+            else:
+                _ISOLATION_APPROVAL_PENDING = True
+                log.error(
+                    "[ISOLATION] 検知を記録しましたが、イベントごとの管理者承認機能が未実装のため"
+                    "実遮断は行いません。承認待ちとして扱います。"
+                )
             return True
     return False
 
@@ -5704,9 +5631,15 @@ def _publish_threat_map_event(packet_bytes: bytes, reason: str, threat_score: fl
 
 def execute_kill_switch(interface: str | None, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
     """
-    異常検知時にOSのファイアウォール/ネットワーク機能による隔離を試みます。
-    失敗しても次のコマンドを続ける fail-safe 方式です。
+    Render a dry-run containment plan; active enforcement is disabled pending
+    a per-event operator-approval workflow.
     """
+    if not dry_run:
+        log.error(
+            "[AIRGAP] イベントごとの管理者承認が未実装のため、実遮断を拒否しました。"
+        )
+        return False
+
     if available_interfaces is None:
         available_interfaces = discover_available_interfaces()
 
@@ -5714,36 +5647,9 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
         containment_mode = "management_safe_harbor"
         log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
 
-    if not dry_run:
-        policy_applied = _apply_nft_policy_with_sudo(
-            containment_mode,
-            management_ips or (),
-            management_ports or (),
-        )
-        state_persisted = _persist_quarantine_state()
-        if not policy_applied or not state_persisted:
-            disable_all_network_paths()
-            log.error("[AIRGAP] nftables隔離または永続状態を確認できません。隔離完了とは扱いません。")
-            return False
-
-    if _PANEL_FULL_ISOLATION and not dry_run:
-        if containment_mode != "full_isolation":
-            log.warning("[AIRGAP] TCP管理safe-harborを適用しました。NIC停止は行いません。")
-            return True
-        if disable_all_network_paths():
-            log.critical("[AIRGAP] NIC・無線・USBネットワーク・モデム・Thunderboltの無効化を確認しました。")
-            _close_panel_after_airgap()
-            return True
-        else:
-            log.error("[AIRGAP] 全経路の無効化を確認できませんでした。隔離完了とは扱いません。")
-            return False
- codespace-probable-dollop-pj64p66j94jv29wg6
-
-
     if containment_mode == "full_isolation" and (management_ports or management_ips):
         containment_mode = "management_safe_harbor"
         log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
- main
 
     containment_plan = build_containment_plan(
         interface,
@@ -6335,19 +6241,54 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
     return worker, completion, result
 
 
+class RuntimeConfigError(ValueError):
+    """Raised when a runtime configuration is unreadable or violates its schema."""
+
+
 def _load_runtime_config(config_path: str) -> dict:
     try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config = json.load(handle)
+        descriptor = os.open(
+            config_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning(f"[CONFIG] 設定ファイルを読み込めません。CLI既定値で続行します ({exc})")
-        return {}
+    except OSError as exc:
+        raise RuntimeConfigError(f"設定ファイルを読み込めません ({exc})") from exc
+
+    try:
+        config_stat = os.fstat(descriptor)
+        effective_uid = os.geteuid()
+        trusted_uids = {effective_uid}
+        sudo_uid = os.environ.get("SUDO_UID", "")
+        if effective_uid == 0 and sudo_uid.isdigit():
+            trusted_uids.add(int(sudo_uid))
+        if not stat.S_ISREG(config_stat.st_mode):
+            raise RuntimeConfigError("設定パスは通常ファイルである必要があります")
+        if config_stat.st_uid not in trusted_uids:
+            raise RuntimeConfigError("設定ファイルの所有者が信頼できません")
+        if config_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeConfigError("設定ファイルがグループまたは他ユーザーから書込可能です")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            serialized_config = handle.read(_MAX_RUNTIME_CONFIG_BYTES + 1)
+    except OSError as exc:
+        raise RuntimeConfigError(f"設定ファイルを読み込めません ({exc})") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if len(serialized_config) > _MAX_RUNTIME_CONFIG_BYTES:
+        raise RuntimeConfigError(
+            f"設定ファイルのサイズが上限({_MAX_RUNTIME_CONFIG_BYTES} bytes)を超えています",
+        )
+    try:
+        config = json.loads(serialized_config.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise RuntimeConfigError(f"設定JSONが不正です ({exc})") from exc
 
     if not isinstance(config, dict):
-        log.warning("[CONFIG] 設定ファイルの最上位はJSON objectである必要があります。既定値で続行します。")
-        return {}
+        raise RuntimeConfigError("設定ファイルの最上位はJSON objectである必要があります")
 
     validators = {
         "interface": lambda value: isinstance(value, str) and bool(value.strip()),
@@ -6384,15 +6325,24 @@ def _load_runtime_config(config_path: str) -> dict:
             isinstance(value, int) and not isinstance(value, bool) and value in (0, 1)
         ),
     }
+    unknown_keys = sorted(set(config) - set(validators))
+    if unknown_keys:
+        raise RuntimeConfigError(
+            "未知の設定キーがあります: " + ", ".join(unknown_keys),
+        )
+
+    invalid_keys = sorted(
+        key for key, value in config.items()
+        if not validators[key](value)
+    )
+    if invalid_keys:
+        raise RuntimeConfigError(
+            "設定値が不正です: " + ", ".join(invalid_keys),
+        )
+
     validated = {}
     for key, value in config.items():
-        validator = validators.get(key)
-        if validator is None:
-            continue
-        if validator(value):
-            validated[key] = value.strip() if isinstance(value, str) else value
-        else:
-            log.warning(f"[CONFIG] {key} の値が不正なため無視します。")
+        validated[key] = value.strip() if isinstance(value, str) else value
     return validated
 
 
@@ -6401,6 +6351,26 @@ def _merge_runtime_config(config_path: str, panel_config_path: str | None = None
     if panel_config_path:
         config.update(_load_runtime_config(panel_config_path))
     return config
+
+
+def _load_panel_runtime_config(
+    config_path: str,
+    tunnel_enabled: bool,
+    memory_guard_enabled: bool,
+    map_mode: MapMode,
+) -> dict:
+    try:
+        return _load_runtime_config(config_path)
+    except RuntimeConfigError as exc:
+        log.error(
+            "[CONFIG] パネル設定の更新を拒否しました。最後に適用した設定を維持します (%s)",
+            exc,
+        )
+        return {
+            "secure_tunnel_enabled": int(tunnel_enabled),
+            "memory_guard_enabled": int(memory_guard_enabled),
+            "map_mode": int(map_mode),
+        }
 
 
 def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_data/config.json"):
@@ -6429,12 +6399,69 @@ def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_
     parser.add_argument("--rsi", action="store_true", help="Recursive Self-ImprovementをGoogle Colabへ委託")
     parser.add_argument("--mode", choices=("normal", "RSI", "rsi"), default=config.get("mode", "normal"), help="実行モード")
     parser.add_argument("--install-deps", action="store_true", help="起動前に不足している依存ライブラリを自動インストールします")
-    parser.add_argument("--no-dry-run",     action="store_true", help="指定すると実際にNICをダウンさせます(危険！)")
+    parser.add_argument("--no-dry-run", action="store_true",
+                        help="現在はイベントごとの管理者承認機能が未実装のため拒否されます")
+    parser.add_argument(
+        "--active-isolation-confirmation",
+        choices=(_ACTIVE_ISOLATION_CONFIRMATION,),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--allow-oni-signal", action="store_true",
                         default=config.get("allow_oni_signal", False),
                         help="SIGUSR1 による鬼モード(ONI_MODE)の切替を許可します(既定は無効)")
     parser.add_argument("--restore-hardening", action="store_true", help="保存済みの sysctl バックアップを書き戻して終了")
     return parser
+
+
+def _confirm_active_isolation(
+    interface: str,
+    available_interfaces: list[str],
+    management_ips: list[str],
+    management_ports: list[int],
+    *,
+    panel_parent_pid: int = 0,
+    panel_confirmation: str | None = None,
+    input_func=input,
+) -> bool:
+    """Require a visible impact preview and explicit confirmation before active mode."""
+    interfaces = sorted({
+        item for item in available_interfaces
+        if isinstance(item, str) and item and item != "lo"
+    })
+    mode = (
+        "management_safe_harbor"
+        if management_ips or management_ports else "full_isolation"
+    )
+    print("実遮断の影響範囲 (実行前プレビュー; この表示自体は設定を変更しません):")
+    print(f"  監視インターフェース: {interface}")
+    print(f"  対象として検出したネットワークインターフェース: {', '.join(interfaces) or '不明'}")
+    print(f"  適用予定ポリシー: {mode}")
+    if mode == "management_safe_harbor":
+        print(f"  維持を試みる管理IP: {', '.join(management_ips) or '未指定'}")
+        print(f"  維持を試みるTCPポート: {', '.join(map(str, management_ports)) or '未指定'}")
+    print("  影響: ファイアウォールが変更され、SSHを含む通信・遠隔管理が切断される可能性があります。")
+    print("  未列挙の無線/USBネットワーク/モデム/Thunderbolt経路はこのプレビューで保証されません。")
+
+    if panel_parent_pid > 0:
+        confirmed = panel_confirmation == _ACTIVE_ISOLATION_CONFIRMATION
+    else:
+        if not sys.stdin.isatty():
+            print("対話端末がないため実遮断を拒否しました。", file=sys.stderr)
+            return False
+        try:
+            entered = input_func(
+                f"続行する場合は {_ACTIVE_ISOLATION_CONFIRMATION} と正確に入力してください: "
+            )
+        except (EOFError, OSError):
+            return False
+        confirmed = hmac.compare_digest(
+            entered.strip(),
+            _ACTIVE_ISOLATION_CONFIRMATION,
+        )
+
+    if not confirmed:
+        print("確認文字列が一致しないため、実遮断を拒否しました。", file=sys.stderr)
+    return confirmed
 
 
 def _format_compact_status(ram_mb: float, ram_limit_mb: int, swap_mb: float,
@@ -6476,6 +6503,8 @@ def _write_panel_status(
     threat_score = max(0.0, min(1.0, float(_LAST_THREAT_SCORE)))
     if _KILL_SWITCH_TRIGGERED:
         alert = "AIRGAP"
+    elif _ISOLATION_APPROVAL_PENDING:
+        alert = "APPROVAL_REQUIRED"
     elif backdoor_score >= 0.35:
         alert = "BACKDOOR"
     elif threat_score >= 0.75:
@@ -6483,12 +6512,14 @@ def _write_panel_status(
     else:
         alert = "NONE"
     status = (
+        f"sampled_at={int(time.time())}\n"
         f"state={state}\n"
         f"packets_per_second={max(0.0, packets_per_second):.2f}\n"
         f"packets_total={max(0, packets_total)}\n"
         f"threat_score={threat_score:.3f}\n"
         f"backdoor_score={backdoor_score:.3f}\n"
         f"isolation_active={int(bool(_KILL_SWITCH_TRIGGERED))}\n"
+        f"isolation_approval_pending={int(bool(_ISOLATION_APPROVAL_PENDING))}\n"
         f"mode={mode}\n"
         f"dry_run={int(bool(dry_run))}\n"
         f"secure_tunnel_active={int(bool(mk1_secure_transport and mk1_secure_transport.transport_is_enabled()))}\n"
@@ -6545,17 +6576,24 @@ def main():
     pre_parser.add_argument("--config", default="./ai_data/config.json")
     pre_parser.add_argument("--panel-config")
     pre_args, _ = pre_parser.parse_known_args()
-    runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
+    try:
+        runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
+    except RuntimeConfigError as exc:
+        pre_parser.error(str(exc))
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
 
+    if args.no_dry_run:
+        parser.error(
+            "実遮断はイベントごとの管理者承認機能が未実装のため無効です"
+        )
+    if args.active_isolation_confirmation and not args.no_dry_run:
+        parser.error("--active-isolation-confirmation は --no-dry-run と併用してください")
     if args.validation_only and not _LOCAL_ADAPTATION_ENABLED:
         log.error("[検証] ローカル適応学習は必要な署名・安全対策がないため実行できません。")
         return 3
- codespace-probable-dollop-pj64p66j94jv29wg6
 
 
- main
     if args.ignore_model_hash and not TORCH_AVAILABLE:
         parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
 
@@ -6574,6 +6612,7 @@ def main():
     if args.panel_parent_pid < 0:
         parser.error("--panel-parent-pid は0以上で指定してください")
     _PANEL_PARENT_PID = args.panel_parent_pid
+    rsi_requested = args.rsi or args.mode.upper() == "RSI"
     if "colab_endpoint" in runtime_config:
         os.environ["COLAB_RSI_ENDPOINT"] = runtime_config["colab_endpoint"]
     if "colab_pq_public_key_sha256" in runtime_config:
@@ -6586,7 +6625,6 @@ def main():
         parser.error("--ram-limit/--max-memory-mb は1以上で指定してください")
     if args.max_samples < 1:
         parser.error("--max-samples は1以上で指定してください")
-    rsi_requested = args.rsi or args.mode.upper() == "RSI"
     configured_endpoint = os.environ.get("COLAB_RSI_ENDPOINT", "").strip()
     if rsi_requested and configured_endpoint:
         public_key_pin = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip()
@@ -6600,8 +6638,8 @@ def main():
             parser.error(f"RSI通信を開始できません。WireGuard full-tunnelが必要です: {exc}")
     rsi_token = runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")
     _RSI_MODE_ACTIVE = rsi_requested
-    dry_run = not args.no_dry_run or rsi_requested
-    _PANEL_FULL_ISOLATION = bool(args.panel_parent_pid > 0 and not dry_run)
+    dry_run = True
+    _PANEL_FULL_ISOLATION = False
     if args.validation_only:
         os.makedirs(args.local_dir, exist_ok=True)
         rsi_model = None
@@ -6635,7 +6673,7 @@ def main():
     print(f"  ローカルデータ保存先: {args.local_dir}")
     print(f"  RAM上限      : {args.max_memory_mb}MB")
     print(f"  更新間隔     : {args.update_interval}秒ごとにローカルデータを再評価")
-    print(f"  Dry-Run      : {dry_run} (--no-dry-run で実遮断モード)")
+    print("  実遮断       : 無効 (イベントごとの管理者承認機能が未実装)")
     print("="*60 + "\n")
 
     # ── 初期化 ──
@@ -6812,7 +6850,12 @@ def main():
 
             now_monotonic = time.monotonic()
             if args.panel_config and now_monotonic >= next_map_config_check:
-                panel_config = _load_runtime_config(args.panel_config)
+                panel_config = _load_panel_runtime_config(
+                    args.panel_config,
+                    tunnel_enabled,
+                    memory_guard_enabled,
+                    map_service.mode,
+                )
                 requested_tunnel = panel_config.get("secure_tunnel_enabled")
                 requested_tunnel_enabled = requested_tunnel == 1
                 if (

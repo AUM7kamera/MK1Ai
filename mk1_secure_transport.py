@@ -12,6 +12,7 @@ import platform
 import re
 import socket
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -46,16 +47,35 @@ class TunnelControlServer:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._socket_identity: tuple[int, int] | None = None
+        self._allowed_uid: int | None = None
 
     def start(self) -> None:
         if self._thread is not None:
             return
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise SecureTransportError("Tunnel control requires Linux SO_PEERCRED support")
+        effective_uid = os.geteuid()
+        sudo_uid = os.environ.get("SUDO_UID", "")
+        allowed_uid = (
+            int(sudo_uid)
+            if effective_uid == 0 and sudo_uid.isdigit()
+            else effective_uid
+        )
+        parent_path = os.path.dirname(os.path.abspath(self.path))
+        parent_stat = os.lstat(parent_path)
+        trusted_parent_uids = {effective_uid, allowed_uid}
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid not in trusted_parent_uids
+            or parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise SecureTransportError("Refusing to use an untrusted tunnel control directory")
         try:
             existing = os.lstat(self.path)
         except FileNotFoundError:
             existing = None
         if existing is not None:
-            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.geteuid():
+            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid not in trusted_parent_uids:
                 raise SecureTransportError("Refusing to replace an untrusted tunnel control path")
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             probe.settimeout(0.2)
@@ -92,6 +112,7 @@ class TunnelControlServer:
             self._unlink_owned_socket()
             raise
         self._listener = listener
+        self._allowed_uid = allowed_uid
         self._thread = threading.Thread(
             target=self._serve, name="mk1-tunnel-control", daemon=True,
         )
@@ -113,6 +134,17 @@ class TunnelControlServer:
             with client:
                 try:
                     client.settimeout(1.0)
+                    credentials = client.getsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_PEERCRED,
+                        struct.calcsize("3i"),
+                    )
+                    if len(credentials) != struct.calcsize("3i"):
+                        raise SecureTransportError("Invalid tunnel control peer credentials")
+                    _, peer_uid, _ = struct.unpack("3i", credentials)
+                    if peer_uid != self._allowed_uid:
+                        client.sendall(b"0")
+                        continue
                     command = bytearray()
                     while len(command) < 2:
                         chunk = client.recv(2 - len(command))

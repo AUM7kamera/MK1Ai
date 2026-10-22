@@ -196,7 +196,9 @@ that the implementation currently satisfies them.
 
 The Common Criteria component mapping, dependencies, refinement rationale, and
 final SFR wording are not established. A certifier/evaluation authority must
-review the final ST.
+review the final ST. The preliminary source/test mapping and its gaps are in
+[`REQUIREMENTS_TRACEABILITY.md`](./REQUIREMENTS_TRACEABILITY.md); it is not
+implementation correspondence or evaluation evidence.
 
 The current Python packet pipeline makes model/composite scores advisory;
 they do not independently trigger a block or kill switch. The limited fixed

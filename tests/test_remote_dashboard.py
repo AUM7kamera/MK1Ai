@@ -15,7 +15,9 @@ from mk1_remote_dashboard import (
     DashboardConfig,
     DashboardHandler,
     DashboardState,
+    APP_JS,
     LOGIN_HTML,
+    MAX_RATE_LIMIT_KEYS,
     RATE_LIMIT_REQUESTS,
     RemoteDashboardServer,
 )
@@ -68,7 +70,16 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertIn("相互検証なし", page)
         self.assertIn("ハードウェア信頼なし(追加層のみ)", page)
         self.assertIn("端末完全侵害で端末内の機密性・完全性は保証喪失", page)
+        self.assertIn('id="status-fetch-error" class="alert" role="alert"', page)
+        self.assertIn("表示値は古い可能性があるため", page)
         self.assertIn("ローカル適応学習", page)
+
+    def test_dashboard_status_refresh_warns_on_failure_and_requires_sample_time(self):
+        self.assertIn("if(!response.ok)throw new Error", APP_JS.decode("utf-8"))
+        self.assertIn("!Number.isFinite(value.sampled_at)", APP_JS.decode("utf-8"))
+        self.assertIn("age>10||age< -5", APP_JS.decode("utf-8"))
+        self.assertIn("stale.hidden=true", APP_JS.decode("utf-8"))
+        self.assertIn("catch(error){stale.hidden=false}", APP_JS.decode("utf-8"))
 
     def test_registration_verification_returns_credential_id_fingerprint(self):
         credential_id = b"enrolled-passkey-id"
@@ -119,6 +130,7 @@ class RemoteDashboardTest(unittest.TestCase):
 
     def test_status_exposes_only_allowlisted_fields_and_rejects_out_of_range_values(self):
         self.config.status_path.write_text(
+            "sampled_at=1792660000\n"
             "state=RUNNING\n"
             "packets_per_second=25.50\n"
             "packets_total=42\n"
@@ -138,6 +150,7 @@ class RemoteDashboardTest(unittest.TestCase):
         result = state.status()
 
         self.assertEqual(result["state"], "RUNNING")
+        self.assertEqual(result["sampled_at"], 1792660000)
         self.assertEqual(result["packets_per_second"], 25.5)
         self.assertEqual(result["packets_total"], 42)
         self.assertEqual(result["alert"], "THREAT")
@@ -145,6 +158,26 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertNotIn("secret_token", result)
         self.assertNotIn("do-not-expose", repr(result))
         self.assertLessEqual(result["threat_score"], 1)
+
+    def test_status_without_source_timestamp_does_not_claim_a_sample_time(self):
+        self.config.status_path.write_text("state=RUNNING\n", encoding="ascii")
+
+        result = DashboardState(self.config).status()
+
+        self.assertNotIn("sampled_at", result)
+
+    def test_malformed_status_value_invalidates_snapshot_timestamp(self):
+        self.config.status_path.write_text(
+            "sampled_at=1792660000\n"
+            "state=RUNNING\n"
+            "threat_score=not-a-number\n",
+            encoding="ascii",
+        )
+
+        result = DashboardState(self.config).status()
+
+        self.assertEqual(result["state"], "RUNNING")
+        self.assertNotIn("sampled_at", result)
 
     def test_session_signing_key_and_bootstrap_token_are_private_and_one_time(self):
         state = DashboardState(self.config)
@@ -193,13 +226,17 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertFalse(state.allow_request("192.0.2.1", "/api/auth/options"))
         self.assertTrue(state.allow_request("192.0.2.1", "/api/session"))
 
-    def test_rate_limit_evicts_old_keys_instead_of_rejecting_every_new_client(self):
+    def test_rate_limit_capacity_preserves_existing_buckets_and_rejects_new_keys(self):
         state = DashboardState(self.config)
 
-        for index in range(4097):
+        for index in range(MAX_RATE_LIMIT_KEYS):
             self.assertTrue(state.allow_request(f"192.0.2.{index}", "/api/status"))
 
-        self.assertTrue(state.allow_request("192.0.2.0", "/api/status"))
+        for _ in range(RATE_LIMIT_REQUESTS - 1):
+            self.assertTrue(state.allow_request("192.0.2.0", "/api/status"))
+        self.assertFalse(state.allow_request("192.0.2.0", "/api/status"))
+        self.assertFalse(state.allow_request("198.51.100.1", "/api/status"))
+        self.assertEqual(len(state.rate_limits), MAX_RATE_LIMIT_KEYS)
 
     def test_forwarded_client_ip_is_trusted_only_from_loopback(self):
         loopback_handler = object.__new__(DashboardHandler)
