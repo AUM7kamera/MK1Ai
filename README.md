@@ -72,7 +72,7 @@ COLAB_RSI_ENDPOINT="https://<your-authenticated-endpoint>/rsi" \
   python3 airgap_ai_defender.py --mode RSI --ram-limit 1500 --local-dir ./ai_data
 ```
 
-`ai_data/config.json` があれば、起動時に引数の初期値として自動読み込みします。明示したCLI引数が設定値より優先されます。例:
+`ai_data/config.json` があれば、起動時に引数の初期値として自動読み込みします。明示したCLI引数が設定値より優先されます。このファイルは端末固有の実行時設定としてGit管理外です。認証情報等を含める場合は権限 `0600` を維持し、以前のコミットに秘密情報が含まれていた場合は履歴から削除されたとみなさず、該当資格情報を失効・更新してください。例:
 
 ```json
 {
