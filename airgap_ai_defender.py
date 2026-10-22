@@ -6280,12 +6280,36 @@ class RuntimeConfigError(ValueError):
 
 def _load_runtime_config(config_path: str) -> dict:
     try:
-        with open(config_path, "rb") as handle:
-            serialized_config = handle.read(_MAX_RUNTIME_CONFIG_BYTES + 1)
+        descriptor = os.open(
+            config_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except FileNotFoundError:
         return {}
     except OSError as exc:
         raise RuntimeConfigError(f"設定ファイルを読み込めません ({exc})") from exc
+
+    try:
+        config_stat = os.fstat(descriptor)
+        effective_uid = os.geteuid()
+        trusted_uids = {effective_uid}
+        sudo_uid = os.environ.get("SUDO_UID", "")
+        if effective_uid == 0 and sudo_uid.isdigit():
+            trusted_uids.add(int(sudo_uid))
+        if not stat.S_ISREG(config_stat.st_mode):
+            raise RuntimeConfigError("設定パスは通常ファイルである必要があります")
+        if config_stat.st_uid not in trusted_uids:
+            raise RuntimeConfigError("設定ファイルの所有者が信頼できません")
+        if config_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeConfigError("設定ファイルがグループまたは他ユーザーから書込可能です")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            serialized_config = handle.read(_MAX_RUNTIME_CONFIG_BYTES + 1)
+    except OSError as exc:
+        raise RuntimeConfigError(f"設定ファイルを読み込めません ({exc})") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
     if len(serialized_config) > _MAX_RUNTIME_CONFIG_BYTES:
         raise RuntimeConfigError(

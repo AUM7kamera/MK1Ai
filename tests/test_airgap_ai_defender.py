@@ -54,6 +54,11 @@ requires_aesgcm = unittest.skipUnless(
 )
 
 
+def write_private_config(path: pathlib.Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
+
+
 class AirgapSecurityHelpersTest(unittest.TestCase):
     def test_torch_stub_never_uses_pickle_fallback(self):
         original_import = builtins.__import__
@@ -126,7 +131,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "config.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
+            write_private_config(config_path, json.dumps(config))
             loaded = module._load_runtime_config(str(config_path))
 
         args = module._build_argument_parser(loaded).parse_args([])
@@ -153,7 +158,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 {"interface": "eth0", "unexpected": True},
                 {"ram_limit": 0},
             ):
-                config_path.write_text(json.dumps(config), encoding="utf-8")
+                write_private_config(config_path, json.dumps(config))
                 with self.subTest(config=config), self.assertRaises(module.RuntimeConfigError):
                     module._load_runtime_config(str(config_path))
 
@@ -161,7 +166,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "config.json"
             for invalid_content in ('{"mode":', "[]", "null"):
-                config_path.write_text(invalid_content, encoding="utf-8")
+                write_private_config(config_path, invalid_content)
                 with self.subTest(invalid_content=invalid_content), \
                      self.assertRaises(module.RuntimeConfigError):
                     module._load_runtime_config(str(config_path))
@@ -170,13 +175,31 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "config.json"
             config_path.write_bytes(b" " * (module._MAX_RUNTIME_CONFIG_BYTES + 1))
+            config_path.chmod(0o600)
             with self.assertRaisesRegex(module.RuntimeConfigError, "サイズが上限"):
                 module._load_runtime_config(str(config_path))
+
+    def test_runtime_config_rejects_symlinks_and_group_writable_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = pathlib.Path(temp_dir)
+            target_path = directory / "target.json"
+            write_private_config(target_path, "{}")
+            link_path = directory / "config-link.json"
+            link_path.symlink_to(target_path)
+            with self.assertRaises(module.RuntimeConfigError):
+                module._load_runtime_config(str(link_path))
+
+            target_path.chmod(0o620)
+            try:
+                with self.assertRaisesRegex(module.RuntimeConfigError, "書込可能"):
+                    module._load_runtime_config(str(target_path))
+            finally:
+                target_path.chmod(0o600)
 
     def test_main_refuses_invalid_runtime_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "config.json"
-            config_path.write_text(json.dumps({"unknown_setting": True}), encoding="utf-8")
+            write_private_config(config_path, json.dumps({"unknown_setting": True}))
             error_output = io.StringIO()
             with mock.patch("sys.argv", ["airgap_ai_defender.py", "--config", str(config_path)]), \
                  contextlib.redirect_stderr(error_output), \
@@ -189,9 +212,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
     def test_invalid_live_panel_config_preserves_last_applied_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
-            config_path.write_text(
-                json.dumps({"map_mode": 99}), encoding="utf-8",
-            )
+            write_private_config(config_path, json.dumps({"map_mode": 99}))
             with self.assertLogs("AirgapAI", level="ERROR") as captured:
                 loaded = module._load_panel_runtime_config(
                     str(config_path), True, False, module.MapMode.CHROME,
@@ -272,15 +293,15 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime_path = pathlib.Path(temp_dir) / "config.json"
             panel_path = pathlib.Path(temp_dir) / "panel-config.json"
-            runtime_path.write_text(json.dumps({
+            write_private_config(runtime_path, json.dumps({
                 "interface": "eth0",
                 "drive_id": "folder-id",
                 "colab_endpoint": "https://colab.example.test/rsi",
-            }), encoding="utf-8")
-            panel_path.write_text(json.dumps({
+            }))
+            write_private_config(panel_path, json.dumps({
                 "interface": "wg0",
                 "ram_limit": 900,
-            }), encoding="utf-8")
+            }))
 
             config = module._merge_runtime_config(str(runtime_path), str(panel_path))
 
@@ -293,10 +314,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for mode in (0, 1, 2):
-                config_path.write_text(json.dumps({"map_mode": mode}), encoding="utf-8")
+                write_private_config(config_path, json.dumps({"map_mode": mode}))
                 self.assertEqual(module._load_runtime_config(str(config_path))["map_mode"], mode)
 
-            config_path.write_text(json.dumps({"map_mode": True}), encoding="utf-8")
+            write_private_config(config_path, json.dumps({"map_mode": True}))
             with self.assertRaisesRegex(module.RuntimeConfigError, "map_mode"):
                 module._load_runtime_config(str(config_path))
 
@@ -304,14 +325,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for enabled in (0, 1):
-                config_path.write_text(json.dumps({"usb_guard_enabled": enabled}), encoding="utf-8")
+                write_private_config(config_path, json.dumps({"usb_guard_enabled": enabled}))
                 self.assertEqual(
                     module._load_runtime_config(str(config_path))["usb_guard_enabled"],
                     enabled,
                 )
 
             for invalid in (True, 2, "1"):
-                config_path.write_text(json.dumps({"usb_guard_enabled": invalid}), encoding="utf-8")
+                write_private_config(config_path, json.dumps({"usb_guard_enabled": invalid}))
                 with self.assertRaisesRegex(module.RuntimeConfigError, "usb_guard_enabled"):
                     module._load_runtime_config(str(config_path))
 
@@ -319,18 +340,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for enabled in (0, 1):
-                config_path.write_text(
-                    json.dumps({"secure_tunnel_enabled": enabled}), encoding="utf-8",
-                )
+                write_private_config(config_path, json.dumps({"secure_tunnel_enabled": enabled}))
                 self.assertEqual(
                     module._load_runtime_config(str(config_path))["secure_tunnel_enabled"],
                     enabled,
                 )
 
             for invalid in (True, 2, "1"):
-                config_path.write_text(
-                    json.dumps({"secure_tunnel_enabled": invalid}), encoding="utf-8",
-                )
+                write_private_config(config_path, json.dumps({"secure_tunnel_enabled": invalid}))
                 with self.assertRaisesRegex(module.RuntimeConfigError, "secure_tunnel_enabled"):
                     module._load_runtime_config(str(config_path))
 
@@ -338,18 +355,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "panel-config.json"
             for enabled in (0, 1):
-                config_path.write_text(
-                    json.dumps({"memory_guard_enabled": enabled}), encoding="utf-8",
-                )
+                write_private_config(config_path, json.dumps({"memory_guard_enabled": enabled}))
                 self.assertEqual(
                     module._load_runtime_config(str(config_path))["memory_guard_enabled"],
                     enabled,
                 )
 
             for invalid in (True, 2, "1"):
-                config_path.write_text(
-                    json.dumps({"memory_guard_enabled": invalid}), encoding="utf-8",
-                )
+                write_private_config(config_path, json.dumps({"memory_guard_enabled": invalid}))
                 with self.assertRaisesRegex(module.RuntimeConfigError, "memory_guard_enabled"):
                     module._load_runtime_config(str(config_path))
 
@@ -2308,6 +2321,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump({"management_ports": [22, 443], "management_ips": ["10.0.0.5"],
                            "allow_oni_signal": True}, handle)
+            os.chmod(config_path, 0o600)
             config = module._load_runtime_config(config_path)
         self.assertEqual(config["management_ports"], [22, 443])
         self.assertTrue(config["allow_oni_signal"])
@@ -2326,6 +2340,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             config_path = os.path.join(temp_dir, "config.json")
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump({"management_ips": ["not-an-ip"]}, handle)
+            os.chmod(config_path, 0o600)
 
             with self.assertRaisesRegex(module.RuntimeConfigError, "management_ips"):
                 module._load_runtime_config(config_path)
