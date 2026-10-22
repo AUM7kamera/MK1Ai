@@ -2760,7 +2760,7 @@ def _is_suspicious_executable_path(exe_path: str) -> bool:
     lowercase = exe_path.lower()
     if " (deleted)" in lowercase:
         return True
-    suspicious_dirs = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/var/run/", "/mnt/", "/proc/self/fd/")
+    suspicious_dirs = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/", "/var/run/", "/mnt/", "/proc/self/fd/")  # nosec B108: these are path-matching indicators, not filesystem operations
     if any(lowercase.startswith(prefix) for prefix in suspicious_dirs):
         return True
     trusted_dirs = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/", "/lib/", "/lib64/", "/usr/lib/", "/usr/local/bin/", "/usr/local/sbin/")
@@ -2792,7 +2792,7 @@ def _is_suspicious_process_command(process_identifier: int | str, cmdline: str =
 
     suspicious_tokens = [
         "nc", "ncat", "socat", "curl", "wget", "python -c", "python3 -c", "bash -c", "powershell", "pwsh", "cmd.exe",
-        "ssh ", "perl", "ruby", "start-process", "/tmp/", "/var/tmp/", "/dev/shm/", "curl -", "wget -"
+        "ssh ", "perl", "ruby", "start-process", "/tmp/", "/var/tmp/", "/dev/shm/", "curl -", "wget -"  # nosec B108: suspicious command-line indicators
     ]
     if any(token in lowered for token in suspicious_tokens):
         return True

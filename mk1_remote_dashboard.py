@@ -617,7 +617,7 @@ class DashboardState:
         )
         context = ssl.create_default_context()
         context.minimum_version = ssl.TLSVersion.TLSv1_3
-        with urllib.request.urlopen(request, timeout=10, context=context) as response:
+        with urllib.request.urlopen(request, timeout=10, context=context) as response:  # nosec B310: fixed HTTPS Twilio endpoint; account ID is URL-encoded
             if response.status not in (200, 201, 202):
                 raise RuntimeError(f"SMSプロバイダーがHTTP {response.status}を返しました")
             response.read(4096)

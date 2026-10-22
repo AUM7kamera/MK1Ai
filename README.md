@@ -27,7 +27,7 @@ python3 -m venv .venv-mk1
 For Colab RSI/PQC transport, install the pinned ML-KEM implementation before starting:
 
 ```bash
-.venv-mk1/bin/python -m pip install -r requirements-secure-transport.txt
+.venv-mk1/bin/python -m pip install --require-hashes -r requirements-secure-transport.lock
 ```
 
 通常版は起動時に `torch`、`psutil`、`cryptography` の有無を確認し、不足していれば現在の Python (`sys.executable`) から pip で導入を試みます。PyTorch はCPU版wheel indexを追加して取得します。インストールにはネットワーク接続と書き込み可能なPython環境が必要です。仮想環境を使うと、システムPythonを汚さずに導入できます。
@@ -108,7 +108,7 @@ bash ./mk1-panel.sh
 - `[4]` でNIC、RAM監視基準、通常/RSIモード、Colab HTTPS URLを編集できます。`[5]` はNIC一覧、`[6]` はGoogle Driveへ接続しないローカル検証です。監視中は処理パケット/秒、累計、脅威・バックドアリスク、隔離状態、RAM・swapを表示します。設定は `ai_data/panel-config.json` に権限 `0600` で保存し、ログは `ai_data/panel.log` に追記します。
 - `[m]` は地図モードを `OFF` → `Chrome` → `Local` の順に切り替えます。監視中は設定ファイルの変更を監視ループが反映し、OFFでは地図ワーカーを起動しません。Chromeモードは `127.0.0.1:9001/map` のWebSocketで、明示的にピン留めされたChrome拡張Originからの読み取り専用接続だけを受け付けます。`MK1_MAP_EXTENSION_ORIGIN=chrome-extension://<拡張ID>` (カンマ区切りで複数可) を設定してください。未設定の場合は警告を出して、すべての拡張からの接続を拒否します。Localモードは外部通信をせず、イベントを `ai_data/map-events.jsonl` に保存します (Raylib描画はこのMVPには含みません)。
 - 地図イベントは脅威判定後に上限付きの非同期キューへ投入し、配信・保存は遮断処理と別スレッドで行います。イベントにはグローバルIPのみを含め、GeoIPデータセットがない位置、RSSIがない距離、パケットから確実に判別できないOSは `null` / `unknown` のままです。日本の市区町村や海外の行政区画、実座標を推定する機能ではありません。
-- `[7]` は閲覧専用ダッシュボードを起動し、`[8]` は停止します。依存を `.venv-mk1/bin/python -m pip install -r requirements-remote.txt` で導入します。アプリはloopbackにだけHTTP bindし、外部接続はNginxがWireGuard IP上でTLSを終端します。スマートフォンを含むクライアントもWireGuardへ接続しなければ到達できません。
+- `[7]` は閲覧専用ダッシュボードを起動し、`[8]` は停止します。依存を `.venv-mk1/bin/python -m pip install --require-hashes -r requirements-remote.lock` で導入します。アプリはloopbackにだけHTTP bindし、外部接続はNginxがWireGuard IP上でTLSを終端します。スマートフォンを含むクライアントもWireGuardへ接続しなければ到達できません。
 - `[u]` はUSB隔離設定をローカルで切り替えます。実遮断監視は現在無効のため、この設定はUSBデバイスを遮断しません。リモート画面から設定を変更するAPIはありません。
 - `[e]` は `MK1_WIREGUARD_INTERFACE` (未設定時 `wg0`) のリンクを `/usr/local/sbin/mk1-wg-link` 専用ラッパー経由で切り替え、PQC/AES-GCM送信ゲートへ設定を通知します。切断はWireGuardリンク上の全通信に影響し、起動は既存インターフェースをupにするだけで `wg-quick` の構成読込は行いません。監視中は0600のUnix domain socketでPython暗号バックエンドへ同期要求し、無効化時にはCの `mk1_secure_key_wipe()` とPython側の鍵破棄を行ってからリンクdownを試みます。RSI送信を再許可する前にアプリがWireGuard peerとIPv4/IPv6デフォルト経路を再検証します。Cの `mk1_tunnel.c` はOpenSSL EVPでAES-256-GCM/HKDF-SHA-256を実装します。liboqs開発パッケージがあれば `mk1_tunnel_oqs.c` が実ML-KEM-768 providerを接続し、なければPQC C providerを利用できません。パネルの実通信は既存の `pqcrypto`/`cryptography` Pythonバックエンドが担い、ダミーPQC実装や平文fallbackはありません。ML-KEM単体は相手認証を提供しないため、公開鍵の真正性と信頼済み配布経路が前提です。CトンネルのHKDF salt/infoはPython RSI実装と異なり、両プロトコルは互換ではありません。鍵wipeはアプリ所有バッファへの措置で、暗号ライブラリ内部・不変オブジェクト・allocator内の全コピーやカーネル内WireGuard秘密鍵まで消去する保証ではありません。リンク状態と暗号化送信ゲートは別々に fail-closed となり、物理NICやOS全体のegress kill-switchを保証しません。
 - 実遮断を有効化する運用手順はありません。root権限で起動した場合のブート時ハードニングはDry-Runとは別の機能であり、システム設定を変更する可能性があります。
@@ -421,13 +421,12 @@ sudo --preserve-env=COLAB_RSI_ENDPOINT,COLAB_RSI_TOKEN,COLAB_RSI_PQ_PUBLIC_KEY_S
 
 ## テスト
 
-テストではPyTorch、NumPy、gdown、requests、psutil、cryptographyを使用します。実PyTorchがない場合はモデル・学習依存のテストをskipし、アプリ本体のstubを実PyTorchの代わりとしてテストしません。secure transportのテストはcryptographyとpqcryptoの両方がある場合だけ実行します。依存不足によるskipは成功を意味しないため、完全なテストには次のように依存を導入してください。
+CIと同じ固定依存でテストするには、次のハッシュ付きロックを使います。PyTorch等の任意モデル依存を導入しない場合、それらを必要とする個別テストはskipされます。skipはその機能の検証成功を意味しません。
 
 ```bash
 python3 -m venv .venv-mk1
-.venv-mk1/bin/python -m pip install torch numpy psutil requests gdown
-.venv-mk1/bin/python -m pip install -r requirements-secure-transport.txt
-.venv-mk1/bin/python -m unittest discover -s tests -v
+.venv-mk1/bin/python -m pip install --require-hashes -r requirements-ci.lock
+.venv-mk1/bin/python -m pytest -q
 ```
 
 すでに仮想環境と依存を準備済みの場合は、最後のテストコマンドだけを実行します。テストの成功は、特定の補助関数の動作確認です。本番ネットワークでの検知精度、安全性、処理性能を保証するものではありません。

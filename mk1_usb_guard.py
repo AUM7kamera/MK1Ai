@@ -389,7 +389,7 @@ def scan_usb_storage_in_guest(
     scan_nonce = secrets.token_hex(16)
     with tempfile.TemporaryDirectory(
         prefix=f"mk1-scan-{scan_nonce}-",
-        dir="/tmp",
+        dir="/tmp",  # nosec B108: fixed private-temp parent; TemporaryDirectory creates a random mode-0700 child
     ) as channel_directory:
         channel_path = Path(channel_directory) / "guest-console.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
