@@ -88,7 +88,7 @@ COLAB_RSI_ENDPOINT="https://<your-authenticated-endpoint>/rsi" \
 
 `management_ports`（整数のリスト）と `management_ips`（文字列のリスト）を `config.json` に記載すると、キルスイッチ発動時に `build_containment_plan` へ自動で渡されます。何も記載がない場合は従来どおり `full_isolation`（全NIC隔離）で、管理経路は保護されません。`management_ports` / `management_ips` を書いた場合は、実行時に `containment_mode` を `management_safe_harbor` に自動的に切り替えます（警告ログを出力）。また、SIGUSR1 による鬼モード(ONI_MODE)の切替は既定で無効です。`--allow-oni-signal` または `"allow_oni_signal": true` を指定した場合のみ有効になります。
 
-`./run.sh` は既定でRSIモードを使い、USB遮断は無効のまま起動します。Colab URLを尋ね、前回値がある場合はプロンプトに表示します。空のままEnterを押すと前回値を保持し、新しいURLを入力すると更新します。`ram_limit`、`mode`、`compact_log` は未設定の場合だけ既定値を保存し、既存の設定値は上書きしません。壊れた `config.json` は上書きせずエラー終了し、`ai_data` は権限 `0700` にします。URL入力時にCtrl+CまたはCtrl+Dを押すと、設定を変更せず終了します。`--compact-log` は通常のINFO/WARNINGを抑え、RAM・swap・脅威スコア・Colab状態を1行で更新します。エラーと高スコアの警告は通常ログとして表示します。
+`./run.sh` は既定でRSIモードを使い、USB遮断は無効のまま起動します。Colab URLを尋ね、前回値がある場合はプロンプトに表示します。空のままEnterを押すと前回値を保持し、新しいURLを入力すると更新します。`ram_limit`、`mode`、`compact_log` は未設定の場合だけ既定値を保存し、既存の設定値は上書きしません。壊れた `config.json` は上書きせずエラー終了し、`ai_data` は権限 `0700`、設定ファイルは `0600` で保存します。URL入力時にCtrl+CまたはCtrl+Dを押すと、設定を変更せず終了します。`--compact-log` は通常のINFO/WARNINGを抑え、RAM・swap・脅威スコア・Colab状態を1行で更新します。エラーと高スコアの警告は通常ログとして表示します。
 
 ### C言語操作パネル
 
