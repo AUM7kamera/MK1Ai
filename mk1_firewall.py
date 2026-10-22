@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
- codespace-probable-dollop-pj64p66j94jv29wg6
 import os
 from pathlib import Path
 
@@ -11,13 +10,11 @@ import logging
 import os
 from pathlib import Path
 import re
- main
 import shutil
 import stat
 import subprocess
 
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
 MIN_NFT_VERSION = (0, 9, 0)
 NFT_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/"}
@@ -62,7 +59,6 @@ def check_nft_support(path: str) -> str | None:
     return None
 
 
- main
 def is_valid_ip_address(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -109,7 +105,7 @@ def apply_nft_policy(
     nft_binary: str | None = None,
 ) -> bool:
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        return False
+        return _fail("nftables の適用にはroot権限が必要です")
     script = render_nft_transaction(
         mode=mode,
         management_ips=management_ips,
@@ -117,12 +113,6 @@ def apply_nft_policy(
     )
     try:
         path = _trusted_nft_binary(nft_binary)
- codespace-probable-dollop-pj64p66j94jv29wg6
-    except OSError:
-        return False
-    if path is None:
-        return False
-
     except OSError as exc:
         return _fail(f"nft バイナリを信頼できません: {exc}")
     if path is None:
@@ -130,7 +120,6 @@ def apply_nft_policy(
     unsupported = check_nft_support(path)
     if unsupported is not None:
         return _fail(unsupported)
- main
     try:
         result = subprocess.run(
             [path, "-f", "-"],
@@ -141,11 +130,6 @@ def apply_nft_policy(
             timeout=10,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/"},
         )
- codespace-probable-dollop-pj64p66j94jv29wg6
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
-
     except (OSError, subprocess.SubprocessError) as exc:
         return _fail(f"nft の実行に失敗しました: {exc}")
     if result.returncode != 0:
@@ -174,7 +158,6 @@ def remove_nft_policy(nft_binary: str | None = None) -> bool:
     except (OSError, subprocess.SubprocessError) as exc:
         return _fail(f"nft の実行に失敗しました: {exc}")
     return result.returncode == 0 or _fail("nft 解除バッチが失敗しました")
- main
 
 
 def _trusted_nft_binary(binary: str | None) -> str | None:
@@ -208,14 +191,9 @@ def render_nft_transaction(
         mode, management_ips, management_ports,
     )
     lines = [
- codespace-probable-dollop-pj64p66j94jv29wg6
-        "destroy table inet mk1ai_quarantine",
-
-        # "add" first makes "delete" succeed on tables that do not exist yet;
-        # "destroy" is avoided because older nft releases reject it.
+        # Add first so delete succeeds even when the table is not present.
         "add table inet mk1ai_quarantine",
         "delete table inet mk1ai_quarantine",
- main
         "add table inet mk1ai_quarantine",
         (
             "add chain inet mk1ai_quarantine input "
