@@ -30,11 +30,17 @@ For Colab RSI/PQC transport, install the pinned ML-KEM implementation before sta
 .venv-mk1/bin/python -m pip install --require-hashes -r requirements-secure-transport.lock
 ```
 
-通常版は起動時に `torch`、`psutil`、`cryptography` の有無を確認し、不足していれば現在の Python (`sys.executable`) から pip で導入を試みます。PyTorch はCPU版wheel indexを追加して取得します。インストールにはネットワーク接続と書き込み可能なPython環境が必要です。仮想環境を使うと、システムPythonを汚さずに導入できます。
+起動時に `torch`、`psutil`、`cryptography` の有無を確認します。不足パッケージを実行時に取得・導入することはありません。`cryptography` と secure transport の依存は `requirements-secure-transport.lock`、ダッシュボードの依存は `requirements-remote.lock`、CPU版のAI/プロセス監視依存は `requirements-model.lock` を使い、ハッシュ検証付きで事前に導入してください。
+
+CPU版のAI/プロセス監視機能を使用する場合は、同じ仮想環境へ事前に導入します。
+
+```bash
+.venv-mk1/bin/python -m pip install --require-hashes -r requirements-model.lock
+```
 
 PyTorchが `Failed to initialize NumPy: No module named 'numpy'` を警告する場合、NumPyがそのPython環境にありません。この警告は通常の推論には致命的ではありません。PyTorchとNumPyの相互変換が必要な場合、または警告を解消する場合は、実行に使う同じ環境へNumPyをインストールしてください。
 
-オフライン環境やインストール失敗時は警告を出し、PyTorch/psutilのstubへ移行します。AI推論やパケット監視など一部機能は利用できません。`cryptography` が使えない場合はMemoryManager自体は起動しますが、平文を保存しないためディスクへのデータ退避は無効になります。必要な機能を利用するには、ネットワークが使える環境で一度起動するか、あらかじめ仮想環境へ依存をインストールしてください。
+`torch`/`psutil` が使えない場合は警告を出し、stubまたは安全な代替処理で続行します。AI推論など一部機能は利用できません。`cryptography` が使えない場合はMemoryManager自体は起動しますが、平文を保存しないためディスクへのデータ退避は無効になります。
 
 ### 2. ネットワークインターフェースを確認する
 

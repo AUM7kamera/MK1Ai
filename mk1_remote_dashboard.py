@@ -526,6 +526,7 @@ class DashboardState:
 
     def status(self) -> dict[str, Any]:
         allowed = {
+            "sampled_at": int,
             "state": str,
             "packets_per_second": float,
             "packets_total": int,
@@ -566,8 +567,8 @@ class DashboardState:
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as exc:
+            result.pop("sampled_at", None)
             LOGGER.error("監視状態ファイルを解析できません: %s", type(exc).__name__)
-        result["sampled_at"] = int(time.time())
         return result
 
     def send_email_code(self, code: str) -> None:
@@ -1119,6 +1120,8 @@ LOGIN_HTML = """<!doctype html>
 <div id="alert-banner" class="alert" hidden></div>
 <div class="alert assurance-warning"><strong>実効保証: 未主張 / S0</strong> · 相互検証なし ·
 ハードウェア信頼なし(追加層のみ) · 端末完全侵害で端末内の機密性・完全性は保証喪失</div>
+<div id="status-fetch-error" class="alert" role="alert" aria-live="assertive" hidden>
+最新の状態を取得できていません。表示値は古い可能性があるため、現時点の状態判断に使わないでください。</div>
 <div class="grid">
 <article class="metric"><span>監視状態</span><strong id="state">—</strong></article>
 <article class="metric"><span>処理パケット / 秒</span><strong id="pps">—</strong></article>
@@ -1145,7 +1148,7 @@ function encode64(value){return btoa(String.fromCharCode(...new Uint8Array(value
 function prepareOptions(options){for(const key of ['challenge'])if(options[key])options[key]=decode64(options[key]);if(options.user&&options.user.id)options.user.id=decode64(options.user.id);for(const key of ['allowCredentials','excludeCredentials'])if(options[key])options[key]=options[key].map(item=>({...item,id:decode64(item.id)}));return options}
 function serializeCredential(credential){const result={id:credential.id,rawId:encode64(credential.rawId),type:credential.type,response:{}};for(const key of ['clientDataJSON','authenticatorData','signature','userHandle','attestationObject'])if(credential.response[key])result.response[key]=encode64(credential.response[key]);if(credential.response.getTransports)result.response.transports=credential.response.getTransports();result.clientExtensionResults=credential.getClientExtensionResults();if(credential.authenticatorAttachment)result.authenticatorAttachment=credential.authenticatorAttachment;return result}
 async function refreshSession(){const response=await fetch('/api/session',{credentials:'same-origin'});const session=await response.json();csrf=session.csrf;if(session.authenticated){byId('login').hidden=true;byId('dashboard').hidden=false;refreshStatus();setInterval(refreshStatus,3000)}}
-async function refreshStatus(){try{const response=await fetch('/api/status',{credentials:'same-origin'});if(response.status===401){location.reload();return}const value=await response.json();for(const [id,key] of [['state','state'],['pps','packets_per_second'],['packets','packets_total'],['threat','threat_score'],['backdoor','backdoor_score'],['mode','mode'],['model','model_sync_status'],['rsi','rsi_connection_status'],['training','training_queue_batches'],['adaptation','local_adaptation_enabled'],['interface','interface']])byId(id).textContent=value[key]??'—';byId('ram').textContent=value.ram_used_mb!==undefined?`${value.ram_used_mb} MB / ${value.ram_limit_mb} MB`:'—';byId('swap').textContent=value.swap_used_mb!==undefined?`${value.swap_used_mb} MB`:'—';const alert=byId('alert-banner');alert.hidden=!value.alert||value.alert==='NONE';alert.textContent=alert.hidden?'':`警告: ${value.alert} · 隔離状態: ${value.isolation_active?'発動':'未発動'} · Dry-Run: ${value.dry_run?'有効':'無効'}`;byId('sampled').textContent=new Date(value.sampled_at*1000).toLocaleString()}catch(error){byId('login-message').textContent='状態を取得できません。'} }
+async function refreshStatus(){const stale=byId('status-fetch-error');try{const response=await fetch('/api/status',{credentials:'same-origin'});if(response.status===401){location.reload();return}if(!response.ok)throw new Error('status request failed');const value=await response.json();const age=Date.now()/1000-value?.sampled_at;if(!value||typeof value!=='object'||Array.isArray(value)||!Number.isFinite(value.sampled_at)||age>10||age< -5)throw new Error('invalid or stale status response');for(const [id,key] of [['state','state'],['pps','packets_per_second'],['packets','packets_total'],['threat','threat_score'],['backdoor','backdoor_score'],['mode','mode'],['model','model_sync_status'],['rsi','rsi_connection_status'],['training','training_queue_batches'],['adaptation','local_adaptation_enabled'],['interface','interface']])byId(id).textContent=value[key]??'—';byId('ram').textContent=value.ram_used_mb!==undefined?`${value.ram_used_mb} MB / ${value.ram_limit_mb} MB`:'—';byId('swap').textContent=value.swap_used_mb!==undefined?`${value.swap_used_mb} MB`:'—';const alert=byId('alert-banner');alert.hidden=!value.alert||value.alert==='NONE';alert.textContent=alert.hidden?'':`警告: ${value.alert} · 隔離状態: ${value.isolation_active?'発動':'未発動'} · Dry-Run: ${value.dry_run?'有効':'無効'}`;byId('sampled').textContent=new Date(value.sampled_at*1000).toLocaleString();stale.hidden=true}catch(error){stale.hidden=false}}
 async function startAuthentication(){byId('login-message').textContent='';try{const result=await api('/api/auth/options',{});csrf=result.csrf;const credential=await navigator.credentials.get({publicKey:prepareOptions(result.options)});const verified=await api('/api/auth/verify',{csrf,credential:serializeCredential(credential)});csrf=verified.csrf||csrf;byId('otp').hidden=false;byId('authenticate').hidden=true;byId('login-message').textContent=verified.message}catch(error){byId('login-message').textContent=error.message}}
 async function registerPasskey(){byId('login-message').textContent='';try{const result=await api('/api/register/options',{bootstrap_token:byId('bootstrap-token').value});csrf=result.csrf;const credential=await navigator.credentials.create({publicKey:prepareOptions(result.options)});const verified=await api('/api/register/verify',{csrf,credential:serializeCredential(credential)});csrf=verified.csrf;byId('otp').hidden=false;byId('register').hidden=true;byId('login-message').textContent=verified.message}catch(error){byId('login-message').textContent=error.message}}
 byId('authenticate').addEventListener('click',startAuthentication);byId('register').addEventListener('click',registerPasskey);

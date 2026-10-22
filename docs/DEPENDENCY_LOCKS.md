@@ -11,6 +11,7 @@ Operator installs and CI must use the lock files with `pip install
 | `requirements-remote.lock` | Remote dashboard |
 | `requirements-secure-transport.lock` | Secure transport |
 | `requirements-runtime.lock` | Combined runtime feature set |
+| `requirements-model.lock` | CPU-only PyTorch, NumPy, and process-monitoring features |
 | `requirements-ci.lock` | Python CI tests and Bandit |
 | `requirements-release-build.lock` | Python release bundle builder |
 
@@ -29,6 +30,8 @@ python3.12 -m venv .venv-lock
   --output-file=requirements-secure-transport.lock requirements-secure-transport.txt
 .venv-lock/bin/pip-compile --generate-hashes --resolver=backtracking \
   --output-file=requirements-runtime.lock requirements-runtime.in
+.venv-lock/bin/pip-compile --allow-unsafe --generate-hashes --resolver=backtracking \
+  --output-file=requirements-model.lock requirements-model.in
 .venv-lock/bin/pip-compile --generate-hashes --resolver=backtracking \
   --output-file=requirements-ci.lock requirements-ci.in
 .venv-lock/bin/pip-compile --allow-unsafe --generate-hashes --resolver=backtracking \
@@ -37,8 +40,8 @@ python3.12 -m venv .venv-lock
 
 The hashes bind installation to artifacts advertised by the configured Python
 package index; they do not independently establish publisher identity, source
-review, build provenance, or package safety. The CI, feature, and release-build
-locks do not include optional PyTorch/model-test dependencies, dynamically
-installed application extras, native OS packages, or liboqs. Those remain
-separate supply-chain work; a test skipped for an unavailable optional
-dependency is not a pass for that capability.
+review, build provenance, or package safety. The model lock uses the official PyTorch CPU wheel index and includes artifact
+hashes for that index and PyPI dependencies. The CI, feature, model, and
+release-build locks do not include native OS packages or liboqs. The application
+does not install dependencies at runtime. A test skipped for an unavailable
+optional dependency is not a pass for that capability.

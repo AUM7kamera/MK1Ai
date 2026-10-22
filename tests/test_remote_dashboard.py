@@ -15,6 +15,7 @@ from mk1_remote_dashboard import (
     DashboardConfig,
     DashboardHandler,
     DashboardState,
+    APP_JS,
     LOGIN_HTML,
     MAX_RATE_LIMIT_KEYS,
     RATE_LIMIT_REQUESTS,
@@ -69,7 +70,16 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertIn("相互検証なし", page)
         self.assertIn("ハードウェア信頼なし(追加層のみ)", page)
         self.assertIn("端末完全侵害で端末内の機密性・完全性は保証喪失", page)
+        self.assertIn('id="status-fetch-error" class="alert" role="alert"', page)
+        self.assertIn("表示値は古い可能性があるため", page)
         self.assertIn("ローカル適応学習", page)
+
+    def test_dashboard_status_refresh_warns_on_failure_and_requires_sample_time(self):
+        self.assertIn("if(!response.ok)throw new Error", APP_JS.decode("utf-8"))
+        self.assertIn("!Number.isFinite(value.sampled_at)", APP_JS.decode("utf-8"))
+        self.assertIn("age>10||age< -5", APP_JS.decode("utf-8"))
+        self.assertIn("stale.hidden=true", APP_JS.decode("utf-8"))
+        self.assertIn("catch(error){stale.hidden=false}", APP_JS.decode("utf-8"))
 
     def test_registration_verification_returns_credential_id_fingerprint(self):
         credential_id = b"enrolled-passkey-id"
@@ -120,6 +130,7 @@ class RemoteDashboardTest(unittest.TestCase):
 
     def test_status_exposes_only_allowlisted_fields_and_rejects_out_of_range_values(self):
         self.config.status_path.write_text(
+            "sampled_at=1792660000\n"
             "state=RUNNING\n"
             "packets_per_second=25.50\n"
             "packets_total=42\n"
@@ -139,6 +150,7 @@ class RemoteDashboardTest(unittest.TestCase):
         result = state.status()
 
         self.assertEqual(result["state"], "RUNNING")
+        self.assertEqual(result["sampled_at"], 1792660000)
         self.assertEqual(result["packets_per_second"], 25.5)
         self.assertEqual(result["packets_total"], 42)
         self.assertEqual(result["alert"], "THREAT")
@@ -146,6 +158,26 @@ class RemoteDashboardTest(unittest.TestCase):
         self.assertNotIn("secret_token", result)
         self.assertNotIn("do-not-expose", repr(result))
         self.assertLessEqual(result["threat_score"], 1)
+
+    def test_status_without_source_timestamp_does_not_claim_a_sample_time(self):
+        self.config.status_path.write_text("state=RUNNING\n", encoding="ascii")
+
+        result = DashboardState(self.config).status()
+
+        self.assertNotIn("sampled_at", result)
+
+    def test_malformed_status_value_invalidates_snapshot_timestamp(self):
+        self.config.status_path.write_text(
+            "sampled_at=1792660000\n"
+            "state=RUNNING\n"
+            "threat_score=not-a-number\n",
+            encoding="ascii",
+        )
+
+        result = DashboardState(self.config).status()
+
+        self.assertEqual(result["state"], "RUNNING")
+        self.assertNotIn("sampled_at", result)
 
     def test_session_signing_key_and_bootstrap_token_are_private_and_one_time(self):
         state = DashboardState(self.config)

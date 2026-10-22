@@ -55,51 +55,18 @@ _CODE_EXECUTION_CONTEXT = (
 _UNSAFE_SHELL_CHARS_RE = re.compile(r"[;&|`$<>\\\n\r\t\f\v]")
 
 def ensure_dependencies() -> dict[str, bool]:
-    """不足ライブラリの導入を試みる。失敗時は呼び出し元のstubへフォールバックする。"""
-    packages = {
-        "torch": "torch",
-        "psutil": "psutil",
-        "cryptography": "cryptography",
-    }
-    availability = {}
-    for module_name, package_name in packages.items():
+    """Report optional dependency availability without installing packages at runtime."""
+    availability: dict[str, bool] = {}
+    for module_name in ("torch", "psutil", "cryptography"):
         try:
             availability[module_name] = importlib.util.find_spec(module_name) is not None
         except (ImportError, ValueError):
             availability[module_name] = False
 
-        if availability[module_name]:
-            continue
-
-        command = [
-            sys.executable, "-m", "pip", "install",
-            "--disable-pip-version-check", "--retries", "3", "--timeout", "300",
-        ]
-        if module_name == "torch":
-            command.extend([
-                "--extra-index-url", "https://download.pytorch.org/whl/cpu",
-            ])
-        command.append(package_name)
-        try:
-            print(f"[DEPENDENCIES] {package_name} をインストールします。", file=sys.stderr)
-            result = subprocess.run(
-                command,
-                check=False,
-                timeout=1800,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            availability[module_name] = result.returncode == 0
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(
-                f"[DEPENDENCIES] {package_name} を導入できません。stub/安全な代替処理で続行します ({exc})",
-                file=sys.stderr,
-            )
-            availability[module_name] = False
-
         if not availability[module_name]:
             print(
-                f"[DEPENDENCIES] {package_name} が利用できません。機能を制限して続行します。",
+                f"[DEPENDENCIES] {module_name} がありません。起動時のパッケージ導入は行わず、"
+                "該当機能を制限して続行します。",
                 file=sys.stderr,
             )
     return availability
@@ -6545,6 +6512,7 @@ def _write_panel_status(
     else:
         alert = "NONE"
     status = (
+        f"sampled_at={int(time.time())}\n"
         f"state={state}\n"
         f"packets_per_second={max(0.0, packets_per_second):.2f}\n"
         f"packets_total={max(0, packets_total)}\n"

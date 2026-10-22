@@ -438,6 +438,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             remaining_temporary_files = list(pathlib.Path(temp_dir).glob(".panel-status.*.tmp"))
 
         self.assertIn("state=STOPPED\n", content)
+        self.assertRegex(content, r"(?m)^sampled_at=[0-9]+$")
         self.assertIn("packets_per_second=12.50\n", content)
         self.assertIn("packets_total=42\n", content)
         self.assertIn("isolation_active=1\n", content)
@@ -825,17 +826,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(run.call_count, 0)
 
-    def test_ensure_dependencies_uses_cpu_torch_and_continues_when_install_fails(self):
+    def test_ensure_dependencies_reports_missing_without_runtime_install(self):
+        stderr = io.StringIO()
         with mock.patch.object(module.importlib.util, "find_spec", return_value=None), \
-             mock.patch.object(module.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
-            available = module.ensure_dependencies()
+             mock.patch.object(module.subprocess, "run") as run, \
+             contextlib.redirect_stderr(stderr):
+            availability = module.ensure_dependencies()
 
-        self.assertEqual(available, {"torch": False, "psutil": False, "cryptography": False})
-        torch_command = run.call_args_list[0].args[0]
-        self.assertIn("--extra-index-url", torch_command)
-        self.assertIn("https://download.pytorch.org/whl/cpu", torch_command)
-        self.assertIn("300", torch_command)
-        self.assertEqual(run.call_args.kwargs["timeout"], 1800)
+        self.assertEqual(
+            availability,
+            {"torch": False, "psutil": False, "cryptography": False},
+        )
+        run.assert_not_called()
+        self.assertEqual(stderr.getvalue().count("起動時のパッケージ導入は行わず"), 3)
 
     def test_load_raw_data_from_files_yields_bounded_json_and_jsonl_batches(self):
         records = [
