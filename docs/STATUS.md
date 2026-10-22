@@ -3,6 +3,13 @@
 This file records implementation state only. Nothing here is a certification,
 conformance claim, or statement that a goal is "achieved".
 
+## Safety analysis and profile safety states (2026-10-22)
+
+| Item | State | Evidence / remaining work |
+|---|---|---|
+| S1: hazard scenarios | 実装あり未検証 | Initial hazard analysis is recorded in `docs/SAFETY_ANALYSIS.md`. It is a repository-based design artifact only; deployment hazards, likelihood, impact, and control effectiveness require asset-specific review and tests. |
+| S2: profile safety states | 実装あり未検証 | Proposed IT/data-center, factory/OT, and government/high-control states are in `docs/SAFETY_STATES.md`. They are not operationally enforced or finally approved; review checklist and representative recovery/non-interference tests remain open. |
+
 ## A. nftables compatibility
 - `destroy table` removed from `mk1_firewall.py` / `mk1_quarantine.py`.
   Apply = `add table` → `delete table` → `add table` … in one `nft -f -` batch;
@@ -18,6 +25,12 @@ conformance claim, or statement that a goal is "achieved".
 - Local sandbox (nft 1.0.9): unit tests pass; the existing traffic-policy
   netns test fails in this sandbox before and after this change (環境依存、原因未調査).
 
-## Not started (pending approval / decisions)
-B, C (awaiting confirmation), D, E, F, G. Undecided: item 10 loopback/local TCP
-mode, item 17 fail-visible vs fail-closed when ML-DSA is unavailable.
+## Historical status note
+
+The preceding nftables and pending-work notes were recorded before 2026-10-22
+and have not been revalidated as part of the S1/S2 document change. The prior
+ML-DSA availability question is superseded by the confirmed decision: refuse
+sensitive operations when ML-DSA-87 is unavailable, maintain quarantine, and
+allow observation-only operation. Ed25519-only fallback requires explicit
+two-person opt-in and must remain visibly identified. Other historical test
+and CI statements must not be treated as current results until refreshed.

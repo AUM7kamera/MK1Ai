@@ -1,9 +1,20 @@
 # Assurance gaps and verification status
 
-**Status date:** 2026-10-10
+**Status date:** 2026-10-22
 **Assurance statement:** No Common Criteria certification, EAL7 conformance,
 evaluation, or achievement is claimed. This inventory is not a substitute for
 an independent evaluation.
+
+## Safety analysis and profile safety states (2026-10-22)
+
+Initial hazard scenarios and proposed IT/data-center, factory/OT, and
+government/high-control safety states are documented in
+`docs/SAFETY_ANALYSIS.md` and `docs/SAFETY_STATES.md`. They have not been
+validated against deployed assets or approved by the responsible site
+authorities. OT non-interference, out-of-band recovery, lockout resistance,
+update fault tolerance, privacy controls, and profile-specific action
+authorization remain unverified. Do not enable disruptive operations on the
+basis of these documents alone.
 
 ## Current change record
 
