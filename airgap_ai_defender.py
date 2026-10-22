@@ -25,7 +25,7 @@ from mk1_firewall import (
     validate_nft_policy,
 )
 import mk1_memory_guard
-from mk1_usb_guard import USBHotplugMonitor, disable_network_interfaces
+from mk1_usb_guard import USBHotplugMonitor
 
 try:
     import mk1_secure_transport
@@ -2642,18 +2642,13 @@ def _usb_scan_threat_response(
     if verdict != "threat":
         return
     log.critical(
-        "[USB] MicroVMが脅威を検出: %s (%s:%s)。iproute2によるNIC遮断を試みます。",
+        "[USB] MicroVMが脅威判定を返しました: %s (%s:%s)。",
         device.device_id, device.vendor_id, device.product_id,
     )
-    if (
-        tunnel_control_path
-        and mk1_secure_transport is not None
-        and not mk1_secure_transport.request_transport_state(tunnel_control_path, False)
-    ):
-        log.critical("[USB] 暗号化トンネル鍵消去IPCを確認できません。")
-    current_interfaces = discover_available_interfaces() or interfaces
-    if not disable_network_interfaces(current_interfaces):
-        log.critical("[USB] iproute2で全NICを遮断できませんでした。USBデバイスは論理切断済みです。")
+    log.error(
+        "[USB] イベントごとの管理者承認機能が未実装のため、"
+        "トンネル変更・NIC遮断は実行しません。"
+    )
 
 
 def _usb_guard_process_main(
@@ -3721,74 +3716,23 @@ def _probe_network_connectivity() -> bool | None:
 
 
 def execute_generated_payload(payload: dict, dry_run: bool = False, available_interfaces=None, interface: str | None = None) -> bool:
-    """生成済みペイロードを動的に実行し、必要ならフォールバック戦略へ切り替える。"""
+    """Preview a generated policy; active execution waits for per-event approval."""
+    if not dry_run:
+        log.error(
+            "[DYNAMIC_EXECUTION] イベントごとの管理者承認機能が未実装のため、"
+            "実遮断ペイロードを拒否しました。"
+        )
+        return False
     if not payload:
         return False
 
     commands = payload.get("commands", [])
-    fallback_payloads = payload.get("fallback_payloads", [])
-    profile = payload.get("profile", {})
     nft_policy = payload.get("nft_policy")
-
-    log.info("[DYNAMIC_EXECUTION] 遮断処理を実行します。")
-    if dry_run:
-        if nft_policy:
-            log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
-        for cmd in commands:
-            log.critical(f"    - 予定: {' '.join(cmd)}")
-        return True
-
-    success_count = 0
-    if nft_policy is not None:
-        if not _apply_nft_policy_with_sudo(
-            nft_policy.get("mode"),
-            nft_policy.get("management_ips", []),
-            nft_policy.get("management_ports", []),
-        ):
-            _attempt_pure_python_network_barrier(interface, available_interfaces)
-            return False
-        success_count += 1
+    log.info("[DYNAMIC_EXECUTION] Dry-Runのため隔離ポリシーは適用しません。")
+    if nft_policy:
+        log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
     for cmd in commands:
-        log.info(f"    - 実行: {' '.join(cmd)}")
-        if _run_command_with_sudo(cmd, dry_run=False):
-            success_count += 1
-            log.critical("    → 遮断コマンド成功")
-        else:
-            log.error(f"    → コマンド失敗: {' '.join(cmd)}")
-
-    expected_successes = len(commands) + (1 if nft_policy is not None else 0)
-    if payload.get("require_all_commands") and success_count != expected_successes:
-        log.error("[DYNAMIC_EXECUTION] 必須の隔離ルールをすべて適用できなかったため、隔離完了とは扱いません。")
-        _attempt_pure_python_network_barrier(interface, available_interfaces)
-        return False
-
-    if payload.get("python_snippet"):
-        log.warning("[DYNAMIC_EXECUTION] Python スニペットの exec 実行は無効化され、構造化なフォールバック経路に切り替えます。")
-
-    if not success_count:
-        if _attempt_pure_python_network_barrier(interface, available_interfaces):
-            log.warning("[FALLBACK_BARRIER] iproute2/netlinkによる遮断を適用しました。")
-            return True
-
-    connectivity_state = _probe_network_connectivity()
-    if connectivity_state is True:
-        log.warning("[SELF_LEARNING] ping で依然として到達性が確認されたため、フォールバック戦略へ切り替えます。")
-    elif connectivity_state is False:
-        log.info("[DYNAMIC_EXECUTION] 生成ロジック適用後に到達性の低下を確認しました。")
-
-    if success_count == 0 or connectivity_state is True:
-        if _attempt_pure_python_network_barrier(interface, available_interfaces):
-            log.warning("[FALLBACK_BARRIER] iproute2/netlinkによる遮断を適用しました。")
-            return True
-
-    if success_count == 0 or (connectivity_state is True and success_count == 0):
-        log.warning("[SELF_LEARNING] 生成戦略が不十分だったため、フォールバック戦略を試します。")
-        for fallback_payload in fallback_payloads:
-            log.info(f"  - フォールバック: {fallback_payload.get('name', 'unnamed')}")
-            if execute_generated_payload(fallback_payload, dry_run=False, available_interfaces=available_interfaces, interface=interface):
-                return True
-        return False
-
+        log.critical(f"    - 予定: {' '.join(cmd)}")
     return True
 
 
@@ -5217,22 +5161,6 @@ def _run_command_with_sudo(cmd: list, dry_run: bool = False) -> bool:
     return _execute_root_command(cmd, dry_run=dry_run)
 
 
-def _attempt_pure_python_network_barrier(interface: str | None = None, available_interfaces=None) -> bool:
-    """信頼済みiproute2/netlink経由でインターフェース停止を試みる。"""
-    interfaces = []
-    if available_interfaces:
-        interfaces = list(available_interfaces)
-    if interface and interface not in interfaces:
-        interfaces.insert(0, interface)
-    interfaces = [iface for iface in interfaces if iface and iface != "lo"]
-    if not interfaces:
-        return False
-
-    if platform.system().lower() != "linux":
-        return False
-    return disable_network_interfaces(interfaces)
-
-
 def _load_admin_recovery_token() -> str:
     """環境変数またはローカルトークンファイルから管理者復旧トークンを取得する。"""
     if _ADMIN_RECOVERY_TOKEN:
@@ -5266,18 +5194,31 @@ def handle_admin_recovery_signal(token: str | None = None, interface: str | None
         interfaces = [iface for iface in available_interfaces if iface and iface != "lo"]
     if interface and interface not in interfaces:
         interfaces.insert(0, interface)
+    if not interfaces:
+        log.error("[RECOVERY_API] 復旧対象のインターフェースを確認できません。状態を変更しません。")
+        return {
+            "authorized": True,
+            "recovered": False,
+            "reason": "no_interfaces",
+            "commands": [],
+        }
 
-    commands = []
-    if interface:
-        commands.append(["ip", "link", "set", interface, "up"])
-    for iface in interfaces:
-        if iface and iface != "lo" and iface != interface:
-            commands.append(["ip", "link", "set", iface, "up"])
-    if commands:
-        for cmd in commands:
-            _run_command_with_sudo(cmd, dry_run=False)
-    else:
-        _run_command_with_sudo(["ip", "link", "set", "lo", "up"], dry_run=False)
+    commands = [
+        ["ip", "link", "set", iface, "up"]
+        for iface in interfaces
+    ]
+    results = [
+        _run_command_with_sudo(cmd, dry_run=False)
+        for cmd in commands
+    ]
+    if not all(results):
+        log.error("[RECOVERY_API] 一部の復旧コマンドが失敗しました。状態を解除しません。")
+        return {
+            "authorized": True,
+            "recovered": False,
+            "reason": "recovery_command_failed",
+            "commands": commands,
+        }
 
     with _CONTAINMENT_LOCK:
         global _KILL_SWITCH_TRIGGERED, _ISOLATION_APPROVAL_PENDING

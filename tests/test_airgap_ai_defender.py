@@ -301,22 +301,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 )
 
 
-    @requires_secure_transport
-    def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
+    def test_usb_guest_threat_does_not_bypass_operator_approval_gate(self):
         device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
         interfaces = ["eth0", "wlan0"]
-        with mock.patch.object(module, "discover_available_interfaces", return_value=interfaces), \
-             mock.patch.object(module, "disable_network_interfaces", return_value=True) as barrier, \
-             mock.patch.object(
-                 module.mk1_secure_transport, "request_transport_state", return_value=True,
-             ) as key_wipe:
+        transport = mock.Mock()
+        with mock.patch("mk1_usb_guard.disable_network_interfaces", return_value=True) as barrier, \
+             mock.patch.object(module, "mk1_secure_transport", transport):
             module._usb_scan_threat_response(device, "error", interfaces)
             barrier.assert_not_called()
 
             module._usb_scan_threat_response(device, "threat", interfaces, "/tmp/tunnel.sock")
 
-        barrier.assert_called_once_with(interfaces)
-        key_wipe.assert_called_once_with("/tmp/tunnel.sock", False)
+        barrier.assert_not_called()
+        transport.request_transport_state.assert_not_called()
 
     def test_usb_guard_is_a_separate_privileged_worker_only_in_full_isolation(self):
         processes = [mock.Mock(), mock.Mock(), mock.Mock()]
@@ -2196,12 +2193,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             register.assert_called_once()
             self.assertTrue(module._ONI_SIGNAL_ALLOWED)
 
-    def test_pure_python_barrier_non_linux_returns_false(self):
-        with mock.patch.object(module.platform, "system", return_value="Windows"), \
-             mock.patch.object(module, "disable_network_interfaces") as disable:
-            self.assertFalse(module._attempt_pure_python_network_barrier("eth0", ["eth0"]))
-            disable.assert_not_called()
-
     def test_configured_management_route_is_loaded_and_passed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = os.path.join(temp_dir, "config.json")
@@ -2364,7 +2355,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 management_ports=[22] * 16,
             )
 
-    def test_nft_policy_failure_prevents_isolation_success(self):
+    def test_active_generated_payload_is_refused_before_network_changes(self):
         payload = {
             "nft_policy": {
                 "mode": "full_isolation",
@@ -2375,9 +2366,28 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             "fallback_payloads": [],
             "require_all_commands": True,
         }
-        with mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=False), \
-             mock.patch.object(module, "_attempt_pure_python_network_barrier", return_value=True):
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo") as apply_policy, \
+             mock.patch.object(module, "_run_command_with_sudo") as run_command:
             self.assertFalse(module.execute_generated_payload(payload, interface="eth0"))
+
+        apply_policy.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_generated_payload_dry_run_only_previews_without_applying(self):
+        payload = {
+            "nft_policy": {
+                "mode": "full_isolation",
+                "management_ips": [],
+                "management_ports": [],
+            },
+            "commands": [["ip", "link", "set", "eth0", "down"]],
+        }
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo") as apply_policy, \
+             mock.patch.object(module, "_run_command_with_sudo") as run_command:
+            self.assertTrue(module.execute_generated_payload(payload, dry_run=True))
+
+        apply_policy.assert_not_called()
+        run_command.assert_not_called()
 
     def test_kill_switch_does_not_escalate_to_all_paths_on_policy_or_state_failure(self):
         for policy_result, state_result in ((False, True), (True, False)):
@@ -2494,14 +2504,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         payload = module.generate_optimal_kill_payload(profile, learning_data=["windows"])
         self.assertTrue(any(command[:1] == ["powershell"] for command in payload["commands"]))
 
-    def test_execute_generated_payload_falls_back_when_primary_fails(self):
+    def test_execute_generated_payload_refuses_active_fallbacks_until_approved(self):
         payload = {
             "commands": [["ip", "link", "set", "eth0", "down"]],
             "fallback_payloads": [{"commands": [["echo", "fallback"]]}],
         }
         with mock.patch.object(module, "_run_command_with_sudo", side_effect=[False, True]) as run_cmd:
-            module.execute_generated_payload(payload, dry_run=False)
-            self.assertGreaterEqual(run_cmd.call_count, 2)
+            self.assertFalse(module.execute_generated_payload(payload, dry_run=False))
+            run_cmd.assert_not_called()
 
     def test_handle_admin_recovery_signal_requires_authorized_token(self):
         original_token = getattr(module, "_ADMIN_RECOVERY_TOKEN", None)
@@ -2514,6 +2524,49 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             run_cmd.assert_not_called()
         finally:
             module._ADMIN_RECOVERY_TOKEN = original_token
+
+    def test_admin_recovery_keeps_pending_state_when_interface_restore_fails(self):
+        original_token = module._ADMIN_RECOVERY_TOKEN
+        original_pending = module._ISOLATION_APPROVAL_PENDING
+        original_triggered = module._KILL_SWITCH_TRIGGERED
+        try:
+            module._ADMIN_RECOVERY_TOKEN = "secret-token"
+            module._ISOLATION_APPROVAL_PENDING = True
+            module._KILL_SWITCH_TRIGGERED = False
+            with mock.patch.object(module, "_run_command_with_sudo", return_value=False) as run:
+                result = module.handle_admin_recovery_signal(
+                    "secret-token",
+                    interface="eth0",
+                    available_interfaces=["eth0", "wlan0"],
+                )
+
+            self.assertTrue(result["authorized"])
+            self.assertFalse(result["recovered"])
+            self.assertEqual(result["reason"], "recovery_command_failed")
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(module._ISOLATION_APPROVAL_PENDING)
+        finally:
+            module._ADMIN_RECOVERY_TOKEN = original_token
+            module._ISOLATION_APPROVAL_PENDING = original_pending
+            module._KILL_SWITCH_TRIGGERED = original_triggered
+
+    def test_admin_recovery_refuses_to_clear_state_without_known_interfaces(self):
+        original_token = module._ADMIN_RECOVERY_TOKEN
+        original_pending = module._ISOLATION_APPROVAL_PENDING
+        try:
+            module._ADMIN_RECOVERY_TOKEN = "secret-token"
+            module._ISOLATION_APPROVAL_PENDING = True
+            with mock.patch.object(module, "_run_command_with_sudo") as run:
+                result = module.handle_admin_recovery_signal("secret-token")
+
+            self.assertTrue(result["authorized"])
+            self.assertFalse(result["recovered"])
+            self.assertEqual(result["reason"], "no_interfaces")
+            run.assert_not_called()
+            self.assertTrue(module._ISOLATION_APPROVAL_PENDING)
+        finally:
+            module._ADMIN_RECOVERY_TOKEN = original_token
+            module._ISOLATION_APPROVAL_PENDING = original_pending
 
     def test_packet_inspection_pipeline_blocks_immediately_in_oni_mode(self):
         original_oni_mode = module.ONI_MODE

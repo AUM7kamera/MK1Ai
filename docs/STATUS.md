@@ -10,7 +10,7 @@ conformance claim, or statement that a goal is "achieved".
 | S1: hazard scenarios | 実装あり未検証 | Initial hazard analysis is recorded in `docs/SAFETY_ANALYSIS.md`. It is a repository-based design artifact only; deployment hazards, likelihood, impact, and control effectiveness require asset-specific review and tests. |
 | S2: profile safety states | 実装あり未検証 | Proposed IT/data-center, factory/OT, and government/high-control states are in `docs/SAFETY_STATES.md`. They are not operationally enforced or finally approved; review checklist and representative recovery/non-interference tests remain open. |
 | S3: active-isolation impact preview | 部分実装・未検証 | A preview helper remains for tests/reference but is not exposed in the live path. Active enforcement is disabled because startup-only consent is not per-event approval. No profile or deployment is authorized by this change. |
-| S4: operator-approved response | 未実装・fail-closed | Threat detections do not dispatch active isolation. They set `APPROVAL_REQUIRED`; `--no-dry-run`, panel `[3]`, and direct non-dry-run kill-switch calls are refused. Per-event approval, audit custody, and an operator action to resolve pending state remain unimplemented. |
+| S4: operator-approved response | 未実装・fail-closed | The proposal and evidence gate are in `docs/OPERATOR_APPROVAL_DESIGN.md`; approval threshold and profile authority remain undecided. Standard CLI/panel monitoring is Dry-Run; if the internal threat evaluator receives active intent it sets `APPROVAL_REQUIRED` without dispatching isolation. `--no-dry-run`, panel `[3]`, and direct non-dry-run kill-switch/generated-payload calls are refused; the USB threat callback does not change network/tunnel state. Per-event approval, an actionable review queue, audit custody, and an operator action to resolve pending state remain unimplemented. |
 
 ## A. nftables compatibility
 - `destroy table` removed from `mk1_firewall.py` / `mk1_quarantine.py`.
@@ -40,7 +40,8 @@ and CI statements must not be treated as current results until refreshed.
 ## Current safety-gate validation (2026-10-22)
 
 - `python3 -m pytest -q tests/test_airgap_ai_defender.py tests/test_firewall_nft.py`:
-  141 passed, 21 skipped, 4 subtests passed.
+  144 passed, 20 skipped, 4 subtests passed after adding direct-path and
+  recovery-failure regression checks.
 - `python3 -m py_compile airgap_ai_defender.py mk1_firewall.py mk1_quarantine.py`:
   passed.
 - `make panel`: fresh rebuild passed with `-Wall -Wextra -Werror`.
