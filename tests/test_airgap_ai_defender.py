@@ -166,6 +166,13 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                      self.assertRaises(module.RuntimeConfigError):
                     module._load_runtime_config(str(config_path))
 
+    def test_runtime_config_rejects_files_over_the_size_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            config_path.write_bytes(b" " * (module._MAX_RUNTIME_CONFIG_BYTES + 1))
+            with self.assertRaisesRegex(module.RuntimeConfigError, "サイズが上限"):
+                module._load_runtime_config(str(config_path))
+
     def test_main_refuses_invalid_runtime_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = pathlib.Path(temp_dir) / "config.json"

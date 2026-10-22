@@ -524,6 +524,7 @@ FULL_PACKET_INSPECTION = str(os.environ.get("FULL_PACKET_INSPECTION", "")).lower
 _DPI_WINDOW_SIZE = 256
 _DPI_SAMPLE_STRIDE = 128
 _DPI_MAX_SAMPLE_WINDOWS = 32
+_MAX_RUNTIME_CONFIG_BYTES = 64 * 1024
 _FULL_PACKET_INSPECTION_LOG_PATH = os.path.join("./ai_data", "packet_logs", "full_packet_inspection.log")
 _FULL_PACKET_INSPECTION_LOG_FD = None
 _FULL_PACKET_INSPECTION_LOG_FD_PATH = None
@@ -6279,12 +6280,21 @@ class RuntimeConfigError(ValueError):
 
 def _load_runtime_config(config_path: str) -> dict:
     try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config = json.load(handle)
+        with open(config_path, "rb") as handle:
+            serialized_config = handle.read(_MAX_RUNTIME_CONFIG_BYTES + 1)
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         raise RuntimeConfigError(f"設定ファイルを読み込めません ({exc})") from exc
+
+    if len(serialized_config) > _MAX_RUNTIME_CONFIG_BYTES:
+        raise RuntimeConfigError(
+            f"設定ファイルのサイズが上限({_MAX_RUNTIME_CONFIG_BYTES} bytes)を超えています",
+        )
+    try:
+        config = json.loads(serialized_config.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise RuntimeConfigError(f"設定JSONが不正です ({exc})") from exc
 
     if not isinstance(config, dict):
         raise RuntimeConfigError("設定ファイルの最上位はJSON objectである必要があります")
