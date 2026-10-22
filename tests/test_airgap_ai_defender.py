@@ -1884,6 +1884,41 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
             self.assertFalse(os.path.exists(log_path))
 
+    def test_packet_inspection_log_redacts_finding_tokens(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "packet_logs", "inspection.log")
+            token = "sensitive-signature-token"
+            result = {
+                "suspicious": True,
+                "findings": [{
+                    "type": "signature",
+                    "token": token,
+                    "description": "known marker",
+                    "offset": 7,
+                }],
+                "attack_signatures": ["known marker"],
+                "protocols": ["HTTP"],
+                "entropy": 0.0,
+            }
+            with mock.patch.object(module, "FULL_PACKET_INSPECTION", True), \
+                 mock.patch.object(module, "log") as logger:
+                module.log_full_packet_inspection(
+                    b"example payload", "eth0", result,
+                    "dpi", "payload_signature", log_path,
+                )
+
+            serialized_record = pathlib.Path(log_path).read_text(encoding="utf-8")
+            self.assertNotIn(token, serialized_record)
+            self.assertNotIn(token, str(logger.warning.call_args_list))
+            self.assertEqual(result["findings"][0]["token"], token)
+            record = json.loads(serialized_record)
+            self.assertEqual(record["findings"], [{
+                "type": "signature",
+                "description": "known marker",
+                "offset": 7,
+            }])
+            self.assertEqual(record["dpi"]["findings"], record["findings"])
+
     def test_packet_inspection_log_preparation_assigns_drop_target(self):
         target = mock.Mock(pw_uid=1234, pw_gid=2345, pw_name="workspace-user")
         with tempfile.TemporaryDirectory() as temp_dir:

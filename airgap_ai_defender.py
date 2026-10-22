@@ -1873,14 +1873,21 @@ def log_full_packet_inspection(packet_bytes: bytes, interface: str | None, dpi_r
     path = log_path or _FULL_PACKET_INSPECTION_LOG_PATH
 
     transport = parse_packet_transport(packet_bytes)
-    findings = dpi_result.get("findings", [])
+    findings = [
+        {key: value for key, value in finding.items() if key != "token"}
+        if isinstance(finding, dict) else finding
+        for finding in dpi_result.get("findings", [])
+    ]
+    safe_dpi_result = dict(dpi_result)
+    if "findings" in safe_dpi_result:
+        safe_dpi_result["findings"] = findings
     record = {
         "timestamp": time.time(),
         "interface": interface,
         "stage": stage,
         "reason": reason,
         "transport": transport,
-        "dpi": dpi_result,
+        "dpi": safe_dpi_result,
         "findings": findings,
         "hex_dump": " ".join(f"{b:02x}" for b in packet_bytes[:256]),
     }
@@ -1922,7 +1929,9 @@ def log_full_packet_inspection(packet_bytes: bytes, interface: str | None, dpi_r
         log.warning(f"  - protocols={', '.join(dpi_result['protocols'])}")
     for finding in findings[:8]:
         if finding.get("type") == "signature":
-            log.warning(f"  - offset={finding.get('offset')} type={finding.get('description')} token={finding.get('token')}")
+            log.warning(
+                f"  - offset={finding.get('offset')} type={finding.get('description')}",
+            )
         elif finding.get("type") == "entropy":
             log.warning(f"  - offset={finding.get('offset')} entropy={finding.get('entropy', 0.0):.3f} high_entropy_window")
 

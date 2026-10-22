@@ -12,6 +12,7 @@ conformance claim, or statement that a goal is "achieved".
 | S3: active-isolation impact preview | 部分実装・未検証 | A preview helper remains for tests/reference but is not exposed in the live path. Active enforcement is disabled because startup-only consent is not per-event approval. No profile or deployment is authorized by this change. |
 | S4: operator-approved response | 未実装・fail-closed | The proposal and evidence gate are in `docs/OPERATOR_APPROVAL_DESIGN.md`; approval threshold and profile authority remain undecided. Standard CLI/panel monitoring is Dry-Run; if the internal threat evaluator receives active intent it sets `APPROVAL_REQUIRED` without dispatching isolation. `--no-dry-run`, panel `[3]`, and direct non-dry-run kill-switch/generated-payload calls are refused; the USB threat callback does not change network/tunnel state. Per-event approval, an actionable review queue, audit custody, and an operator action to resolve pending state remain unimplemented. |
 | H5: packet payload persistence | 修正・ローカルテスト済み | Full packet inspection log writes now require `FULL_PACKET_INSPECTION=1`; suspicious findings alone do not persist packet bytes. Focused regression test confirms no log file is created with the flag disabled. Retention, deletion, encryption-at-rest, and access audit remain undecided/unverified. |
+| H5: DPI finding token minimization | 修正・ローカルテスト済み | Signature `token` fields are omitted from persisted detailed inspection records and console warnings, even when full inspection is explicitly enabled. Regression test verifies both sinks and that the original DPI result remains unchanged. |
 | Map WebSocket Origin allowlist | 修正・ローカルテスト済み | Chrome extension Origin must exactly match a configured `MK1_MAP_EXTENSION_ORIGIN`; an unset/empty allowlist rejects all extension connections. Focused handshake test covers the empty allowlist. |
 | AI data file permissions | 部分修正・ローカル確認済み | Removed executable bits from tracked JSON data; runtime config, curated data, and local adaptation checkpoint are no longer tracked, while local files are preserved. Current `ai_data` directories/files are owner-only. `run.sh` creates the directory as `0700`, writes config atomically as `0600`, and has a regression assertion for that mode. Prior repository history is unchanged. |
 | Runtime config schema | 修正・ローカルテスト済み | Unknown keys, invalid values, malformed JSON, and read errors are rejected rather than partially ignored at startup. Invalid live panel updates are logged and do not replace the last applied tunnel, memory-guard, or map settings. |
@@ -48,7 +49,7 @@ and CI statements must not be treated as current results until refreshed.
 - `python3 -m pytest -q tests/test_airgap_ai_defender.py tests/test_firewall_nft.py`:
   145 passed, 20 skipped, 4 subtests passed after adding direct-path and
   recovery-failure regression checks.
-- `python3 -m pytest -q`: 323 passed, 17 skipped, 58 subtests passed.
+- `python3 -m pytest -q`: 324 passed, 17 skipped, 58 subtests passed.
 - `python3 -m pytest -q tests/test_map_visualization.py`: 8 passed.
 - `.github/workflows/build-release.yml`: YAML parse passed; every `uses:` reference is SHA-pinned. CI has not been run.
 - `python3 -m py_compile airgap_ai_defender.py mk1_map.py mk1_firewall.py mk1_quarantine.py`:
