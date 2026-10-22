@@ -1867,7 +1867,7 @@ def analyze_dpi_payload(packet_bytes: bytes, payload: bytes | None = None, inter
 
 def log_full_packet_inspection(packet_bytes: bytes, interface: str | None, dpi_result: dict, stage: str, reason: str, log_path: str | None = None):
     """異常疑惑パケットの完全なヘッダー・DPI詳細をログ/ファイルへ保存する。"""
-    if not (FULL_PACKET_INSPECTION or dpi_result.get("suspicious")):
+    if not FULL_PACKET_INSPECTION:
         return
 
     path = log_path or _FULL_PACKET_INSPECTION_LOG_PATH

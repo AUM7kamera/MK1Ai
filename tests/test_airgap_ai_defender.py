@@ -1810,8 +1810,9 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 "protocols": [],
                 "entropy": 0.0,
             }
-            module.log_full_packet_inspection(b"first", "lo", result, "test", "one", log_path)
-            module.log_full_packet_inspection(b"second", "lo", result, "test", "two", log_path)
+            with mock.patch.object(module, "FULL_PACKET_INSPECTION", True):
+                module.log_full_packet_inspection(b"first", "lo", result, "test", "one", log_path)
+                module.log_full_packet_inspection(b"second", "lo", result, "test", "two", log_path)
 
             self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(os.path.dirname(log_path)).st_mode & 0o777, 0o700)
@@ -1819,11 +1820,30 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 records = [json.loads(line) for line in handle]
             self.assertEqual([record["reason"] for record in records], ["one", "two"])
 
+    def test_suspicious_packet_is_not_persisted_when_full_inspection_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "packet_logs", "inspection.log")
+            suspicious_result = {
+                "suspicious": True,
+                "findings": [{"type": "signature", "token": "private-data"}],
+                "attack_signatures": ["test-signature"],
+                "protocols": ["HTTP"],
+                "entropy": 0.0,
+            }
+            with mock.patch.object(module, "FULL_PACKET_INSPECTION", False):
+                module.log_full_packet_inspection(
+                    b"private packet payload", "eth0", suspicious_result,
+                    "dpi", "payload_signature", log_path,
+                )
+
+            self.assertFalse(os.path.exists(log_path))
+
     def test_packet_inspection_log_preparation_assigns_drop_target(self):
         target = mock.Mock(pw_uid=1234, pw_gid=2345, pw_name="workspace-user")
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = os.path.join(temp_dir, "ai_data", "packet_logs", "inspection.log")
             with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path), \
+                 mock.patch.object(module, "FULL_PACKET_INSPECTION", True), \
                  mock.patch.object(module.os, "geteuid", return_value=0), \
                   mock.patch.dict(module.os.environ, {"SUDO_UID": "1234"}, clear=False), \
                  mock.patch.object(module.pwd, "getpwuid", return_value=target), \
@@ -1853,7 +1873,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 "protocols": [],
                 "entropy": 0.0,
             }
-            with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path):
+            with mock.patch.object(module, "_FULL_PACKET_INSPECTION_LOG_PATH", log_path), \
+                 mock.patch.object(module, "FULL_PACKET_INSPECTION", True):
                 module._prepare_packet_inspection_log()
                 try:
                     os.chmod(directory, 0)

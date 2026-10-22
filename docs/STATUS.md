@@ -11,6 +11,7 @@ conformance claim, or statement that a goal is "achieved".
 | S2: profile safety states | 実装あり未検証 | Proposed IT/data-center, factory/OT, and government/high-control states are in `docs/SAFETY_STATES.md`. They are not operationally enforced or finally approved; review checklist and representative recovery/non-interference tests remain open. |
 | S3: active-isolation impact preview | 部分実装・未検証 | A preview helper remains for tests/reference but is not exposed in the live path. Active enforcement is disabled because startup-only consent is not per-event approval. No profile or deployment is authorized by this change. |
 | S4: operator-approved response | 未実装・fail-closed | The proposal and evidence gate are in `docs/OPERATOR_APPROVAL_DESIGN.md`; approval threshold and profile authority remain undecided. Standard CLI/panel monitoring is Dry-Run; if the internal threat evaluator receives active intent it sets `APPROVAL_REQUIRED` without dispatching isolation. `--no-dry-run`, panel `[3]`, and direct non-dry-run kill-switch/generated-payload calls are refused; the USB threat callback does not change network/tunnel state. Per-event approval, an actionable review queue, audit custody, and an operator action to resolve pending state remain unimplemented. |
+| H5: packet payload persistence | 修正・ローカルテスト済み | Full packet inspection log writes now require `FULL_PACKET_INSPECTION=1`; suspicious findings alone do not persist packet bytes. Focused regression test confirms no log file is created with the flag disabled. Retention, deletion, encryption-at-rest, and access audit remain undecided/unverified. |
 
 ## A. nftables compatibility
 - `destroy table` removed from `mk1_firewall.py` / `mk1_quarantine.py`.
@@ -40,7 +41,7 @@ and CI statements must not be treated as current results until refreshed.
 ## Current safety-gate validation (2026-10-22)
 
 - `python3 -m pytest -q tests/test_airgap_ai_defender.py tests/test_firewall_nft.py`:
-  144 passed, 20 skipped, 4 subtests passed after adding direct-path and
+  145 passed, 20 skipped, 4 subtests passed after adding direct-path and
   recovery-failure regression checks.
 - `python3 -m py_compile airgap_ai_defender.py mk1_firewall.py mk1_quarantine.py`:
   passed.
