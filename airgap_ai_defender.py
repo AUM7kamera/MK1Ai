@@ -6264,6 +6264,10 @@ def _start_colab_rsi_request(model: LightweightMultiTaskAI, local_dir: str, wait
     return worker, completion, result
 
 
+class RuntimeConfigError(ValueError):
+    """Raised when a runtime configuration is unreadable or violates its schema."""
+
+
 def _load_runtime_config(config_path: str) -> dict:
     try:
         with open(config_path, "r", encoding="utf-8") as handle:
@@ -6271,12 +6275,10 @@ def _load_runtime_config(config_path: str) -> dict:
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning(f"[CONFIG] 設定ファイルを読み込めません。CLI既定値で続行します ({exc})")
-        return {}
+        raise RuntimeConfigError(f"設定ファイルを読み込めません ({exc})") from exc
 
     if not isinstance(config, dict):
-        log.warning("[CONFIG] 設定ファイルの最上位はJSON objectである必要があります。既定値で続行します。")
-        return {}
+        raise RuntimeConfigError("設定ファイルの最上位はJSON objectである必要があります")
 
     validators = {
         "interface": lambda value: isinstance(value, str) and bool(value.strip()),
@@ -6313,15 +6315,24 @@ def _load_runtime_config(config_path: str) -> dict:
             isinstance(value, int) and not isinstance(value, bool) and value in (0, 1)
         ),
     }
+    unknown_keys = sorted(set(config) - set(validators))
+    if unknown_keys:
+        raise RuntimeConfigError(
+            "未知の設定キーがあります: " + ", ".join(unknown_keys),
+        )
+
+    invalid_keys = sorted(
+        key for key, value in config.items()
+        if not validators[key](value)
+    )
+    if invalid_keys:
+        raise RuntimeConfigError(
+            "設定値が不正です: " + ", ".join(invalid_keys),
+        )
+
     validated = {}
     for key, value in config.items():
-        validator = validators.get(key)
-        if validator is None:
-            continue
-        if validator(value):
-            validated[key] = value.strip() if isinstance(value, str) else value
-        else:
-            log.warning(f"[CONFIG] {key} の値が不正なため無視します。")
+        validated[key] = value.strip() if isinstance(value, str) else value
     return validated
 
 
@@ -6330,6 +6341,26 @@ def _merge_runtime_config(config_path: str, panel_config_path: str | None = None
     if panel_config_path:
         config.update(_load_runtime_config(panel_config_path))
     return config
+
+
+def _load_panel_runtime_config(
+    config_path: str,
+    tunnel_enabled: bool,
+    memory_guard_enabled: bool,
+    map_mode: MapMode,
+) -> dict:
+    try:
+        return _load_runtime_config(config_path)
+    except RuntimeConfigError as exc:
+        log.error(
+            "[CONFIG] パネル設定の更新を拒否しました。最後に適用した設定を維持します (%s)",
+            exc,
+        )
+        return {
+            "secure_tunnel_enabled": int(tunnel_enabled),
+            "memory_guard_enabled": int(memory_guard_enabled),
+            "map_mode": int(map_mode),
+        }
 
 
 def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_data/config.json"):
@@ -6534,7 +6565,10 @@ def main():
     pre_parser.add_argument("--config", default="./ai_data/config.json")
     pre_parser.add_argument("--panel-config")
     pre_args, _ = pre_parser.parse_known_args()
-    runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
+    try:
+        runtime_config = _merge_runtime_config(pre_args.config, pre_args.panel_config)
+    except RuntimeConfigError as exc:
+        pre_parser.error(str(exc))
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
 
@@ -6805,7 +6839,12 @@ def main():
 
             now_monotonic = time.monotonic()
             if args.panel_config and now_monotonic >= next_map_config_check:
-                panel_config = _load_runtime_config(args.panel_config)
+                panel_config = _load_panel_runtime_config(
+                    args.panel_config,
+                    tunnel_enabled,
+                    memory_guard_enabled,
+                    map_service.mode,
+                )
                 requested_tunnel = panel_config.get("secure_tunnel_enabled")
                 requested_tunnel_enabled = requested_tunnel == 1
                 if (

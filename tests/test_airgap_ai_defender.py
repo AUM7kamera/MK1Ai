@@ -146,6 +146,57 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertFalse(overridden.ignore_model_hash)
         self.assertFalse(overridden.compact_log)
 
+    def test_runtime_config_rejects_unknown_keys_and_invalid_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            for config in (
+                {"interface": "eth0", "unexpected": True},
+                {"ram_limit": 0},
+            ):
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.subTest(config=config), self.assertRaises(module.RuntimeConfigError):
+                    module._load_runtime_config(str(config_path))
+
+    def test_runtime_config_rejects_malformed_json_and_non_object_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            for invalid_content in ('{"mode":', "[]", "null"):
+                config_path.write_text(invalid_content, encoding="utf-8")
+                with self.subTest(invalid_content=invalid_content), \
+                     self.assertRaises(module.RuntimeConfigError):
+                    module._load_runtime_config(str(config_path))
+
+    def test_main_refuses_invalid_runtime_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "config.json"
+            config_path.write_text(json.dumps({"unknown_setting": True}), encoding="utf-8")
+            error_output = io.StringIO()
+            with mock.patch("sys.argv", ["airgap_ai_defender.py", "--config", str(config_path)]), \
+                 contextlib.redirect_stderr(error_output), \
+                 self.assertRaises(SystemExit) as raised:
+                module.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("未知の設定キー", error_output.getvalue())
+
+    def test_invalid_live_panel_config_preserves_last_applied_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = pathlib.Path(temp_dir) / "panel-config.json"
+            config_path.write_text(
+                json.dumps({"map_mode": 99}), encoding="utf-8",
+            )
+            with self.assertLogs("AirgapAI", level="ERROR") as captured:
+                loaded = module._load_panel_runtime_config(
+                    str(config_path), True, False, module.MapMode.CHROME,
+                )
+
+        self.assertEqual(loaded, {
+            "secure_tunnel_enabled": 1,
+            "memory_guard_enabled": 0,
+            "map_mode": int(module.MapMode.CHROME),
+        })
+        self.assertIn("最後に適用した設定を維持", captured.output[0])
+
     def test_active_isolation_requires_exact_confirmation_and_shows_scope(self):
         terminal = type("Terminal", (), {"isatty": lambda self: True})()
         with mock.patch.object(module.sys, "stdin", terminal), \
@@ -239,7 +290,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 self.assertEqual(module._load_runtime_config(str(config_path))["map_mode"], mode)
 
             config_path.write_text(json.dumps({"map_mode": True}), encoding="utf-8")
-            self.assertNotIn("map_mode", module._load_runtime_config(str(config_path)))
+            with self.assertRaisesRegex(module.RuntimeConfigError, "map_mode"):
+                module._load_runtime_config(str(config_path))
 
     def test_usb_guard_config_accepts_only_integer_toggle_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -253,10 +305,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
             for invalid in (True, 2, "1"):
                 config_path.write_text(json.dumps({"usb_guard_enabled": invalid}), encoding="utf-8")
-                self.assertNotIn(
-                    "usb_guard_enabled",
-                    module._load_runtime_config(str(config_path)),
-                )
+                with self.assertRaisesRegex(module.RuntimeConfigError, "usb_guard_enabled"):
+                    module._load_runtime_config(str(config_path))
 
     def test_secure_tunnel_config_accepts_only_integer_toggle_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -274,10 +324,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 config_path.write_text(
                     json.dumps({"secure_tunnel_enabled": invalid}), encoding="utf-8",
                 )
-                self.assertNotIn(
-                    "secure_tunnel_enabled",
-                    module._load_runtime_config(str(config_path)),
-                )
+                with self.assertRaisesRegex(module.RuntimeConfigError, "secure_tunnel_enabled"):
+                    module._load_runtime_config(str(config_path))
 
     def test_memory_guard_config_accepts_only_integer_toggle_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -295,10 +343,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 config_path.write_text(
                     json.dumps({"memory_guard_enabled": invalid}), encoding="utf-8",
                 )
-                self.assertNotIn(
-                    "memory_guard_enabled",
-                    module._load_runtime_config(str(config_path)),
-                )
+                with self.assertRaisesRegex(module.RuntimeConfigError, "memory_guard_enabled"):
+                    module._load_runtime_config(str(config_path))
 
 
     def test_usb_guest_threat_does_not_bypass_operator_approval_gate(self):
@@ -2233,15 +2279,14 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertEqual(module._configured_management_route(), {})
             self.assertEqual(module.build_containment_plan("eth0")["mode"], "full_isolation")
 
-    def test_invalid_management_ip_is_not_loaded_from_configuration(self):
+    def test_invalid_management_ip_rejects_configuration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = os.path.join(temp_dir, "config.json")
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump({"management_ips": ["not-an-ip"]}, handle)
 
-            config = module._load_runtime_config(config_path)
-
-        self.assertNotIn("management_ips", config)
+            with self.assertRaisesRegex(module.RuntimeConfigError, "management_ips"):
+                module._load_runtime_config(config_path)
 
     def _run_kill_switch_with_route(self, route, containment_mode="full_isolation"):
         with mock.patch.object(module, "_PANEL_FULL_ISOLATION", False), \
