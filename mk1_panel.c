@@ -12,10 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
- codespace-probable-dollop-pj64p66j94jv29wg6
 
 #include <pthread.h>
- main
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -24,7 +22,6 @@
 #include <time.h>
 #include <unistd.h>
 #include "mk1_memory_guard.h"
-#include "mk1_path_trust.h"
 #include "mk1_tunnel.h"
 
 #define CONFIG_PATH "ai_data/panel-config.json"
@@ -65,6 +62,7 @@ typedef struct {
     double swap_used_mb;
     long long packets_total;
     int isolation_active;
+    int isolation_approval_pending;
     int dry_run;
     int secure_tunnel_active;
     int memory_guard_active;
@@ -83,7 +81,6 @@ static volatile sig_atomic_t close_requested = 0;
 static volatile sig_atomic_t isolation_closed = 0;
 static char message[256] = "準備完了";
 static void set_message(const char *text);
- codespace-probable-dollop-pj64p66j94jv29wg6
 
 static PanelSnapshot panel_snapshot;
 static pthread_mutex_t panel_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -97,7 +94,6 @@ static WINDOW *resource_window;
 static WINDOW *footer_window;
 static int panel_rows;
 static int panel_columns;
- main
 
 static void handle_shutdown_signal(int signal_number) {
     if (signal_number == SIGTERM) {
@@ -357,6 +353,7 @@ static bool read_status(PanelStatus *status) {
         if (sscanf(line, "ram_limit_mb=%lf", &status->ram_limit_mb) == 1) continue;
         if (sscanf(line, "swap_used_mb=%lf", &status->swap_used_mb) == 1) continue;
         if (sscanf(line, "isolation_active=%d", &status->isolation_active) == 1) continue;
+        if (sscanf(line, "isolation_approval_pending=%d", &status->isolation_approval_pending) == 1) continue;
         if (sscanf(line, "secure_tunnel_active=%d", &status->secure_tunnel_active) == 1) continue;
         if (sscanf(line, "memory_guard_active=%d", &status->memory_guard_active) == 1) continue;
         sscanf(line, "dry_run=%d", &status->dry_run);
@@ -548,7 +545,8 @@ static void draw_panel_windows(const PanelConfig *config, const PanelSnapshot *s
               snapshot->status_available ? status->threat_score : 0.0,
               snapshot->status_available ? status->backdoor_score : 0.0);
     wattroff(status_window, COLOR_PAIR(threat_color) | A_BOLD);
-    short alert_color = status->isolation_active ? COLOR_CRITICAL :
+    short alert_color = status->isolation_active || status->isolation_approval_pending
+        ? COLOR_CRITICAL :
         (strcmp(status->alert, "NONE") == 0 ? COLOR_INFO : COLOR_HIGH);
     wattron(status_window, COLOR_PAIR(alert_color) | A_BOLD);
     mvwprintw(status_window, 6, 2, "Alert: %.20s", snapshot->status_available
@@ -556,7 +554,9 @@ static void draw_panel_windows(const PanelConfig *config, const PanelSnapshot *s
     wattroff(status_window, COLOR_PAIR(alert_color) | A_BOLD);
     mvwprintw(status_window, 7, 2, "実行: %s",
               !snapshot->status_available ? "状態未取得" :
-              status->dry_run ? "Dry-Run (no enforcement)" : "隔離操作有効");
+              status->dry_run ? "Dry-Run (no enforcement)" :
+              status->isolation_approval_pending ? "Approval pending; no isolation" :
+              "Active isolation disabled");
     mvwprintw(status_window, 8, 2, "USB policy: %s",
               config->usb_guard_enabled ? "HID deny / storage scan" : "OFF");
     mvwprintw(status_window, 9, 2, "WG gate: %s  mem guard: %s",
@@ -604,7 +604,7 @@ static void draw_panel_windows(const PanelConfig *config, const PanelSnapshot *s
     werase(footer_window);
     box(footer_window, 0, 0);
     mvwprintw(footer_window, 1, 1,
-              "[1]Dry [2]Stop [3]Isolate [4]Config [5]NIC [6]Test [7]Dash [8]Stop");
+              "[1]Dry [2]Stop [3]Active disabled [4]Config [5]NIC [6]Test [7]Dash [8]Stop");
     mvwprintw(footer_window, 2, 1, "[m]Map [u]USB [e]WG [a]Mem [q]Quit");
     wnoutrefresh(footer_window);
     doupdate();
@@ -684,20 +684,13 @@ static void start_dashboard(void) {
     set_message("閲覧専用HTTPSサーバーを起動中。URL/設定と認証手順: ai_data/remote-dashboard.log");
 }
 
-static bool confirm_monitor_start(bool full_isolation) {
+static bool confirm_monitor_start(void) {
     erase();
     attron(A_BOLD);
     mvprintw(2, 2, "起動前のセキュリティ警告");
     attroff(A_BOLD);
-    if (full_isolation) {
-        mvprintw(4, 2, "脅威検知時はOSのファイアウォール/ネットワーク機能で全通信の遮断を試みます。");
-        mvprintw(5, 2, "誤検知でもWi-Fi/有線/VPN/SSH/リモート操作が切断される場合があります。");
-        mvprintw(6, 2, "隔離後の遠隔復旧はできません。端末の前でのみ復旧してください。");
-        mvprintw(7, 2, "管理者認証を行い、--no-dry-runで監視を開始します。");
-    } else {
-        mvprintw(4, 2, "Dry-Runでは検知しても通信を遮断しません。実際の防御強度は低下します。");
-        mvprintw(5, 2, "本番通信の保護やエアギャップが有効になったとはみなさないでください。");
-    }
+    mvprintw(4, 2, "Dry-Runでは検知しても通信を遮断しません。実際の防御強度は低下します。");
+    mvprintw(5, 2, "本番通信の保護やエアギャップが有効になったとはみなさないでください。");
     mvprintw(9, 2, "続行しますか? [y]=続行 / その他のキー=キャンセル");
     refresh();
     nodelay(stdscr, FALSE);
@@ -868,25 +861,14 @@ static bool start_monitor(const PanelConfig *config, bool full_isolation) {
         set_message("監視はすでに起動しています");
         return false;
     }
-    if (full_isolation && strcmp(config->mode, "RSI") == 0) {
-        set_message("RSIモードはDry-Run固定です。通常モードに変更してください");
+    if (full_isolation) {
+        set_message("実遮断はイベントごとの管理者承認機能が未実装のため無効です");
         return false;
     }
-    if (!confirm_monitor_start(full_isolation)) {
+    if (!confirm_monitor_start()) {
         set_message("監視の起動をキャンセルしました");
         return false;
     }
-    if (full_isolation) {
-        const char *privileged_python = getenv("MK1_PYTHON_BIN");
-        if (privileged_python == NULL || privileged_python[0] == '\0') privileged_python = "python3";
-        bool python_ok = strchr(privileged_python, '/') == NULL
-            || mk1_path_chain_is_root_trusted(privileged_python);
-        if (!python_ok || !mk1_path_chain_is_root_trusted("airgap_ai_defender.py")) {
-            set_message("実遮断はroot権限で実行されます。スクリプトとPythonをrootが所有し、group/otherが書き込めない場所に配置してください");
-            return false;
-        }
-    }
-    if (full_isolation && !authorize_admin()) return false;
     if (!save_config(config)) return false;
     pid_t child = fork();
     if (child < 0) {
@@ -905,25 +887,16 @@ static bool start_monitor(const PanelConfig *config, bool full_isolation) {
             dup2(fileno(log_file), STDERR_FILENO);
             fclose(log_file);
         }
-        if (full_isolation) {
-            execl(SUDO_PATH, "sudo", "-n", python, "airgap_ai_defender.py",
-                   "--config", "ai_data/config.json",
-                   "--panel-config", CONFIG_PATH,
-                   "--panel-parent-pid", parent_pid,
-                   "--no-dry-run", "--compact-log", (char *)NULL);
-        } else {
-            execl(python, python, "airgap_ai_defender.py",
-                  "--config", "ai_data/config.json",
-                  "--panel-config", CONFIG_PATH,
-                  "--compact-log", (char *)NULL);
-        }
+        execl(python, python, "airgap_ai_defender.py",
+              "--config", "ai_data/config.json",
+              "--panel-config", CONFIG_PATH,
+              "--panel-parent-pid", parent_pid,
+              "--compact-log", (char *)NULL);
         _exit(127);
     }
     setpgid(child, child);
     monitor_pid = child;
-    set_message(full_isolation
-        ? "実遮断監視を起動しました。検知時はTUIを閉じ、遠隔復旧経路を残しません"
-        : "Dry-Run監視を起動しました。詳細ログ: ai_data/panel.log");
+    set_message("Dry-Run監視を起動しました。詳細ログ: ai_data/panel.log");
     return true;
 }
 
@@ -1088,7 +1061,6 @@ static void draw_panel(const PanelConfig *config) {
         (void)kill(getpid(), SIGKILL);
         return;
     }
- codespace-probable-dollop-pj64p66j94jv29wg6
     PanelStatus status;
     bool status_available = read_status(&status);
 
@@ -1096,7 +1068,6 @@ static void draw_panel(const PanelConfig *config) {
     pthread_mutex_lock(&panel_snapshot_mutex);
     snapshot = panel_snapshot;
     pthread_mutex_unlock(&panel_snapshot_mutex);
- main
     if (monitor_pid > 0 && !isolation_closed) {
         int child_status;
         pid_t result = waitpid(monitor_pid, &child_status, WNOHANG);
@@ -1114,7 +1085,6 @@ static void draw_panel(const PanelConfig *config) {
         }
     }
 
- codespace-probable-dollop-pj64p66j94jv29wg6
     erase();
     attron(A_BOLD);
     mvprintw(1, 2, "MK1Ai C操作パネル");
@@ -1195,7 +1165,6 @@ static int mouse_shortcut_key(void) {
         }
     }
     return ERR;
- main
 }
 
 int main(void) {
@@ -1229,7 +1198,6 @@ int main(void) {
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     if (has_colors()) {
         start_color();
@@ -1240,7 +1208,6 @@ int main(void) {
     }
     mousemask(ALL_MOUSE_EVENTS, NULL);
     create_panel_windows();
- main
     struct sigaction shutdown_action = {0};
     shutdown_action.sa_handler = handle_shutdown_signal;
     sigemptyset(&shutdown_action.sa_mask);
@@ -1253,15 +1220,12 @@ int main(void) {
     pipe_action.sa_handler = SIG_IGN;
     sigemptyset(&pipe_action.sa_mask);
     if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
- codespace-probable-dollop-pj64p66j94jv29wg6
 
         destroy_panel_windows();
- main
         endwin();
         fprintf(stderr, "SIGPIPEハンドラーを設定できません: %s\n", strerror(errno));
         return 1;
     }
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     int thread_error = pthread_create(&telemetry_thread, NULL, telemetry_worker, NULL);
     if (thread_error != 0) {
@@ -1272,7 +1236,6 @@ int main(void) {
         return 1;
     }
     telemetry_thread_started = true;
- main
 
     bool running = true;
     while (running && !close_requested) {
@@ -1297,7 +1260,7 @@ int main(void) {
                     config.usb_guard_enabled = previous_state;
                 } else {
                     set_message(config.usb_guard_enabled
-                        ? "USB隔離を有効にしました。実遮断監視の起動時のみ適用"
+                        ? "USB隔離設定を保存しました。イベント承認が未実装のため実遮断は無効です"
                         : "USB隔離を無効にしました");
                 }
                 break;

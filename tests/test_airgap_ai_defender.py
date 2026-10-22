@@ -1,5 +1,6 @@
 import hashlib
 import builtins
+import contextlib
 import importlib.util
 import io
 import json
@@ -145,6 +146,70 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertFalse(overridden.ignore_model_hash)
         self.assertFalse(overridden.compact_log)
 
+    def test_active_isolation_requires_exact_confirmation_and_shows_scope(self):
+        terminal = type("Terminal", (), {"isatty": lambda self: True})()
+        with mock.patch.object(module.sys, "stdin", terminal), \
+             mock.patch("builtins.print") as display:
+            self.assertTrue(module._confirm_active_isolation(
+                "eth0",
+                ["eth0", "wlan0", "lo"],
+                ["192.0.2.10"],
+                [22],
+                input_func=lambda _: module._ACTIVE_ISOLATION_CONFIRMATION,
+            ))
+
+        preview = "\n".join(str(call.args[0]) for call in display.call_args_list)
+        self.assertIn("eth0, wlan0", preview)
+        self.assertIn("management_safe_harbor", preview)
+        self.assertIn("192.0.2.10", preview)
+
+    def test_active_isolation_refuses_noninteractive_or_wrong_confirmation(self):
+        noninteractive = type("Terminal", (), {"isatty": lambda self: False})()
+        with mock.patch.object(module.sys, "stdin", noninteractive), \
+             mock.patch("builtins.print"):
+            self.assertFalse(module._confirm_active_isolation(
+                "eth0", ["eth0"], [], [],
+                input_func=lambda _: self.fail("must not prompt without a TTY"),
+            ))
+
+        terminal = type("Terminal", (), {"isatty": lambda self: True})()
+        with mock.patch.object(module.sys, "stdin", terminal), \
+             mock.patch("builtins.print"):
+            self.assertFalse(module._confirm_active_isolation(
+                "eth0", ["eth0"], [], [],
+                input_func=lambda _: "yes",
+            ))
+
+    def test_panel_active_isolation_confirmation_is_exact(self):
+        with mock.patch("builtins.print"):
+            self.assertTrue(module._confirm_active_isolation(
+                "eth0",
+                ["eth0"],
+                [],
+                [],
+                panel_parent_pid=123,
+                panel_confirmation=module._ACTIVE_ISOLATION_CONFIRMATION,
+            ))
+            self.assertFalse(module._confirm_active_isolation(
+                "eth0",
+                ["eth0"],
+                [],
+                [],
+                panel_parent_pid=123,
+                panel_confirmation="yes",
+            ))
+
+    def test_cli_rejects_active_isolation_until_per_event_approval_is_implemented(self):
+        error_output = io.StringIO()
+        with mock.patch.object(module, "_merge_runtime_config", return_value={}), \
+             mock.patch.object(module.sys, "argv", ["airgap_ai_defender.py", "--no-dry-run"]), \
+             contextlib.redirect_stderr(error_output), \
+             self.assertRaises(SystemExit) as raised:
+            module.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("イベントごとの管理者承認機能が未実装", error_output.getvalue())
+
     def test_panel_config_overrides_runtime_config_without_discarding_other_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime_path = pathlib.Path(temp_dir) / "config.json"
@@ -235,10 +300,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                     module._load_runtime_config(str(config_path)),
                 )
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_secure_transport
- main
     def test_usb_guest_threat_uses_iproute2_barrier_but_scan_error_does_not(self):
         device = mock.Mock(device_id="1-2", vendor_id="1234", product_id="abcd")
         interfaces = ["eth0", "wlan0"]
@@ -325,6 +388,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(status_mode, 0o600)
         self.assertEqual(remaining_temporary_files, [])
 
+    def test_panel_status_reports_pending_approval_without_claiming_isolation(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(module, "_KILL_SWITCH_TRIGGERED", False), \
+             mock.patch.object(module, "_ISOLATION_APPROVAL_PENDING", True):
+            module._write_panel_status(temp_dir, 0, 0, "Normal", False)
+            content = (pathlib.Path(temp_dir) / "panel-status.txt").read_text(
+                encoding="ascii",
+            )
+
+        self.assertIn("isolation_active=0\n", content)
+        self.assertIn("isolation_approval_pending=1\n", content)
+        self.assertIn("alert=APPROVAL_REQUIRED\n", content)
+
     def test_airgap_closes_only_the_panel_process_in_its_ancestry(self):
         ancestor = mock.Mock(pid=4321)
         process = mock.Mock()
@@ -363,56 +439,19 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(run_command.call_count, 2)
 
-    def test_panel_full_isolation_stops_all_nics_before_other_containment_work(self):
-        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
-             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True), \
-             mock.patch.object(module, "disable_all_network_paths", return_value=True) as stop_all, \
-             mock.patch.object(module, "_close_panel_after_airgap") as close_panel, \
-             mock.patch.object(module, "profile_environment", side_effect=AssertionError("slow follow-up must not run")), \
-             mock.patch.object(module, "execute_generated_payload", side_effect=AssertionError("fallback must not run")):
-            module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0", "wlan0"])
-
-        stop_all.assert_called_once_with()
-        close_panel.assert_called_once_with()
-
-    def test_management_safe_harbor_uses_validated_tcp_policy_without_stopping_nics(self):
-        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True) as apply, \
-             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
-             mock.patch.object(
-                 module, "disable_all_network_paths",
-                 side_effect=AssertionError("safe-harbor must retain its configured TCP path"),
-             ):
-            self.assertTrue(module.execute_kill_switch(
-                "eth0",
-                dry_run=False,
-                management_ports=[22],
-                management_ips=["192.0.2.10"],
+    def test_active_isolation_is_refused_until_per_event_approval_exists(self):
+        with mock.patch.object(module, "_apply_nft_policy_with_sudo") as apply_policy, \
+             mock.patch.object(module, "_persist_quarantine_state") as persist_state, \
+             mock.patch.object(module, "disable_all_network_paths") as disable_paths, \
+             mock.patch.object(module, "execute_generated_payload") as execute_payload:
+            self.assertFalse(module.execute_kill_switch(
+                "eth0", dry_run=False, available_interfaces=["eth0", "wlan0"],
             ))
 
-        apply.assert_called_once_with(
-            "management_safe_harbor",
-            ["192.0.2.10"],
-            [22],
-        )
-
-    def test_persisted_quarantine_follows_atomic_policy_application(self):
-        events = []
-        with mock.patch.object(module, "_PANEL_FULL_ISOLATION", True), \
-             mock.patch.object(
-                 module, "_apply_nft_policy_with_sudo",
-                 side_effect=lambda *args, **kwargs: events.append("firewall") or True,
-             ), \
-             mock.patch.object(
-                 module, "_persist_quarantine_state",
-                 side_effect=lambda: events.append("state") or True,
-             ), \
-             mock.patch.object(module, "disable_all_network_paths", return_value=True), \
-             mock.patch.object(module, "_close_panel_after_airgap"):
-            self.assertTrue(module.execute_kill_switch("eth0", dry_run=False))
-
-        self.assertEqual(events, ["firewall", "state"])
+        apply_policy.assert_not_called()
+        persist_state.assert_not_called()
+        disable_paths.assert_not_called()
+        execute_payload.assert_not_called()
 
     def test_root_privilege_drop_uses_sudo_invoking_user(self):
         passwd_entry = mock.Mock(pw_name="workspace-user")
@@ -567,10 +606,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(result["reason"], "PQC public-key pin required")
         secure_request.assert_not_called()
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_cloud_model_apply_does_not_enable_local_feedback_when_adaptation_disabled(self):
         model = module.LightweightMultiTaskAI(input_dim=10)
         state_dict = model.state_dict()
@@ -597,10 +634,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 load_feedback.assert_not_called()
                 train.assert_not_called()
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_head_b_maps_benign_and_threat_labels_with_balanced_weights(self):
         targets, weights = module._head_b_targets([0, 0, 0, 1])
 
@@ -1188,10 +1223,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         self.assertEqual(module._train_queue.maxsize, module._TRAIN_QUEUE_MAX_BATCHES)
         self.assertGreater(module._train_queue.maxsize, 0)
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_local_adaptation_is_disabled_by_default(self):
         torch = module.torch
         model = module.LightweightMultiTaskAI(input_dim=10)
@@ -1216,10 +1249,8 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             self.assertTrue(module._enqueue_training_batch([{"features": [0.2] * 10}]))
             train_queue.put.assert_not_called()
 
- codespace-probable-dollop-pj64p66j94jv29wg6
 
     @requires_torch
- main
     def test_local_training_persists_and_restores_only_head_b(self):
         torch = module.torch
         with mock.patch.object(module, "_HEAD_B_REVIEWED_LABELS", set()), \
@@ -1271,15 +1302,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
     def test_training_enqueue_drops_batch_without_blocking_when_queue_is_full(self):
         original_queue = module._train_queue
- codespace-probable-dollop-pj64p66j94jv29wg6
-        full_queue = mock.Mock()
-        full_queue.put.side_effect = [queue.Full, None]
-        with mock.patch.object(module, "_LOCAL_ADAPTATION_ENABLED", True):
-            try:
-                module._train_queue = full_queue
-                self.assertTrue(module._enqueue_training_batch([{"features": [0.0] * 10}], wait_timeout=0))
-                self.assertEqual(full_queue.put.call_count, 2)
-
         full_queue = queue.Queue(maxsize=1)
         queued_batch = [{"features": [0.1] * 10, "label": 0}]
         rejected_batch = [{"features": [0.9] * 10, "label": 1}]
@@ -1291,7 +1313,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 self.assertFalse(module._enqueue_training_batch(rejected_batch))
                 self.assertLess(module.time.monotonic() - started, 0.5)
                 self.assertIs(full_queue.get_nowait(), queued_batch)
- main
             finally:
                 module._train_queue = original_queue
 
@@ -1389,6 +1410,31 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
             module._BACKDOOR_RISK_SCORE = 0.8
             module.evaluate_threat_state("eth0", dry_run=True, score_a=0.1, backdoor_detected=True)
             kill_switch.assert_called_once_with("eth0", True)
+
+    def test_active_threat_detection_sets_pending_approval_without_isolating(self):
+        original_pending = module._ISOLATION_APPROVAL_PENDING
+        original_triggered = module._KILL_SWITCH_TRIGGERED
+        original_last_trigger = module._LAST_KILL_SWITCH_TRIGGER
+        try:
+            module._ISOLATION_APPROVAL_PENDING = False
+            module._KILL_SWITCH_TRIGGERED = False
+            module._LAST_KILL_SWITCH_TRIGGER = 0.0
+            with mock.patch.object(module, "_dispatch_privileged_command") as dispatch, \
+                 mock.patch.object(module, "execute_kill_switch") as execute, \
+                 mock.patch.object(module, "mk1_secure_transport") as transport:
+                self.assertTrue(module.evaluate_threat_state(
+                    "eth0", dry_run=False, score_a=0.99, backdoor_detected=True,
+                ))
+
+            self.assertTrue(module._ISOLATION_APPROVAL_PENDING)
+            self.assertFalse(module._KILL_SWITCH_TRIGGERED)
+            dispatch.assert_not_called()
+            execute.assert_not_called()
+            transport.set_transport_enabled.assert_not_called()
+        finally:
+            module._ISOLATION_APPROVAL_PENDING = original_pending
+            module._KILL_SWITCH_TRIGGERED = original_triggered
+            module._LAST_KILL_SWITCH_TRIGGER = original_last_trigger
 
     def test_handle_packet_event_does_not_enforce_advisory_backdoor_score(self):
         original_triggered = module._KILL_SWITCH_TRIGGERED
@@ -1996,30 +2042,6 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         tcp_header = struct.pack("!HHIIHHHH", 12345, dst_port, 0, 0, 5, 2, 0, 0)
         return ethernet_header + ip_header + tcp_header
 
-    def test_execute_kill_switch_runs_all_commands_when_some_fail(self):
-        profile = {
-            "os": {"system": "Linux"},
-            "available_interfaces": ["eth0"],
-            "tools": {"ip": True, "iptables": True, "nft": False},
-            "permissions": {"root": True},
-            "network_layers": ["physical"],
-        }
-        with mock.patch.object(module, "_run_command_with_sudo", side_effect=[False, True, True]) as run_cmd, \
-             mock.patch.object(module, "profile_environment", return_value=profile), \
-             mock.patch.object(module, "_probe_network_connectivity", return_value=False), \
-             mock.patch.object(module, "_persist_quarantine_state", return_value=True), \
-             mock.patch.object(module, "_apply_nft_policy_with_sudo", return_value=True):
-            module._KILL_SWITCH_TRIGGERED = False
-            module.execute_kill_switch("eth0", dry_run=False, available_interfaces=["eth0"])
-            self.assertEqual(run_cmd.call_count, 3)
-
-            executed_commands = [call.args[0] for call in run_cmd.call_args_list]
-            self.assertEqual(executed_commands, [
-                ["iptables", "-I", "INPUT", "1", "-j", "DROP"],
-                ["iptables", "-I", "OUTPUT", "1", "-j", "DROP"],
-                ["iptables", "-I", "FORWARD", "1", "-j", "DROP"],
-            ])
-
     def test_build_containment_plan_preserves_management_sessions(self):
         plan = module.build_containment_plan(
             "eth0",
@@ -2277,16 +2299,12 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(payload["nft_policy"]["mode"], "full_isolation")
         transaction = render_nft_transaction(**payload["nft_policy"])
- codespace-probable-dollop-pj64p66j94jv29wg6
-        self.assertIn("destroy table inet mk1ai_quarantine", transaction)
-
         self.assertNotIn("destroy", transaction)
         self.assertTrue(transaction.startswith(
             "add table inet mk1ai_quarantine\n"
             "delete table inet mk1ai_quarantine\n"
             "add table inet mk1ai_quarantine\n"
         ))
- main
         self.assertIn("policy drop", transaction)
         self.assertNotIn("mk1ai_egress", transaction)
         self.assertTrue(payload["require_all_commands"])
@@ -2361,16 +2379,33 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
              mock.patch.object(module, "_attempt_pure_python_network_barrier", return_value=True):
             self.assertFalse(module.execute_generated_payload(payload, interface="eth0"))
 
+    def test_kill_switch_does_not_escalate_to_all_paths_on_policy_or_state_failure(self):
+        for policy_result, state_result in ((False, True), (True, False)):
+            with self.subTest(policy_result=policy_result, state_result=state_result), \
+                 mock.patch.object(
+                     module, "_apply_nft_policy_with_sudo", return_value=policy_result,
+                 ), \
+                 mock.patch.object(
+                     module, "_persist_quarantine_state", return_value=state_result,
+                 ), \
+                 mock.patch.object(
+                     module, "disable_all_network_paths",
+                     side_effect=AssertionError("failure must not broaden isolation"),
+                 ) as disable_paths:
+                self.assertFalse(module.execute_kill_switch(
+                    "eth0",
+                    dry_run=False,
+                    available_interfaces=["eth0", "wlan0"],
+                ))
+                disable_paths.assert_not_called()
+
     def test_nft_policy_is_applied_as_one_stdin_transaction(self):
         from mk1_firewall import apply_nft_policy
 
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch("mk1_firewall.os.geteuid", return_value=0), \
              mock.patch("mk1_firewall._trusted_nft_binary", return_value="/usr/sbin/nft"), \
- codespace-probable-dollop-pj64p66j94jv29wg6
-
              mock.patch("mk1_firewall.check_nft_support", return_value=None), \
- main
              mock.patch("mk1_firewall.subprocess.run", return_value=completed) as run:
             self.assertTrue(apply_nft_policy(
                 mode="management_safe_harbor",

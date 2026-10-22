@@ -9,6 +9,8 @@ conformance claim, or statement that a goal is "achieved".
 |---|---|---|
 | S1: hazard scenarios | 実装あり未検証 | Initial hazard analysis is recorded in `docs/SAFETY_ANALYSIS.md`. It is a repository-based design artifact only; deployment hazards, likelihood, impact, and control effectiveness require asset-specific review and tests. |
 | S2: profile safety states | 実装あり未検証 | Proposed IT/data-center, factory/OT, and government/high-control states are in `docs/SAFETY_STATES.md`. They are not operationally enforced or finally approved; review checklist and representative recovery/non-interference tests remain open. |
+| S3: active-isolation impact preview | 部分実装・未検証 | A preview helper remains for tests/reference but is not exposed in the live path. Active enforcement is disabled because startup-only consent is not per-event approval. No profile or deployment is authorized by this change. |
+| S4: operator-approved response | 未実装・fail-closed | Threat detections do not dispatch active isolation. They set `APPROVAL_REQUIRED`; `--no-dry-run`, panel `[3]`, and direct non-dry-run kill-switch calls are refused. Per-event approval, audit custody, and an operator action to resolve pending state remain unimplemented. |
 
 ## A. nftables compatibility
 - `destroy table` removed from `mk1_firewall.py` / `mk1_quarantine.py`.
@@ -34,3 +36,18 @@ sensitive operations when ML-DSA-87 is unavailable, maintain quarantine, and
 allow observation-only operation. Ed25519-only fallback requires explicit
 two-person opt-in and must remain visibly identified. Other historical test
 and CI statements must not be treated as current results until refreshed.
+
+## Current safety-gate validation (2026-10-22)
+
+- `python3 -m pytest -q tests/test_airgap_ai_defender.py tests/test_firewall_nft.py`:
+  141 passed, 21 skipped, 4 subtests passed.
+- `python3 -m py_compile airgap_ai_defender.py mk1_firewall.py mk1_quarantine.py`:
+  passed.
+- `make panel`: fresh rebuild passed with `-Wall -Wextra -Werror`.
+- `make test`: native runner and unit tests passed; liboqs and C ML-KEM-768
+  were skipped because liboqs is not installed.
+- `python3 airgap_ai_defender.py --no-dry-run`: refused with the expected
+  per-event approval-not-implemented error.
+- `git diff --check`: passed.
+- CI, privileged netns tests, hardware, and OT/non-interference tests have not
+  been run for this change.

@@ -442,8 +442,10 @@ import signal as _signal_module
 _CRYPTO_LOG_COOLDOWN = 0.0
 _BACKDOOR_RISK_SCORE = 0.0
 _KILL_SWITCH_TRIGGERED = False
+_ISOLATION_APPROVAL_PENDING = False
 _KILL_SWITCH_COOLDOWN_SEC = 5.0
 _LAST_KILL_SWITCH_TRIGGER = 0.0
+_ACTIVE_ISOLATION_CONFIRMATION = "ENABLE ACTIVE ISOLATION"
 _MONITOR_INTERFACE = "eth0"
 _DRY_RUN = True
 
@@ -5113,11 +5115,7 @@ _TRAIN_QUEUE_MAX_BATCHES = 10
 _train_queue: queue.Queue = queue.Queue(maxsize=_TRAIN_QUEUE_MAX_BATCHES)
 
 
- codespace-probable-dollop-pj64p66j94jv29wg6
-def _enqueue_training_batch(batch: list, wait_timeout: float = 1.0) -> bool:
-
 def _enqueue_training_batch(batch: list) -> bool:
- main
     if not batch or not _LOCAL_ADAPTATION_ENABLED:
         return True
     try:
@@ -5282,8 +5280,10 @@ def handle_admin_recovery_signal(token: str | None = None, interface: str | None
         _run_command_with_sudo(["ip", "link", "set", "lo", "up"], dry_run=False)
 
     with _CONTAINMENT_LOCK:
-        global _KILL_SWITCH_TRIGGERED, _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _BACKDOOR_RISK_SCORE
+        global _KILL_SWITCH_TRIGGERED, _ISOLATION_APPROVAL_PENDING
+        global _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _BACKDOOR_RISK_SCORE
         _KILL_SWITCH_TRIGGERED = False
+        _ISOLATION_APPROVAL_PENDING = False
         _LAST_KILL_SWITCH_TRIGGER = 0.0
         _anomaly_counter = 0
         _BACKDOOR_RISK_SCORE = 0.0
@@ -5311,8 +5311,9 @@ def _apply_anomaly_decay(now: float | None = None) -> tuple[float, bool]:
 
 def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float = 0.0,
                           backdoor_detected: bool = False, backdoor_boost: float = 0.0) -> bool:
-    """バックドア/異常スコアを評価して必要なら即座にキルスイッチを発動する。"""
-    global _KILL_SWITCH_TRIGGERED, _LAST_KILL_SWITCH_TRIGGER, _anomaly_counter, _LAST_THREAT_SCORE
+    """Threats are advisory; active isolation waits for per-event operator approval."""
+    global _ISOLATION_APPROVAL_PENDING, _LAST_KILL_SWITCH_TRIGGER
+    global _anomaly_counter, _LAST_THREAT_SCORE
     _LAST_THREAT_SCORE = max(0.0, min(0.99, float(score_a)))
 
     if is_learning_mode() and (backdoor_detected or backdoor_boost > 0.0 or score_a >= 0.95):
@@ -5345,17 +5346,25 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
         if should_trigger:
             if effective_dry_run:
                 log.warning("[MAINTENANCE] メンテナンス状態のため、遮断処理は Dry-Run として扱います。")
-            elif mk1_secure_transport is not None:
-                mk1_secure_transport.set_transport_enabled(False)
-            log.info(f"キルスイッチ発動 スコア={effective_score:.3f}, backdoor={backdoor_detected}, consecutive={_anomaly_counter}")
             _KILL_SWITCH_EVENT.set()
-            management_route = _configured_management_route()
-            if not _dispatch_privileged_command(
-                "kill_switch", interface=interface, dry_run=effective_dry_run, **management_route,
-            ):
-                execute_kill_switch(interface, effective_dry_run, **management_route)
-            _KILL_SWITCH_TRIGGERED = True
             _LAST_KILL_SWITCH_TRIGGER = now
+            if effective_dry_run:
+                log.info(
+                    "脅威イベントを検出しました。Dry-Runのため実遮断は行いません "
+                    "(score=%.3f, backdoor=%s, consecutive=%d)",
+                    effective_score, backdoor_detected, _anomaly_counter,
+                )
+                management_route = _configured_management_route()
+                if not _dispatch_privileged_command(
+                    "kill_switch", interface=interface, dry_run=True, **management_route,
+                ):
+                    execute_kill_switch(interface, True, **management_route)
+            else:
+                _ISOLATION_APPROVAL_PENDING = True
+                log.error(
+                    "[ISOLATION] 検知を記録しましたが、イベントごとの管理者承認機能が未実装のため"
+                    "実遮断は行いません。承認待ちとして扱います。"
+                )
             return True
     return False
 
@@ -5704,9 +5713,15 @@ def _publish_threat_map_event(packet_bytes: bytes, reason: str, threat_score: fl
 
 def execute_kill_switch(interface: str | None, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
     """
-    異常検知時にOSのファイアウォール/ネットワーク機能による隔離を試みます。
-    失敗しても次のコマンドを続ける fail-safe 方式です。
+    Render a dry-run containment plan; active enforcement is disabled pending
+    a per-event operator-approval workflow.
     """
+    if not dry_run:
+        log.error(
+            "[AIRGAP] イベントごとの管理者承認が未実装のため、実遮断を拒否しました。"
+        )
+        return False
+
     if available_interfaces is None:
         available_interfaces = discover_available_interfaces()
 
@@ -5714,36 +5729,9 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
         containment_mode = "management_safe_harbor"
         log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
 
-    if not dry_run:
-        policy_applied = _apply_nft_policy_with_sudo(
-            containment_mode,
-            management_ips or (),
-            management_ports or (),
-        )
-        state_persisted = _persist_quarantine_state()
-        if not policy_applied or not state_persisted:
-            disable_all_network_paths()
-            log.error("[AIRGAP] nftables隔離または永続状態を確認できません。隔離完了とは扱いません。")
-            return False
-
-    if _PANEL_FULL_ISOLATION and not dry_run:
-        if containment_mode != "full_isolation":
-            log.warning("[AIRGAP] TCP管理safe-harborを適用しました。NIC停止は行いません。")
-            return True
-        if disable_all_network_paths():
-            log.critical("[AIRGAP] NIC・無線・USBネットワーク・モデム・Thunderboltの無効化を確認しました。")
-            _close_panel_after_airgap()
-            return True
-        else:
-            log.error("[AIRGAP] 全経路の無効化を確認できませんでした。隔離完了とは扱いません。")
-            return False
- codespace-probable-dollop-pj64p66j94jv29wg6
-
-
     if containment_mode == "full_isolation" and (management_ports or management_ips):
         containment_mode = "management_safe_harbor"
         log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
- main
 
     containment_plan = build_containment_plan(
         interface,
@@ -6429,12 +6417,69 @@ def _build_argument_parser(config: dict | None = None, config_path: str = "./ai_
     parser.add_argument("--rsi", action="store_true", help="Recursive Self-ImprovementをGoogle Colabへ委託")
     parser.add_argument("--mode", choices=("normal", "RSI", "rsi"), default=config.get("mode", "normal"), help="実行モード")
     parser.add_argument("--install-deps", action="store_true", help="起動前に不足している依存ライブラリを自動インストールします")
-    parser.add_argument("--no-dry-run",     action="store_true", help="指定すると実際にNICをダウンさせます(危険！)")
+    parser.add_argument("--no-dry-run", action="store_true",
+                        help="現在はイベントごとの管理者承認機能が未実装のため拒否されます")
+    parser.add_argument(
+        "--active-isolation-confirmation",
+        choices=(_ACTIVE_ISOLATION_CONFIRMATION,),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--allow-oni-signal", action="store_true",
                         default=config.get("allow_oni_signal", False),
                         help="SIGUSR1 による鬼モード(ONI_MODE)の切替を許可します(既定は無効)")
     parser.add_argument("--restore-hardening", action="store_true", help="保存済みの sysctl バックアップを書き戻して終了")
     return parser
+
+
+def _confirm_active_isolation(
+    interface: str,
+    available_interfaces: list[str],
+    management_ips: list[str],
+    management_ports: list[int],
+    *,
+    panel_parent_pid: int = 0,
+    panel_confirmation: str | None = None,
+    input_func=input,
+) -> bool:
+    """Require a visible impact preview and explicit confirmation before active mode."""
+    interfaces = sorted({
+        item for item in available_interfaces
+        if isinstance(item, str) and item and item != "lo"
+    })
+    mode = (
+        "management_safe_harbor"
+        if management_ips or management_ports else "full_isolation"
+    )
+    print("実遮断の影響範囲 (実行前プレビュー; この表示自体は設定を変更しません):")
+    print(f"  監視インターフェース: {interface}")
+    print(f"  対象として検出したネットワークインターフェース: {', '.join(interfaces) or '不明'}")
+    print(f"  適用予定ポリシー: {mode}")
+    if mode == "management_safe_harbor":
+        print(f"  維持を試みる管理IP: {', '.join(management_ips) or '未指定'}")
+        print(f"  維持を試みるTCPポート: {', '.join(map(str, management_ports)) or '未指定'}")
+    print("  影響: ファイアウォールが変更され、SSHを含む通信・遠隔管理が切断される可能性があります。")
+    print("  未列挙の無線/USBネットワーク/モデム/Thunderbolt経路はこのプレビューで保証されません。")
+
+    if panel_parent_pid > 0:
+        confirmed = panel_confirmation == _ACTIVE_ISOLATION_CONFIRMATION
+    else:
+        if not sys.stdin.isatty():
+            print("対話端末がないため実遮断を拒否しました。", file=sys.stderr)
+            return False
+        try:
+            entered = input_func(
+                f"続行する場合は {_ACTIVE_ISOLATION_CONFIRMATION} と正確に入力してください: "
+            )
+        except (EOFError, OSError):
+            return False
+        confirmed = hmac.compare_digest(
+            entered.strip(),
+            _ACTIVE_ISOLATION_CONFIRMATION,
+        )
+
+    if not confirmed:
+        print("確認文字列が一致しないため、実遮断を拒否しました。", file=sys.stderr)
+    return confirmed
 
 
 def _format_compact_status(ram_mb: float, ram_limit_mb: int, swap_mb: float,
@@ -6476,6 +6521,8 @@ def _write_panel_status(
     threat_score = max(0.0, min(1.0, float(_LAST_THREAT_SCORE)))
     if _KILL_SWITCH_TRIGGERED:
         alert = "AIRGAP"
+    elif _ISOLATION_APPROVAL_PENDING:
+        alert = "APPROVAL_REQUIRED"
     elif backdoor_score >= 0.35:
         alert = "BACKDOOR"
     elif threat_score >= 0.75:
@@ -6489,6 +6536,7 @@ def _write_panel_status(
         f"threat_score={threat_score:.3f}\n"
         f"backdoor_score={backdoor_score:.3f}\n"
         f"isolation_active={int(bool(_KILL_SWITCH_TRIGGERED))}\n"
+        f"isolation_approval_pending={int(bool(_ISOLATION_APPROVAL_PENDING))}\n"
         f"mode={mode}\n"
         f"dry_run={int(bool(dry_run))}\n"
         f"secure_tunnel_active={int(bool(mk1_secure_transport and mk1_secure_transport.transport_is_enabled()))}\n"
@@ -6549,13 +6597,17 @@ def main():
     parser = _build_argument_parser(runtime_config, config_path=pre_args.config)
     args = parser.parse_args()
 
+    if args.no_dry_run:
+        parser.error(
+            "実遮断はイベントごとの管理者承認機能が未実装のため無効です"
+        )
+    if args.active_isolation_confirmation and not args.no_dry_run:
+        parser.error("--active-isolation-confirmation は --no-dry-run と併用してください")
     if args.validation_only and not _LOCAL_ADAPTATION_ENABLED:
         log.error("[検証] ローカル適応学習は必要な署名・安全対策がないため実行できません。")
         return 3
- codespace-probable-dollop-pj64p66j94jv29wg6
 
 
- main
     if args.ignore_model_hash and not TORCH_AVAILABLE:
         parser.error("--ignore-model-hash requires PyTorch; model loading is disabled without it")
 
@@ -6574,6 +6626,7 @@ def main():
     if args.panel_parent_pid < 0:
         parser.error("--panel-parent-pid は0以上で指定してください")
     _PANEL_PARENT_PID = args.panel_parent_pid
+    rsi_requested = args.rsi or args.mode.upper() == "RSI"
     if "colab_endpoint" in runtime_config:
         os.environ["COLAB_RSI_ENDPOINT"] = runtime_config["colab_endpoint"]
     if "colab_pq_public_key_sha256" in runtime_config:
@@ -6586,7 +6639,6 @@ def main():
         parser.error("--ram-limit/--max-memory-mb は1以上で指定してください")
     if args.max_samples < 1:
         parser.error("--max-samples は1以上で指定してください")
-    rsi_requested = args.rsi or args.mode.upper() == "RSI"
     configured_endpoint = os.environ.get("COLAB_RSI_ENDPOINT", "").strip()
     if rsi_requested and configured_endpoint:
         public_key_pin = os.environ.get("COLAB_RSI_PQ_PUBLIC_KEY_SHA256", "").strip()
@@ -6600,8 +6652,8 @@ def main():
             parser.error(f"RSI通信を開始できません。WireGuard full-tunnelが必要です: {exc}")
     rsi_token = runtime_config.get("model_sync_token") or os.environ.get("COLAB_RSI_TOKEN", "")
     _RSI_MODE_ACTIVE = rsi_requested
-    dry_run = not args.no_dry_run or rsi_requested
-    _PANEL_FULL_ISOLATION = bool(args.panel_parent_pid > 0 and not dry_run)
+    dry_run = True
+    _PANEL_FULL_ISOLATION = False
     if args.validation_only:
         os.makedirs(args.local_dir, exist_ok=True)
         rsi_model = None
@@ -6635,7 +6687,7 @@ def main():
     print(f"  ローカルデータ保存先: {args.local_dir}")
     print(f"  RAM上限      : {args.max_memory_mb}MB")
     print(f"  更新間隔     : {args.update_interval}秒ごとにローカルデータを再評価")
-    print(f"  Dry-Run      : {dry_run} (--no-dry-run で実遮断モード)")
+    print("  実遮断       : 無効 (イベントごとの管理者承認機能が未実装)")
     print("="*60 + "\n")
 
     # ── 初期化 ──
