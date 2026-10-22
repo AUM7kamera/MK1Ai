@@ -58,7 +58,7 @@ int mk1_ensure_private_directory(const char *path) {
     if (mkdir(path, S_IRWXU) != 0 && errno != EEXIST) return 0;
 
     int descriptor = open(
-        path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_DIRECTORY
     );
     if (descriptor < 0) return 0;
 

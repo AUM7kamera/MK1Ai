@@ -64,9 +64,11 @@ static void test_private_directory_rejects_symlinks_and_regular_files(void) {
     char target[256];
     char link_path[256];
     char regular_file[256];
+    char fifo_path[256];
     snprintf(target, sizeof(target), "%s/target", root);
     snprintf(link_path, sizeof(link_path), "%s/link", root);
     snprintf(regular_file, sizeof(regular_file), "%s/file", root);
+    snprintf(fifo_path, sizeof(fifo_path), "%s/fifo", root);
 
     assert(mkdir(target, 0700) == 0);
     assert(symlink(target, link_path) == 0);
@@ -77,9 +79,12 @@ static void test_private_directory_rejects_symlinks_and_regular_files(void) {
     assert(descriptor >= 0);
     close(descriptor);
     assert(mk1_ensure_private_directory(regular_file) == 0);
+    assert(mkfifo(fifo_path, 0600) == 0);
+    assert(mk1_ensure_private_directory(fifo_path) == 0);
 
     unlink(regular_file);
     unlink(link_path);
+    unlink(fifo_path);
     assert(rmdir(root) == 0);
 }
 
