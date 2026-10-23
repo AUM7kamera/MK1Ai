@@ -1,0 +1,3106 @@
+{
+  "classification": "repeatability diagnostic for synthetic localhost transport; not network throughput",
+  "created_utc": "2026-10-23T10:47:36Z",
+  "environments": {
+    "ai_disabled_python314": {
+      "command_template": "python scripts/throughput_component_probe.py --duration-seconds 0.5 --connection-counts 1 8 32 --output <temporary report>",
+      "scenario_statistics": {
+        "payload_1024_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 13.486041517206592,
+            "max": 935.288,
+            "median": 837.954,
+            "min": 669.469
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 2.386718624488297,
+            "max": 101.57266402249236,
+            "median": 101.1854698684733,
+            "min": 96.34240187089593
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5713643837229019,
+            "max": 56205312,
+            "median": 55730176,
+            "min": 55431168
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 4.4207126196631785,
+            "max": 11586136.75073928,
+            "median": 11283447.790846935,
+            "min": 10427503.683971167
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 4.4207126196631785,
+            "max": 1414.3233338304785,
+            "median": 1377.37399790612,
+            "min": 1272.8886332972615
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 1.7575860232900438,
+            "max": 1062.9789999999996,
+            "median": 1025.0851999999998,
+            "min": 1023.57415
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 23.708397515445554,
+            "max": 2173.459929999999,
+            "median": 1692.8846000000024,
+            "min": 1193.95358
+          }
+        },
+        "payload_1024_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 34.52383558662561,
+            "max": 4124008.12075,
+            "median": 2095824.32855,
+            "min": 2093356.45335
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 3.415844189147693,
+            "max": 119.9943186013917,
+            "median": 113.25705639519951,
+            "min": 110.71136659094962
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.41937848920556786,
+            "max": 59715584,
+            "median": 59412480,
+            "min": 59105280
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 5.5493228822793546,
+            "max": 8630776.88899766,
+            "median": 8027643.15129125,
+            "min": 7536413.680855674
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 5.5493228822793546,
+            "max": 1053.561631957722,
+            "median": 979.9369081166077,
+            "min": 919.9723731513274
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 32.471843305865114,
+            "max": 83964.52865,
+            "median": 45098.5915,
+            "min": 43588.390400000004
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 32.52427510979797,
+            "max": 87423.45143000002,
+            "median": 46140.906030000006,
+            "min": 46077.50977
+          }
+        },
+        "payload_1024_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 69.78116968700391,
+            "max": 1067539.2256,
+            "median": 1056709.2449,
+            "min": 9376.854
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 4.081890239359917,
+            "max": 122.48382481447413,
+            "median": 117.31828811443708,
+            "min": 110.82324659924687
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5386873866975062,
+            "max": 56782848,
+            "median": 56356864,
+            "min": 56041472
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 4.870034204362138,
+            "max": 8949946.081717625,
+            "median": 8451016.860363526,
+            "min": 7942224.223885836
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 4.870034204362138,
+            "max": 1092.522715053421,
+            "median": 1031.6182690873445,
+            "min": 969.509792954814
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 20.13857939606306,
+            "max": 17612.4653,
+            "median": 12652.742199999997,
+            "min": 11101.390049999996
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 20.365429865037,
+            "max": 19911.135540000003,
+            "median": 14237.44332,
+            "min": 12494.63115
+          }
+        },
+        "payload_128_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 67.29904285549503,
+            "max": 2591.977,
+            "median": 768.965,
+            "min": 627.208
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 0.9622236295644548,
+            "max": 102.86205175167187,
+            "median": 102.08247712448113,
+            "min": 100.50670539397144
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5111633443277295,
+            "max": 54542336,
+            "median": 54124544,
+            "min": 53870592
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 2.239249081612759,
+            "max": 2243961.688665008,
+            "median": 2160502.3925694143,
+            "min": 2128236.5563702243
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 2.239249081612759,
+            "max": 2191.368836586922,
+            "median": 2109.8656177435687,
+            "min": 2078.356012080297
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 5.2089426606746345,
+            "max": 664.3234,
+            "median": 645.9205,
+            "min": 587.0798
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 17.5184498105257,
+            "max": 1052.3274799999997,
+            "median": 869.4959999999983,
+            "min": 680.1644399999993
+          }
+        },
+        "payload_128_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 45.619693894084946,
+            "max": 4099210.2437,
+            "median": 3113157.9590499997,
+            "min": 1073435.12995
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 3.2712335156879018,
+            "max": 128.37617582173152,
+            "median": 127.3316407576274,
+            "min": 119.22851841904918
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5153761834140027,
+            "max": 58093568,
+            "median": 57581568,
+            "min": 57389056
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 0.6392655502485695,
+            "max": 1434661.1086176157,
+            "median": 1434090.035201649,
+            "min": 1415018.0095543754
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 0.6392655502485695,
+            "max": 1401.0362388843903,
+            "median": 1400.4785500016103,
+            "min": 1381.8535249554448
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 2.099064852248429,
+            "max": 34991.270449999996,
+            "median": 34264.3526,
+            "min": 33242.824850000005
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 3.612269173808432,
+            "max": 37930.21453999999,
+            "median": 36616.525779999996,
+            "min": 34724.6893
+          }
+        },
+        "payload_128_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 136.86239797316972,
+            "max": 1049468.7314499998,
+            "median": 11895.5965,
+            "min": 11154.176249999999
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 1.3062567516036812,
+            "max": 114.23015239452106,
+            "median": 111.27936915788767,
+            "min": 110.98562889312993
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5076821450342917,
+            "max": 55218176,
+            "median": 54779904,
+            "min": 54546432
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 2.1015247521899147,
+            "max": 1414294.2128664614,
+            "median": 1401778.3311626508,
+            "min": 1347127.940640781
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 2.1015247521899147,
+            "max": 1381.1466922524037,
+            "median": 1368.9241515260262,
+            "min": 1315.5546295320128
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 3.1197660660497006,
+            "max": 9845.079199999996,
+            "median": 9291.828399999999,
+            "min": 9168.050899999998
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 7.882421533923374,
+            "max": 13422.5809,
+            "median": 11516.867179999997,
+            "min": 11304.74053
+          }
+        },
+        "payload_1518_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 24.674851373031554,
+            "max": 1147.331,
+            "median": 909.597,
+            "min": 610.98
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 0.8581331583438857,
+            "max": 102.8191760550559,
+            "median": 102.48047029878798,
+            "min": 100.81564767375917
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.4291502917779996,
+            "max": 57188352,
+            "median": 56893440,
+            "min": 56590336
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 4.3431760294109365,
+            "max": 15877009.581647303,
+            "median": 15451452.024855237,
+            "min": 14311893.854820894
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 4.343176029410932,
+            "max": 1307.3953871580454,
+            "median": 1272.3527688451281,
+            "min": 1178.5156336314967
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 10.181970439599047,
+            "max": 1217.3227999999992,
+            "median": 991.414399999998,
+            "min": 983.726
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 21.223167404201128,
+            "max": 1722.7111299999997,
+            "median": 1530.5986400000002,
+            "min": 1009.021
+          }
+        },
+        "payload_1518_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 32.81663179855825,
+            "max": 2095132.6042499999,
+            "median": 1100959.52015,
+            "min": 1096935.5218
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 3.839036991403256,
+            "max": 116.76060318712642,
+            "median": 113.76165327069334,
+            "min": 106.48898657993173
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.38213027665284477,
+            "max": 60084224,
+            "median": 59715584,
+            "min": 59535360
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 4.763278029004841,
+            "max": 11105505.519709645,
+            "median": 10756360.127017085,
+            "min": 9904605.73779186
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 4.763278029004843,
+            "max": 914.4849736256296,
+            "median": 885.7345295633304,
+            "min": 815.5966516627026
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 22.765141138201084,
+            "max": 87492.59225,
+            "median": 56710.7393,
+            "min": 54441.9118
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 22.364557089909955,
+            "max": 88469.41491,
+            "median": 57396.14013,
+            "min": 55813.8894
+          }
+        },
+        "payload_1518_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 136.8760331003821,
+            "max": 1052459.6217,
+            "median": 11786.366499999998,
+            "min": 11258.38065
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 0.8241756479252977,
+            "max": 120.51751335817231,
+            "median": 118.5461760602004,
+            "min": 118.3386475544036
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.4249586339458088,
+            "max": 57749504,
+            "median": 57454592,
+            "min": 57151488
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 0.6179195741789758,
+            "max": 11748055.245810833,
+            "median": 11604477.183335096,
+            "min": 11587688.889233481
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 0.6179195741789761,
+            "max": 967.3958535746733,
+            "median": 955.5728905908346,
+            "min": 954.1904553057873
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 4.96745254914907,
+            "max": 14783.1308,
+            "median": 13583.7927,
+            "min": 13159.371449999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 4.067426353288072,
+            "max": 15471.51771,
+            "median": 15049.888310000002,
+            "min": 14032.413680000001
+          }
+        },
+        "payload_256_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 17.53873189675968,
+            "max": 1065.769,
+            "median": 751.573,
+            "min": 744.622
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 2.7404818261629944,
+            "max": 103.09909518276616,
+            "median": 101.50961782174055,
+            "min": 96.63150347385402
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5530853785126121,
+            "max": 55590912,
+            "median": 55070720,
+            "min": 54865920
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 5.083544765822691,
+            "max": 4055195.793338794,
+            "median": 3720633.318772192,
+            "min": 3599391.0287973764
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 5.083544765822691,
+            "max": 1980.076070966208,
+            "median": 1816.7154876817344,
+            "min": 1757.515150779969
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 5.065682484956077,
+            "max": 780.6718999999998,
+            "median": 756.4404,
+            "min": 691.5341
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 31.224543326683406,
+            "max": 1473.6340000000005,
+            "median": 843.6461599999996,
+            "min": 755.41155
+          }
+        },
+        "payload_256_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 1.2508710836965853,
+            "max": 2112706.8872499997,
+            "median": 2108038.2715,
+            "min": 2055010.9942
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 4.968006701692585,
+            "max": 125.95774279261467,
+            "median": 115.32219742507202,
+            "min": 112.30633957066058
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5557444514033313,
+            "max": 58368000,
+            "median": 57835520,
+            "min": 57597952
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 3.999606301899198,
+            "max": 2658389.6066863923,
+            "median": 2458067.872235583,
+            "min": 2433734.7728016484
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 3.999606301899198,
+            "max": 1298.04180013984,
+            "median": 1200.2284532400308,
+            "min": 1188.3470570320549
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 14.328629632396817,
+            "max": 46136.59164999999,
+            "median": 35613.54289999999,
+            "min": 33563.9368
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 15.539365604173849,
+            "max": 52906.29842999998,
+            "median": 38611.9847,
+            "min": 38604.79186999998
+          }
+        },
+        "payload_256_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 138.07847631582257,
+            "max": 1050046.77445,
+            "median": 9538.49095,
+            "min": 7274.840049999999
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 0.5694095475541949,
+            "max": 125.17030698029382,
+            "median": 124.35583988603072,
+            "min": 123.43736164188952
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5644118837705124,
+            "max": 56221696,
+            "median": 55689216,
+            "min": 55472128
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 1.682063530848756,
+            "max": 2763842.7182809566,
+            "median": 2746498.6274286257,
+            "min": 2659170.580486014
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 1.682063530848756,
+            "max": 1349.5325772856233,
+            "median": 1341.0637829241336,
+            "min": 1298.4231350029365
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 1.4265474330046783,
+            "max": 8969.4561,
+            "median": 8730.820899999997,
+            "min": 8682.465499999993
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 3.5622146713719167,
+            "max": 11675.116530000005,
+            "median": 10876.846379999999,
+            "min": 10798.72571
+          }
+        },
+        "payload_512_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 0.724949844896293,
+            "max": 766.14,
+            "median": 760.371,
+            "min": 752.694
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 0.7619038424574759,
+            "max": 102.65490488231843,
+            "median": 101.23749439493596,
+            "min": 100.85588107656758
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5950544629082142,
+            "max": 55865344,
+            "median": 55312384,
+            "min": 55078912
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 4.137909426976031,
+            "max": 7250796.714694006,
+            "median": 6784476.118412146,
+            "min": 6569981.393601965
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 4.137909426976031,
+            "max": 1770.2140416733414,
+            "median": 1656.3662398467154,
+            "min": 1603.9993636723548
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 7.679073412185603,
+            "max": 870.0096499999997,
+            "median": 863.581,
+            "min": 732.97825
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 8.898330379753176,
+            "max": 1204.441,
+            "median": 1069.6811900000002,
+            "min": 969.6213000000007
+          }
+        },
+        "payload_512_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 134.5921088733333,
+            "max": 2051511.75105,
+            "median": 34673.07205,
+            "min": 33569.12505
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 0.9524676894826941,
+            "max": 124.00723418406558,
+            "median": 123.1073515864481,
+            "min": 121.20228999571623
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.546207523150227,
+            "max": 58728448,
+            "median": 58257408,
+            "min": 57954304
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 0.8689488799823439,
+            "max": 4911074.857088261,
+            "median": 4845457.62610252,
+            "min": 4809124.8769529415
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 0.8689488799823439,
+            "max": 1198.9928850313138,
+            "median": 1182.9730532476856,
+            "min": 1174.1027531623392
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 2.700649234079201,
+            "max": 41225.0902,
+            "median": 39387.6283,
+            "min": 38676.30314999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 3.3577668517974537,
+            "max": 43711.192109999996,
+            "median": 41957.29212,
+            "min": 40258.909
+          }
+        },
+        "payload_512_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 69.72680354288966,
+            "max": 1058656.11835,
+            "median": 1058461.3225500002,
+            "min": 9865.015849999998
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 2.2488843130426273,
+            "max": 124.75734175795343,
+            "median": 123.64413360827922,
+            "min": 118.44731555088156
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5769988472396723,
+            "max": 56463360,
+            "median": 55918592,
+            "min": 55693312
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 1.5729093347815266,
+            "max": 5011460.006465804,
+            "median": 5010285.11265805,
+            "min": 4845519.761253955
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 1.5729093347815266,
+            "max": 1223.5009781410654,
+            "median": 1223.2141388325317,
+            "min": 1182.9882229623913
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 8.813658842711506,
+            "max": 11042.59195,
+            "median": 10763.815549999994,
+            "min": 8998.614599999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 9.650190471812383,
+            "max": 13305.61359,
+            "median": 11987.234279999999,
+            "min": 10488.22769
+          }
+        },
+        "payload_64_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 13.545717161748854,
+            "max": 1201.715,
+            "median": 1012.977,
+            "min": 862.122
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 1.528379040682528,
+            "max": 103.29354904245633,
+            "median": 100.64289616336018,
+            "min": 99.62444515327323
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.45996548198982995,
+            "max": 53444608,
+            "median": 53121024,
+            "min": 52846592
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 3.9837439522735876,
+            "max": 1225849.7353669265,
+            "median": 1133539.959297482,
+            "min": 1122850.429254945
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 3.9837439522735876,
+            "max": 2394.2377643885284,
+            "median": 2213.9452330028944,
+            "min": 2193.0672446385643
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 2.2718317082328974,
+            "max": 627.5500999999999,
+            "median": 606.7538,
+            "min": 593.9526000000001
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 31.27513171895457,
+            "max": 1537.537999999986,
+            "median": 1347.2785700000015,
+            "min": 673.0393800000003
+          }
+        },
+        "payload_64_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 27.46250223762573,
+            "max": 2133053.87905,
+            "median": 2064738.20285,
+            "min": 1076412.5946
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 2.7429948730075138,
+            "max": 126.58283008238176,
+            "median": 124.07284277856931,
+            "min": 118.50554554120849
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.48727416198646456,
+            "max": 57040896,
+            "median": 56635392,
+            "min": 56369152
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 2.701287614920136,
+            "max": 758624.0078404284,
+            "median": 732977.5683095454,
+            "min": 710089.803391103
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 2.701287614920136,
+            "max": 1481.6875153133367,
+            "median": 1431.5968131045809,
+            "min": 1386.8941472482481
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 15.23591621327623,
+            "max": 45914.00549999999,
+            "median": 34407.82124999999,
+            "min": 33090.261399999996
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 16.247585356429077,
+            "max": 51651.85896,
+            "median": 37476.211319999995,
+            "min": 36889.56746
+          }
+        },
+        "payload_64_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 3.166797344413969,
+            "max": 9265.91745,
+            "median": 9008.39915,
+            "min": 8578.73395
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 3.793684581579118,
+            "max": 129.19013303439357,
+            "median": 119.73737615009412,
+            "min": 118.95267548716156
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.5037032335502429,
+            "max": 54173696,
+            "median": 53776384,
+            "min": 53514240
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 0.6041563749648621,
+            "max": 777101.2136094087,
+            "median": 774923.0742701249,
+            "min": 766289.5325842855
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 0.6041563749648621,
+            "max": 1517.7758078308764,
+            "median": 1513.5216294338377,
+            "min": 1496.6592433286826
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 9.850883033500422,
+            "max": 9981.404299999991,
+            "median": 8584.776849999998,
+            "min": 7892.4908
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 11.815888972713255,
+            "max": 12346.196789999998,
+            "median": 10521.91506,
+            "min": 9263.519839999997
+          }
+        }
+      },
+      "trials": [
+        {
+          "created_utc": "2026-10-23T10:42:26Z",
+          "package_versions": {
+            "cryptography": "50.0.2",
+            "pqcrypto": "1.0.0",
+            "torch": "not installed"
+          },
+          "python": "3.14.2",
+          "scenario_results": {
+            "payload_1024_connections_1": {
+              "authenticated_request_records": 708,
+              "authenticated_response_records": 708,
+              "failed_request_records": 0,
+              "inspection_log_records": 708,
+              "ml_kem_768_handshake_latency.p95_us": 837.954,
+              "process_cpu_percent_of_one_core": 101.57266402249236,
+              "process_rss_bytes.peak_sampled": 55730176,
+              "request_goodput_bps": 11586136.75073928,
+              "request_packets_per_second": 1414.3233338304785,
+              "request_response_rtt.p95_us": 1025.0851999999998,
+              "request_response_rtt.p99_us": 1692.8846000000024
+            },
+            "payload_1024_connections_32": {
+              "authenticated_request_records": 546,
+              "authenticated_response_records": 546,
+              "failed_request_records": 0,
+              "inspection_log_records": 546,
+              "ml_kem_768_handshake_latency.p95_us": 2095824.32855,
+              "process_cpu_percent_of_one_core": 119.9943186013917,
+              "process_rss_bytes.peak_sampled": 59412480,
+              "request_goodput_bps": 8630776.88899766,
+              "request_packets_per_second": 1053.561631957722,
+              "request_response_rtt.p95_us": 43588.390400000004,
+              "request_response_rtt.p99_us": 46077.50977
+            },
+            "payload_1024_connections_8": {
+              "authenticated_request_records": 487,
+              "authenticated_response_records": 487,
+              "failed_request_records": 0,
+              "inspection_log_records": 487,
+              "ml_kem_768_handshake_latency.p95_us": 1056709.2449,
+              "process_cpu_percent_of_one_core": 110.82324659924687,
+              "process_rss_bytes.peak_sampled": 56356864,
+              "request_goodput_bps": 7942224.223885836,
+              "request_packets_per_second": 969.509792954814,
+              "request_response_rtt.p95_us": 17612.4653,
+              "request_response_rtt.p99_us": 19911.135540000003
+            },
+            "payload_128_connections_1": {
+              "authenticated_request_records": 1097,
+              "authenticated_response_records": 1097,
+              "failed_request_records": 0,
+              "inspection_log_records": 1097,
+              "ml_kem_768_handshake_latency.p95_us": 768.965,
+              "process_cpu_percent_of_one_core": 102.86205175167187,
+              "process_rss_bytes.peak_sampled": 54124544,
+              "request_goodput_bps": 2243961.688665008,
+              "request_packets_per_second": 2191.368836586922,
+              "request_response_rtt.p95_us": 587.0798,
+              "request_response_rtt.p99_us": 680.1644399999993
+            },
+            "payload_128_connections_32": {
+              "authenticated_request_records": 713,
+              "authenticated_response_records": 713,
+              "failed_request_records": 0,
+              "inspection_log_records": 713,
+              "ml_kem_768_handshake_latency.p95_us": 4099210.2437,
+              "process_cpu_percent_of_one_core": 128.37617582173152,
+              "process_rss_bytes.peak_sampled": 57581568,
+              "request_goodput_bps": 1434090.035201649,
+              "request_packets_per_second": 1400.4785500016103,
+              "request_response_rtt.p95_us": 34264.3526,
+              "request_response_rtt.p99_us": 37930.21453999999
+            },
+            "payload_128_connections_8": {
+              "authenticated_request_records": 688,
+              "authenticated_response_records": 688,
+              "failed_request_records": 0,
+              "inspection_log_records": 688,
+              "ml_kem_768_handshake_latency.p95_us": 11895.5965,
+              "process_cpu_percent_of_one_core": 114.23015239452106,
+              "process_rss_bytes.peak_sampled": 54779904,
+              "request_goodput_bps": 1401778.3311626508,
+              "request_packets_per_second": 1368.9241515260262,
+              "request_response_rtt.p95_us": 9845.079199999996,
+              "request_response_rtt.p99_us": 13422.5809
+            },
+            "payload_1518_connections_1": {
+              "authenticated_request_records": 637,
+              "authenticated_response_records": 637,
+              "failed_request_records": 0,
+              "inspection_log_records": 637,
+              "ml_kem_768_handshake_latency.p95_us": 909.597,
+              "process_cpu_percent_of_one_core": 102.48047029878798,
+              "process_rss_bytes.peak_sampled": 56893440,
+              "request_goodput_bps": 15451452.024855237,
+              "request_packets_per_second": 1272.3527688451281,
+              "request_response_rtt.p95_us": 991.414399999998,
+              "request_response_rtt.p99_us": 1722.7111299999997
+            },
+            "payload_1518_connections_32": {
+              "authenticated_request_records": 420,
+              "authenticated_response_records": 420,
+              "failed_request_records": 0,
+              "inspection_log_records": 420,
+              "ml_kem_768_handshake_latency.p95_us": 2095132.6042499999,
+              "process_cpu_percent_of_one_core": 106.48898657993173,
+              "process_rss_bytes.peak_sampled": 59715584,
+              "request_goodput_bps": 9904605.73779186,
+              "request_packets_per_second": 815.5966516627026,
+              "request_response_rtt.p95_us": 87492.59225,
+              "request_response_rtt.p99_us": 88469.41491
+            },
+            "payload_1518_connections_8": {
+              "authenticated_request_records": 480,
+              "authenticated_response_records": 480,
+              "failed_request_records": 0,
+              "inspection_log_records": 480,
+              "ml_kem_768_handshake_latency.p95_us": 1052459.6217,
+              "process_cpu_percent_of_one_core": 118.5461760602004,
+              "process_rss_bytes.peak_sampled": 57454592,
+              "request_goodput_bps": 11587688.889233481,
+              "request_packets_per_second": 954.1904553057873,
+              "request_response_rtt.p95_us": 14783.1308,
+              "request_response_rtt.p99_us": 15471.51771
+            },
+            "payload_256_connections_1": {
+              "authenticated_request_records": 879,
+              "authenticated_response_records": 879,
+              "failed_request_records": 0,
+              "inspection_log_records": 879,
+              "ml_kem_768_handshake_latency.p95_us": 1065.769,
+              "process_cpu_percent_of_one_core": 96.63150347385402,
+              "process_rss_bytes.peak_sampled": 55070720,
+              "request_goodput_bps": 3599391.0287973764,
+              "request_packets_per_second": 1757.515150779969,
+              "request_response_rtt.p95_us": 780.6718999999998,
+              "request_response_rtt.p99_us": 1473.6340000000005
+            },
+            "payload_256_connections_32": {
+              "authenticated_request_records": 608,
+              "authenticated_response_records": 608,
+              "failed_request_records": 0,
+              "inspection_log_records": 608,
+              "ml_kem_768_handshake_latency.p95_us": 2108038.2715,
+              "process_cpu_percent_of_one_core": 112.30633957066058,
+              "process_rss_bytes.peak_sampled": 57835520,
+              "request_goodput_bps": 2433734.7728016484,
+              "request_packets_per_second": 1188.3470570320549,
+              "request_response_rtt.p95_us": 33563.9368,
+              "request_response_rtt.p99_us": 38604.79186999998
+            },
+            "payload_256_connections_8": {
+              "authenticated_request_records": 652,
+              "authenticated_response_records": 652,
+              "failed_request_records": 0,
+              "inspection_log_records": 652,
+              "ml_kem_768_handshake_latency.p95_us": 9538.49095,
+              "process_cpu_percent_of_one_core": 124.35583988603072,
+              "process_rss_bytes.peak_sampled": 55689216,
+              "request_goodput_bps": 2659170.580486014,
+              "request_packets_per_second": 1298.4231350029365,
+              "request_response_rtt.p95_us": 8682.465499999993,
+              "request_response_rtt.p99_us": 10876.846379999999
+            },
+            "payload_512_connections_1": {
+              "authenticated_request_records": 829,
+              "authenticated_response_records": 829,
+              "failed_request_records": 0,
+              "inspection_log_records": 829,
+              "ml_kem_768_handshake_latency.p95_us": 752.694,
+              "process_cpu_percent_of_one_core": 101.23749439493596,
+              "process_rss_bytes.peak_sampled": 55312384,
+              "request_goodput_bps": 6784476.118412146,
+              "request_packets_per_second": 1656.3662398467154,
+              "request_response_rtt.p95_us": 870.0096499999997,
+              "request_response_rtt.p99_us": 1069.6811900000002
+            },
+            "payload_512_connections_32": {
+              "authenticated_request_records": 608,
+              "authenticated_response_records": 608,
+              "failed_request_records": 0,
+              "inspection_log_records": 608,
+              "ml_kem_768_handshake_latency.p95_us": 2051511.75105,
+              "process_cpu_percent_of_one_core": 123.1073515864481,
+              "process_rss_bytes.peak_sampled": 58257408,
+              "request_goodput_bps": 4845457.62610252,
+              "request_packets_per_second": 1182.9730532476856,
+              "request_response_rtt.p95_us": 39387.6283,
+              "request_response_rtt.p99_us": 41957.29212
+            },
+            "payload_512_connections_8": {
+              "authenticated_request_records": 615,
+              "authenticated_response_records": 615,
+              "failed_request_records": 0,
+              "inspection_log_records": 615,
+              "ml_kem_768_handshake_latency.p95_us": 9865.015849999998,
+              "process_cpu_percent_of_one_core": 123.64413360827922,
+              "process_rss_bytes.peak_sampled": 55918592,
+              "request_goodput_bps": 5010285.11265805,
+              "request_packets_per_second": 1223.2141388325317,
+              "request_response_rtt.p95_us": 8998.614599999999,
+              "request_response_rtt.p99_us": 10488.22769
+            },
+            "payload_64_connections_1": {
+              "authenticated_request_records": 1108,
+              "authenticated_response_records": 1108,
+              "failed_request_records": 0,
+              "inspection_log_records": 1108,
+              "ml_kem_768_handshake_latency.p95_us": 1201.715,
+              "process_cpu_percent_of_one_core": 99.62444515327323,
+              "process_rss_bytes.peak_sampled": 53121024,
+              "request_goodput_bps": 1133539.959297482,
+              "request_packets_per_second": 2213.9452330028944,
+              "request_response_rtt.p95_us": 627.5500999999999,
+              "request_response_rtt.p99_us": 1347.2785700000015
+            },
+            "payload_64_connections_32": {
+              "authenticated_request_records": 756,
+              "authenticated_response_records": 756,
+              "failed_request_records": 0,
+              "inspection_log_records": 756,
+              "ml_kem_768_handshake_latency.p95_us": 2064738.20285,
+              "process_cpu_percent_of_one_core": 126.58283008238176,
+              "process_rss_bytes.peak_sampled": 56635392,
+              "request_goodput_bps": 758624.0078404284,
+              "request_packets_per_second": 1481.6875153133367,
+              "request_response_rtt.p95_us": 33090.261399999996,
+              "request_response_rtt.p99_us": 36889.56746
+            },
+            "payload_64_connections_8": {
+              "authenticated_request_records": 762,
+              "authenticated_response_records": 762,
+              "failed_request_records": 0,
+              "inspection_log_records": 762,
+              "ml_kem_768_handshake_latency.p95_us": 9008.39915,
+              "process_cpu_percent_of_one_core": 129.19013303439357,
+              "process_rss_bytes.peak_sampled": 53776384,
+              "request_goodput_bps": 777101.2136094087,
+              "request_packets_per_second": 1517.7758078308764,
+              "request_response_rtt.p95_us": 7892.4908,
+              "request_response_rtt.p99_us": 9263.519839999997
+            }
+          },
+          "trial": 1
+        },
+        {
+          "created_utc": "2026-10-23T10:43:21Z",
+          "package_versions": {
+            "cryptography": "50.0.2",
+            "pqcrypto": "1.0.0",
+            "torch": "not installed"
+          },
+          "python": "3.14.2",
+          "scenario_results": {
+            "payload_1024_connections_1": {
+              "authenticated_request_records": 690,
+              "authenticated_response_records": 690,
+              "failed_request_records": 0,
+              "inspection_log_records": 690,
+              "ml_kem_768_handshake_latency.p95_us": 669.469,
+              "process_cpu_percent_of_one_core": 101.1854698684733,
+              "process_rss_bytes.peak_sampled": 55431168,
+              "request_goodput_bps": 11283447.790846935,
+              "request_packets_per_second": 1377.37399790612,
+              "request_response_rtt.p95_us": 1023.57415,
+              "request_response_rtt.p99_us": 1193.95358
+            },
+            "payload_1024_connections_32": {
+              "authenticated_request_records": 503,
+              "authenticated_response_records": 503,
+              "failed_request_records": 0,
+              "inspection_log_records": 503,
+              "ml_kem_768_handshake_latency.p95_us": 2093356.45335,
+              "process_cpu_percent_of_one_core": 113.25705639519951,
+              "process_rss_bytes.peak_sampled": 59105280,
+              "request_goodput_bps": 8027643.15129125,
+              "request_packets_per_second": 979.9369081166077,
+              "request_response_rtt.p95_us": 45098.5915,
+              "request_response_rtt.p99_us": 46140.906030000006
+            },
+            "payload_1024_connections_8": {
+              "authenticated_request_records": 551,
+              "authenticated_response_records": 551,
+              "failed_request_records": 0,
+              "inspection_log_records": 551,
+              "ml_kem_768_handshake_latency.p95_us": 1067539.2256,
+              "process_cpu_percent_of_one_core": 122.48382481447413,
+              "process_rss_bytes.peak_sampled": 56041472,
+              "request_goodput_bps": 8949946.081717625,
+              "request_packets_per_second": 1092.522715053421,
+              "request_response_rtt.p95_us": 11101.390049999996,
+              "request_response_rtt.p99_us": 12494.63115
+            },
+            "payload_128_connections_1": {
+              "authenticated_request_records": 1040,
+              "authenticated_response_records": 1040,
+              "failed_request_records": 0,
+              "inspection_log_records": 1040,
+              "ml_kem_768_handshake_latency.p95_us": 627.208,
+              "process_cpu_percent_of_one_core": 100.50670539397144,
+              "process_rss_bytes.peak_sampled": 53870592,
+              "request_goodput_bps": 2128236.5563702243,
+              "request_packets_per_second": 2078.356012080297,
+              "request_response_rtt.p95_us": 664.3234,
+              "request_response_rtt.p99_us": 1052.3274799999997
+            },
+            "payload_128_connections_32": {
+              "authenticated_request_records": 706,
+              "authenticated_response_records": 706,
+              "failed_request_records": 0,
+              "inspection_log_records": 706,
+              "ml_kem_768_handshake_latency.p95_us": 3113157.9590499997,
+              "process_cpu_percent_of_one_core": 119.22851841904918,
+              "process_rss_bytes.peak_sampled": 57389056,
+              "request_goodput_bps": 1415018.0095543754,
+              "request_packets_per_second": 1381.8535249554448,
+              "request_response_rtt.p95_us": 34991.270449999996,
+              "request_response_rtt.p99_us": 36616.525779999996
+            },
+            "payload_128_connections_8": {
+              "authenticated_request_records": 695,
+              "authenticated_response_records": 695,
+              "failed_request_records": 0,
+              "inspection_log_records": 695,
+              "ml_kem_768_handshake_latency.p95_us": 1049468.7314499998,
+              "process_cpu_percent_of_one_core": 111.27936915788767,
+              "process_rss_bytes.peak_sampled": 54546432,
+              "request_goodput_bps": 1414294.2128664614,
+              "request_packets_per_second": 1381.1466922524037,
+              "request_response_rtt.p95_us": 9168.050899999998,
+              "request_response_rtt.p99_us": 11304.74053
+            },
+            "payload_1518_connections_1": {
+              "authenticated_request_records": 654,
+              "authenticated_response_records": 654,
+              "failed_request_records": 0,
+              "inspection_log_records": 654,
+              "ml_kem_768_handshake_latency.p95_us": 610.98,
+              "process_cpu_percent_of_one_core": 102.8191760550559,
+              "process_rss_bytes.peak_sampled": 56590336,
+              "request_goodput_bps": 15877009.581647303,
+              "request_packets_per_second": 1307.3953871580454,
+              "request_response_rtt.p95_us": 983.726,
+              "request_response_rtt.p99_us": 1009.021
+            },
+            "payload_1518_connections_32": {
+              "authenticated_request_records": 469,
+              "authenticated_response_records": 469,
+              "failed_request_records": 0,
+              "inspection_log_records": 469,
+              "ml_kem_768_handshake_latency.p95_us": 1100959.52015,
+              "process_cpu_percent_of_one_core": 116.76060318712642,
+              "process_rss_bytes.peak_sampled": 59535360,
+              "request_goodput_bps": 11105505.519709645,
+              "request_packets_per_second": 914.4849736256296,
+              "request_response_rtt.p95_us": 56710.7393,
+              "request_response_rtt.p99_us": 57396.14013
+            },
+            "payload_1518_connections_8": {
+              "authenticated_request_records": 482,
+              "authenticated_response_records": 482,
+              "failed_request_records": 0,
+              "inspection_log_records": 482,
+              "ml_kem_768_handshake_latency.p95_us": 11258.38065,
+              "process_cpu_percent_of_one_core": 118.3386475544036,
+              "process_rss_bytes.peak_sampled": 57151488,
+              "request_goodput_bps": 11604477.183335096,
+              "request_packets_per_second": 955.5728905908346,
+              "request_response_rtt.p95_us": 13159.371449999999,
+              "request_response_rtt.p99_us": 14032.413680000001
+            },
+            "payload_256_connections_1": {
+              "authenticated_request_records": 991,
+              "authenticated_response_records": 991,
+              "failed_request_records": 0,
+              "inspection_log_records": 991,
+              "ml_kem_768_handshake_latency.p95_us": 744.622,
+              "process_cpu_percent_of_one_core": 103.09909518276616,
+              "process_rss_bytes.peak_sampled": 54865920,
+              "request_goodput_bps": 4055195.793338794,
+              "request_packets_per_second": 1980.076070966208,
+              "request_response_rtt.p95_us": 691.5341,
+              "request_response_rtt.p99_us": 755.41155
+            },
+            "payload_256_connections_32": {
+              "authenticated_request_records": 664,
+              "authenticated_response_records": 664,
+              "failed_request_records": 0,
+              "inspection_log_records": 664,
+              "ml_kem_768_handshake_latency.p95_us": 2055010.9942,
+              "process_cpu_percent_of_one_core": 125.95774279261467,
+              "process_rss_bytes.peak_sampled": 57597952,
+              "request_goodput_bps": 2658389.6066863923,
+              "request_packets_per_second": 1298.04180013984,
+              "request_response_rtt.p95_us": 35613.54289999999,
+              "request_response_rtt.p99_us": 38611.9847
+            },
+            "payload_256_connections_8": {
+              "authenticated_request_records": 680,
+              "authenticated_response_records": 680,
+              "failed_request_records": 0,
+              "inspection_log_records": 680,
+              "ml_kem_768_handshake_latency.p95_us": 7274.840049999999,
+              "process_cpu_percent_of_one_core": 123.43736164188952,
+              "process_rss_bytes.peak_sampled": 55472128,
+              "request_goodput_bps": 2763842.7182809566,
+              "request_packets_per_second": 1349.5325772856233,
+              "request_response_rtt.p95_us": 8730.820899999997,
+              "request_response_rtt.p99_us": 10798.72571
+            },
+            "payload_512_connections_1": {
+              "authenticated_request_records": 803,
+              "authenticated_response_records": 803,
+              "failed_request_records": 0,
+              "inspection_log_records": 803,
+              "ml_kem_768_handshake_latency.p95_us": 760.371,
+              "process_cpu_percent_of_one_core": 100.85588107656758,
+              "process_rss_bytes.peak_sampled": 55078912,
+              "request_goodput_bps": 6569981.393601965,
+              "request_packets_per_second": 1603.9993636723548,
+              "request_response_rtt.p95_us": 863.581,
+              "request_response_rtt.p99_us": 1204.441
+            },
+            "payload_512_connections_32": {
+              "authenticated_request_records": 614,
+              "authenticated_response_records": 614,
+              "failed_request_records": 0,
+              "inspection_log_records": 614,
+              "ml_kem_768_handshake_latency.p95_us": 34673.07205,
+              "process_cpu_percent_of_one_core": 124.00723418406558,
+              "process_rss_bytes.peak_sampled": 57954304,
+              "request_goodput_bps": 4911074.857088261,
+              "request_packets_per_second": 1198.9928850313138,
+              "request_response_rtt.p95_us": 38676.30314999999,
+              "request_response_rtt.p99_us": 40258.909
+            },
+            "payload_512_connections_8": {
+              "authenticated_request_records": 615,
+              "authenticated_response_records": 615,
+              "failed_request_records": 0,
+              "inspection_log_records": 615,
+              "ml_kem_768_handshake_latency.p95_us": 1058461.3225500002,
+              "process_cpu_percent_of_one_core": 124.75734175795343,
+              "process_rss_bytes.peak_sampled": 55693312,
+              "request_goodput_bps": 5011460.006465804,
+              "request_packets_per_second": 1223.5009781410654,
+              "request_response_rtt.p95_us": 11042.59195,
+              "request_response_rtt.p99_us": 11987.234279999999
+            },
+            "payload_64_connections_1": {
+              "authenticated_request_records": 1097,
+              "authenticated_response_records": 1097,
+              "failed_request_records": 0,
+              "inspection_log_records": 1097,
+              "ml_kem_768_handshake_latency.p95_us": 1012.977,
+              "process_cpu_percent_of_one_core": 100.64289616336018,
+              "process_rss_bytes.peak_sampled": 52846592,
+              "request_goodput_bps": 1122850.429254945,
+              "request_packets_per_second": 2193.0672446385643,
+              "request_response_rtt.p95_us": 593.9526000000001,
+              "request_response_rtt.p99_us": 1537.537999999986
+            },
+            "payload_64_connections_32": {
+              "authenticated_request_records": 709,
+              "authenticated_response_records": 709,
+              "failed_request_records": 0,
+              "inspection_log_records": 709,
+              "ml_kem_768_handshake_latency.p95_us": 2133053.87905,
+              "process_cpu_percent_of_one_core": 118.50554554120849,
+              "process_rss_bytes.peak_sampled": 56369152,
+              "request_goodput_bps": 710089.803391103,
+              "request_packets_per_second": 1386.8941472482481,
+              "request_response_rtt.p95_us": 45914.00549999999,
+              "request_response_rtt.p99_us": 51651.85896
+            },
+            "payload_64_connections_8": {
+              "authenticated_request_records": 751,
+              "authenticated_response_records": 751,
+              "failed_request_records": 0,
+              "inspection_log_records": 751,
+              "ml_kem_768_handshake_latency.p95_us": 8578.73395,
+              "process_cpu_percent_of_one_core": 118.95267548716156,
+              "process_rss_bytes.peak_sampled": 53514240,
+              "request_goodput_bps": 766289.5325842855,
+              "request_packets_per_second": 1496.6592433286826,
+              "request_response_rtt.p95_us": 9981.404299999991,
+              "request_response_rtt.p99_us": 12346.196789999998
+            }
+          },
+          "trial": 2
+        },
+        {
+          "created_utc": "2026-10-23T10:44:10Z",
+          "package_versions": {
+            "cryptography": "50.0.2",
+            "pqcrypto": "1.0.0",
+            "torch": "not installed"
+          },
+          "python": "3.14.2",
+          "scenario_results": {
+            "payload_1024_connections_1": {
+              "authenticated_request_records": 637,
+              "authenticated_response_records": 637,
+              "failed_request_records": 0,
+              "inspection_log_records": 637,
+              "ml_kem_768_handshake_latency.p95_us": 935.288,
+              "process_cpu_percent_of_one_core": 96.34240187089593,
+              "process_rss_bytes.peak_sampled": 56205312,
+              "request_goodput_bps": 10427503.683971167,
+              "request_packets_per_second": 1272.8886332972615,
+              "request_response_rtt.p95_us": 1062.9789999999996,
+              "request_response_rtt.p99_us": 2173.459929999999
+            },
+            "payload_1024_connections_32": {
+              "authenticated_request_records": 472,
+              "authenticated_response_records": 472,
+              "failed_request_records": 0,
+              "inspection_log_records": 472,
+              "ml_kem_768_handshake_latency.p95_us": 4124008.12075,
+              "process_cpu_percent_of_one_core": 110.71136659094962,
+              "process_rss_bytes.peak_sampled": 59715584,
+              "request_goodput_bps": 7536413.680855674,
+              "request_packets_per_second": 919.9723731513274,
+              "request_response_rtt.p95_us": 83964.52865,
+              "request_response_rtt.p99_us": 87423.45143000002
+            },
+            "payload_1024_connections_8": {
+              "authenticated_request_records": 519,
+              "authenticated_response_records": 519,
+              "failed_request_records": 0,
+              "inspection_log_records": 519,
+              "ml_kem_768_handshake_latency.p95_us": 9376.854,
+              "process_cpu_percent_of_one_core": 117.31828811443708,
+              "process_rss_bytes.peak_sampled": 56782848,
+              "request_goodput_bps": 8451016.860363526,
+              "request_packets_per_second": 1031.6182690873445,
+              "request_response_rtt.p95_us": 12652.742199999997,
+              "request_response_rtt.p99_us": 14237.44332
+            },
+            "payload_128_connections_1": {
+              "authenticated_request_records": 1056,
+              "authenticated_response_records": 1056,
+              "failed_request_records": 0,
+              "inspection_log_records": 1056,
+              "ml_kem_768_handshake_latency.p95_us": 2591.977,
+              "process_cpu_percent_of_one_core": 102.08247712448113,
+              "process_rss_bytes.peak_sampled": 54542336,
+              "request_goodput_bps": 2160502.3925694143,
+              "request_packets_per_second": 2109.8656177435687,
+              "request_response_rtt.p95_us": 645.9205,
+              "request_response_rtt.p99_us": 869.4959999999983
+            },
+            "payload_128_connections_32": {
+              "authenticated_request_records": 716,
+              "authenticated_response_records": 716,
+              "failed_request_records": 0,
+              "inspection_log_records": 716,
+              "ml_kem_768_handshake_latency.p95_us": 1073435.12995,
+              "process_cpu_percent_of_one_core": 127.3316407576274,
+              "process_rss_bytes.peak_sampled": 58093568,
+              "request_goodput_bps": 1434661.1086176157,
+              "request_packets_per_second": 1401.0362388843903,
+              "request_response_rtt.p95_us": 33242.824850000005,
+              "request_response_rtt.p99_us": 34724.6893
+            },
+            "payload_128_connections_8": {
+              "authenticated_request_records": 661,
+              "authenticated_response_records": 661,
+              "failed_request_records": 0,
+              "inspection_log_records": 661,
+              "ml_kem_768_handshake_latency.p95_us": 11154.176249999999,
+              "process_cpu_percent_of_one_core": 110.98562889312993,
+              "process_rss_bytes.peak_sampled": 55218176,
+              "request_goodput_bps": 1347127.940640781,
+              "request_packets_per_second": 1315.5546295320128,
+              "request_response_rtt.p95_us": 9291.828399999999,
+              "request_response_rtt.p99_us": 11516.867179999997
+            },
+            "payload_1518_connections_1": {
+              "authenticated_request_records": 590,
+              "authenticated_response_records": 590,
+              "failed_request_records": 0,
+              "inspection_log_records": 590,
+              "ml_kem_768_handshake_latency.p95_us": 1147.331,
+              "process_cpu_percent_of_one_core": 100.81564767375917,
+              "process_rss_bytes.peak_sampled": 57188352,
+              "request_goodput_bps": 14311893.854820894,
+              "request_packets_per_second": 1178.5156336314967,
+              "request_response_rtt.p95_us": 1217.3227999999992,
+              "request_response_rtt.p99_us": 1530.5986400000002
+            },
+            "payload_1518_connections_32": {
+              "authenticated_request_records": 452,
+              "authenticated_response_records": 452,
+              "failed_request_records": 0,
+              "inspection_log_records": 452,
+              "ml_kem_768_handshake_latency.p95_us": 1096935.5218,
+              "process_cpu_percent_of_one_core": 113.76165327069334,
+              "process_rss_bytes.peak_sampled": 60084224,
+              "request_goodput_bps": 10756360.127017085,
+              "request_packets_per_second": 885.7345295633304,
+              "request_response_rtt.p95_us": 54441.9118,
+              "request_response_rtt.p99_us": 55813.8894
+            },
+            "payload_1518_connections_8": {
+              "authenticated_request_records": 487,
+              "authenticated_response_records": 487,
+              "failed_request_records": 0,
+              "inspection_log_records": 487,
+              "ml_kem_768_handshake_latency.p95_us": 11786.366499999998,
+              "process_cpu_percent_of_one_core": 120.51751335817231,
+              "process_rss_bytes.peak_sampled": 57749504,
+              "request_goodput_bps": 11748055.245810833,
+              "request_packets_per_second": 967.3958535746733,
+              "request_response_rtt.p95_us": 13583.7927,
+              "request_response_rtt.p99_us": 15049.888310000002
+            },
+            "payload_256_connections_1": {
+              "authenticated_request_records": 909,
+              "authenticated_response_records": 909,
+              "failed_request_records": 0,
+              "inspection_log_records": 909,
+              "ml_kem_768_handshake_latency.p95_us": 751.573,
+              "process_cpu_percent_of_one_core": 101.50961782174055,
+              "process_rss_bytes.peak_sampled": 55590912,
+              "request_goodput_bps": 3720633.318772192,
+              "request_packets_per_second": 1816.7154876817344,
+              "request_response_rtt.p95_us": 756.4404,
+              "request_response_rtt.p99_us": 843.6461599999996
+            },
+            "payload_256_connections_32": {
+              "authenticated_request_records": 615,
+              "authenticated_response_records": 615,
+              "failed_request_records": 0,
+              "inspection_log_records": 615,
+              "ml_kem_768_handshake_latency.p95_us": 2112706.8872499997,
+              "process_cpu_percent_of_one_core": 115.32219742507202,
+              "process_rss_bytes.peak_sampled": 58368000,
+              "request_goodput_bps": 2458067.872235583,
+              "request_packets_per_second": 1200.2284532400308,
+              "request_response_rtt.p95_us": 46136.59164999999,
+              "request_response_rtt.p99_us": 52906.29842999998
+            },
+            "payload_256_connections_8": {
+              "authenticated_request_records": 673,
+              "authenticated_response_records": 673,
+              "failed_request_records": 0,
+              "inspection_log_records": 673,
+              "ml_kem_768_handshake_latency.p95_us": 1050046.77445,
+              "process_cpu_percent_of_one_core": 125.17030698029382,
+              "process_rss_bytes.peak_sampled": 56221696,
+              "request_goodput_bps": 2746498.6274286257,
+              "request_packets_per_second": 1341.0637829241336,
+              "request_response_rtt.p95_us": 8969.4561,
+              "request_response_rtt.p99_us": 11675.116530000005
+            },
+            "payload_512_connections_1": {
+              "authenticated_request_records": 886,
+              "authenticated_response_records": 886,
+              "failed_request_records": 0,
+              "inspection_log_records": 886,
+              "ml_kem_768_handshake_latency.p95_us": 766.14,
+              "process_cpu_percent_of_one_core": 102.65490488231843,
+              "process_rss_bytes.peak_sampled": 55865344,
+              "request_goodput_bps": 7250796.714694006,
+              "request_packets_per_second": 1770.2140416733414,
+              "request_response_rtt.p95_us": 732.97825,
+              "request_response_rtt.p99_us": 969.6213000000007
+            },
+            "payload_512_connections_32": {
+              "authenticated_request_records": 602,
+              "authenticated_response_records": 602,
+              "failed_request_records": 0,
+              "inspection_log_records": 602,
+              "ml_kem_768_handshake_latency.p95_us": 33569.12505,
+              "process_cpu_percent_of_one_core": 121.20228999571623,
+              "process_rss_bytes.peak_sampled": 58728448,
+              "request_goodput_bps": 4809124.8769529415,
+              "request_packets_per_second": 1174.1027531623392,
+              "request_response_rtt.p95_us": 41225.0902,
+              "request_response_rtt.p99_us": 43711.192109999996
+            },
+            "payload_512_connections_8": {
+              "authenticated_request_records": 595,
+              "authenticated_response_records": 595,
+              "failed_request_records": 0,
+              "inspection_log_records": 595,
+              "ml_kem_768_handshake_latency.p95_us": 1058656.11835,
+              "process_cpu_percent_of_one_core": 118.44731555088156,
+              "process_rss_bytes.peak_sampled": 56463360,
+              "request_goodput_bps": 4845519.761253955,
+              "request_packets_per_second": 1182.9882229623913,
+              "request_response_rtt.p95_us": 10763.815549999994,
+              "request_response_rtt.p99_us": 13305.61359
+            },
+            "payload_64_connections_1": {
+              "authenticated_request_records": 1198,
+              "authenticated_response_records": 1198,
+              "failed_request_records": 0,
+              "inspection_log_records": 1198,
+              "ml_kem_768_handshake_latency.p95_us": 862.122,
+              "process_cpu_percent_of_one_core": 103.29354904245633,
+              "process_rss_bytes.peak_sampled": 53444608,
+              "request_goodput_bps": 1225849.7353669265,
+              "request_packets_per_second": 2394.2377643885284,
+              "request_response_rtt.p95_us": 606.7538,
+              "request_response_rtt.p99_us": 673.0393800000003
+            },
+            "payload_64_connections_32": {
+              "authenticated_request_records": 733,
+              "authenticated_response_records": 733,
+              "failed_request_records": 0,
+              "inspection_log_records": 733,
+              "ml_kem_768_handshake_latency.p95_us": 1076412.5946,
+              "process_cpu_percent_of_one_core": 124.07284277856931,
+              "process_rss_bytes.peak_sampled": 57040896,
+              "request_goodput_bps": 732977.5683095454,
+              "request_packets_per_second": 1431.5968131045809,
+              "request_response_rtt.p95_us": 34407.82124999999,
+              "request_response_rtt.p99_us": 37476.211319999995
+            },
+            "payload_64_connections_8": {
+              "authenticated_request_records": 762,
+              "authenticated_response_records": 762,
+              "failed_request_records": 0,
+              "inspection_log_records": 762,
+              "ml_kem_768_handshake_latency.p95_us": 9265.91745,
+              "process_cpu_percent_of_one_core": 119.73737615009412,
+              "process_rss_bytes.peak_sampled": 54173696,
+              "request_goodput_bps": 774923.0742701249,
+              "request_packets_per_second": 1513.5216294338377,
+              "request_response_rtt.p95_us": 8584.776849999998,
+              "request_response_rtt.p99_us": 10521.91506
+            }
+          },
+          "trial": 3
+        }
+      ]
+    },
+    "random_weight_ai_diagnostic_python312": {
+      "command_template": "python scripts/throughput_component_probe.py --duration-seconds 0.5 --connection-counts 1 8 32 --output <temporary report>",
+      "scenario_statistics": {
+        "payload_1024_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 101.47748493256185,
+            "max": 5909.277,
+            "median": 745.171,
+            "min": 626.482
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 19.713811503900335,
+            "max": 101.99348846738101,
+            "median": 100.71706960528294,
+            "min": 64.16927154556646
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.002547014945028312,
+            "max": 262619136,
+            "median": 262610944,
+            "min": 262602752
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 36.41844372239935,
+            "max": 8749542.239246707,
+            "median": 8304036.122674615,
+            "min": 3299690.2979007466
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 36.41844372239935,
+            "max": 1068.0593553767953,
+            "median": 1013.6762845061786,
+            "min": 402.79422581796223
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 62.86807443080137,
+            "max": 4547.760599999994,
+            "median": 1544.81105,
+            "min": 1148.9583499999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 72.93307089025994,
+            "max": 6658.039319999996,
+            "median": 1800.1055700000006,
+            "min": 1386.8337600000004
+          }
+        },
+        "payload_1024_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 38.64866410618962,
+            "max": 3241319.4258000003,
+            "median": 2117682.61055,
+            "min": 1180492.99945
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 28.349272142032195,
+            "max": 129.58472779011333,
+            "median": 109.74429646168717,
+            "min": 61.79782587807882
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.033727304049971735,
+            "max": 265510912,
+            "median": 265375744,
+            "min": 265293824
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 22.971642821760284,
+            "max": 4631597.059110263,
+            "median": 3776593.6773292115,
+            "min": 2580064.5215113843
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 22.971642821760284,
+            "max": 565.3805003796708,
+            "median": 461.009970377101,
+            "min": 314.94928241105765
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 25.908065798742108,
+            "max": 271381.15725,
+            "median": 188089.12965000002,
+            "min": 145574.7745
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 23.486912982334708,
+            "max": 306498.0228000002,
+            "median": 283881.77381000004,
+            "min": 170373.28091000003
+          }
+        },
+        "payload_1024_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 53.344201886209305,
+            "max": 27352.019749999996,
+            "median": 9945.180199999997,
+            "min": 9479.6071
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 29.344059212406897,
+            "max": 128.4439422263335,
+            "median": 122.20007197630214,
+            "min": 60.90422261477209
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.002541940104379459,
+            "max": 263143424,
+            "median": 263135232,
+            "min": 263127040
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 18.01302988291898,
+            "max": 4644268.465908661,
+            "median": 4539397.542738645,
+            "min": 3037817.701773161
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 18.01302988291898,
+            "max": 566.9273029673658,
+            "median": 554.1256766038385,
+            "min": 370.8273561734816
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 35.193720825918845,
+            "max": 48978.507249999995,
+            "median": 24851.38545,
+            "min": 24283.232799999994
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 30.606101305234112,
+            "max": 50980.48465,
+            "median": 31689.90260000001,
+            "min": 25069.33776
+          }
+        },
+        "payload_128_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 39.228706314376375,
+            "max": 2764.619,
+            "median": 1934.22,
+            "min": 955.54
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 43.24809556402805,
+            "max": 102.33076741107277,
+            "median": 101.55634879692452,
+            "min": 30.32288651165259
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.004838224535145979,
+            "max": 261709824,
+            "median": 261705728,
+            "min": 261681152
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 51.6222185560515,
+            "max": 1698192.6478431285,
+            "median": 1694966.4036520838,
+            "min": 335523.1324416069
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 51.6222185560515,
+            "max": 1658.3912576593052,
+            "median": 1655.240628566488,
+            "min": 327.65930902500673
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 90.68758688302067,
+            "max": 5064.1305,
+            "median": 800.37285,
+            "min": 791.4869499999998
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 61.81436877927674,
+            "max": 5106.8021,
+            "median": 2325.641250000006,
+            "min": 953.3060600000002
+          }
+        },
+        "payload_128_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 137.19740401984672,
+            "max": 3171846.80605,
+            "median": 33331.6467,
+            "min": 31109.392
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 22.45911546955671,
+            "max": 138.49172849767484,
+            "median": 137.76967933538873,
+            "min": 81.34301395458624
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.006488746516813977,
+            "max": 264511488,
+            "median": 264482816,
+            "min": 264470528
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 0.9279161787909442,
+            "max": 759368.6142244927,
+            "median": 746917.7200284145,
+            "min": 743065.7790748072
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 0.9279161787909442,
+            "max": 741.5709123286061,
+            "median": 729.4118359652485,
+            "min": 725.6501748777414
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 15.979161111697357,
+            "max": 111746.75219999999,
+            "median": 108365.76745,
+            "min": 76652.89899999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 11.32025348121974,
+            "max": 117977.64312,
+            "median": 114075.40533000001,
+            "min": 90434.74204
+          }
+        },
+        "payload_128_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 1.5760974303016748,
+            "max": 1087420.7453,
+            "median": 1055305.4245,
+            "min": 1049184.6458
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 22.732297462037725,
+            "max": 131.58054652654744,
+            "median": 109.74553977718833,
+            "min": 73.69016487465257
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.004828400166348563,
+            "max": 262242304,
+            "median": 262238208,
+            "min": 262213632
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 5.807071836711302,
+            "max": 776946.9903752278,
+            "median": 770229.8540402368,
+            "min": 682229.1263142996
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 5.807071836711302,
+            "max": 758.7372952883084,
+            "median": 752.1775918361687,
+            "min": 666.2393811663082
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 11.995652837391376,
+            "max": 22564.720999999998,
+            "median": 19875.404,
+            "min": 16770.3713
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 4.648961625918262,
+            "max": 23241.38176,
+            "median": 22163.47807999999,
+            "min": 20738.66675
+          }
+        },
+        "payload_1518_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 19.163394020335637,
+            "max": 1180.543,
+            "median": 817.739,
+            "min": 789.436
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 21.44069599184891,
+            "max": 101.91627309855255,
+            "median": 101.9123094902486,
+            "min": 61.6634170104332
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.03288801831678898,
+            "max": 263135232,
+            "median": 263000064,
+            "min": 262926336
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 38.86463845345546,
+            "max": 11197858.695092117,
+            "median": 11045229.391993545,
+            "min": 3930011.553625955
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 38.86463845345547,
+            "max": 922.0898134957278,
+            "median": 909.5215243736451,
+            "min": 323.6175521760503
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 82.27123572823352,
+            "max": 7275.036,
+            "median": 1453.2595999999996,
+            "min": 1360.1293999999996
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 79.57144810282813,
+            "max": 8270.213600000001,
+            "median": 1730.2671199999995,
+            "min": 1673.5833999999995
+          }
+        },
+        "payload_1518_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 17.742491734205746,
+            "max": 3109609.3271500003,
+            "median": 2175029.5674,
+            "min": 2172956.99715
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 19.702731988161172,
+            "max": 123.63192512680392,
+            "median": 119.57395588841051,
+            "min": 77.11467600095344
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.054020592436546666,
+            "max": 265904128,
+            "median": 265850880,
+            "min": 265576448
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 18.70238296186039,
+            "max": 6227810.271517313,
+            "median": 5872787.648897387,
+            "min": 3950052.908070478
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 18.70238296186039,
+            "max": 512.8302265742187,
+            "median": 483.59582089075985,
+            "min": 325.2678613365018
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 14.802483103630243,
+            "max": 179665.67124999996,
+            "median": 137149.15389999998,
+            "min": 129634.03735
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 18.040279549084453,
+            "max": 220613.35651000004,
+            "median": 177497.35299000004,
+            "min": 141263.85095000002
+          }
+        },
+        "payload_1518_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 69.87980508067709,
+            "max": 1110388.7100499999,
+            "median": 1055015.75955,
+            "min": 9231.2758
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 25.567661446057365,
+            "max": 128.5540152146654,
+            "median": 122.04260439773462,
+            "min": 67.9794475020776
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.03350921682571628,
+            "max": 263671808,
+            "median": 263532544,
+            "min": 263458816
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 18.66964984986017,
+            "max": 6582877.899462948,
+            "median": 6319916.8824440325,
+            "min": 4204499.994349351
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 18.669649849860164,
+            "max": 542.0683382298212,
+            "median": 520.4147630471041,
+            "min": 346.22035526592157
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 63.61337345829274,
+            "max": 85653.27649999999,
+            "median": 27181.967,
+            "min": 22571.145249999998
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 62.70535633957898,
+            "max": 93930.9809,
+            "median": 32085.149400000002,
+            "min": 23751.46762
+          }
+        },
+        "payload_256_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 15.560684892996008,
+            "max": 1254.965,
+            "median": 942.068,
+            "min": 893.137
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 11.194040696821796,
+            "max": 100.6347229244199,
+            "median": 95.28435512503076,
+            "min": 76.87024470915014
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.008302101105657832,
+            "max": 262127616,
+            "median": 262098944,
+            "min": 262074368
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 25.829278614118234,
+            "max": 2884836.2841723105,
+            "median": 2639308.631089322,
+            "min": 1497403.569955081
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 25.829278614118234,
+            "max": 1408.611466881011,
+            "median": 1288.724917524083,
+            "min": 731.1540868921294
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 22.084980688746768,
+            "max": 1701.5417999999997,
+            "median": 1180.523,
+            "min": 1029.3225999999997
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 27.639907420264315,
+            "max": 2675.687200000001,
+            "median": 1981.606560000002,
+            "min": 1325.6438000000003
+          }
+        },
+        "payload_256_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 17.525734748769633,
+            "max": 3169235.45445,
+            "median": 3116042.1064,
+            "min": 2104011.693
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 22.445306684447782,
+            "max": 136.50678551577496,
+            "median": 135.4376214307512,
+            "min": 80.10526746617447
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.016569573034804372,
+            "max": 264765440,
+            "median": 264699904,
+            "min": 264658944
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 8.604099310430065,
+            "max": 1450292.694562324,
+            "median": 1439687.8049921293,
+            "min": 1196535.6034928318
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 8.604099310430065,
+            "max": 708.1507297667598,
+            "median": 702.9725610313131,
+            "min": 584.2459001429843
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 18.103304212288364,
+            "max": 142107.54335,
+            "median": 103505.9086,
+            "min": 94845.50185
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 25.29625693534988,
+            "max": 185316.1236100001,
+            "median": 124694.83804,
+            "min": 103023.96277000001
+          }
+        },
+        "payload_256_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 136.6690851854473,
+            "max": 1071496.55735,
+            "median": 16491.35715,
+            "min": 8079.914449999999
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 16.67082548113881,
+            "max": 136.45015725292953,
+            "median": 135.27528677392735,
+            "min": 92.89331168476977
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.008285139633558375,
+            "max": 262664192,
+            "median": 262635520,
+            "min": 262610944
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 4.47333288157216,
+            "max": 1480857.941717079,
+            "median": 1473611.12596351,
+            "min": 1341492.9324218824
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 4.47333288157216,
+            "max": 723.0751668540424,
+            "median": 719.5366825993701,
+            "min": 655.0258459091223
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 9.349906456634494,
+            "max": 21941.488799999985,
+            "median": 20166.8497,
+            "min": 17430.269899999996
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 15.904930066136144,
+            "max": 26507.46735999999,
+            "median": 21298.151380000003,
+            "min": 18031.53298
+          }
+        },
+        "payload_512_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 62.760699854968664,
+            "max": 2217.598,
+            "median": 671.065,
+            "min": 636.174
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 31.566559905629017,
+            "max": 102.37692162436545,
+            "median": 97.27716388366214,
+            "min": 45.32425197480603
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.01672119342516033,
+            "max": 262365184,
+            "median": 262299648,
+            "min": 262258688
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 44.920560851004474,
+            "max": 5524717.133453095,
+            "median": 4816233.797255487,
+            "min": 1469547.673899553
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 44.920560851004474,
+            "max": 1348.807893909447,
+            "median": 1175.838329408078,
+            "min": 358.77628757313306
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 99.48368742346089,
+            "max": 9271.552349999998,
+            "median": 1511.8989999999988,
+            "min": 792.5389
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 97.77292406284465,
+            "max": 10651.631270000002,
+            "median": 1758.83868,
+            "min": 1019.2086199999999
+          }
+        },
+        "payload_512_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 53.51821007853105,
+            "max": 4246571.408849999,
+            "median": 2106846.29545,
+            "min": 1066870.3835
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 26.130356925499004,
+            "max": 124.61710826554938,
+            "median": 123.78094184856221,
+            "min": 66.09483589397777
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.007176400295324814,
+            "max": 265011200,
+            "median": 264998912,
+            "min": 264966144
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 13.852675673764745,
+            "max": 2626801.619868678,
+            "median": 2486089.637287589,
+            "min": 1882179.420384774
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 13.852675673764745,
+            "max": 641.3089892257515,
+            "median": 606.9554778534152,
+            "min": 459.51646005487646
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 23.464887171184724,
+            "max": 194843.03639999998,
+            "median": 123591.72769999997,
+            "min": 120525.16339999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 20.554593640971305,
+            "max": 215093.47283,
+            "median": 155268.14958000003,
+            "min": 133437.26777
+          }
+        },
+        "payload_512_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 67.1712570141351,
+            "max": 1058226.10695,
+            "median": 1057659.0638000001,
+            "min": 35902.6391
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 35.00447195775044,
+            "max": 132.6870371392103,
+            "median": 129.19210374703704,
+            "min": 53.047923372183526
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.016687318481335006,
+            "max": 262897664,
+            "median": 262832128,
+            "min": 262791168
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 19.54736760197117,
+            "max": 2814928.55970487,
+            "median": 2696204.0250389273,
+            "min": 1756328.2407863494
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 19.54736760197117,
+            "max": 687.2384178966968,
+            "median": 658.2529358005194,
+            "min": 428.79107441072983
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 37.2310460368352,
+            "max": 46719.117249999996,
+            "median": 26421.538199999988,
+            "min": 19618.886999999995
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 34.95462797412861,
+            "max": 48599.19625,
+            "median": 28487.211219999997,
+            "min": 21501.65417
+          }
+        },
+        "payload_64_connections_1": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 27.368085419542293,
+            "max": 1625.423,
+            "median": 1038.628,
+            "min": 873.352
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 23.12134055429939,
+            "max": 102.92395494047372,
+            "median": 102.23991646384847,
+            "min": 59.34135497204625
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.018267116417437355,
+            "max": 259829760,
+            "median": 259788800,
+            "min": 259715072
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 34.86429624845586,
+            "max": 928011.0881721254,
+            "median": 909571.6323834386,
+            "min": 373846.50064421503
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 34.86429624845586,
+            "max": 1812.5216565861824,
+            "median": 1776.5070944989036,
+            "min": 730.1689465707325
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 62.13954385075403,
+            "max": 2404.3630999999996,
+            "median": 737.579,
+            "min": 697.6639999999996
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 92.22685994563258,
+            "max": 5821.790600000005,
+            "median": 899.5152000000007,
+            "min": 858.3256399999996
+          }
+        },
+        "payload_64_connections_32": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 17.873506886047156,
+            "max": 3214057.7833000002,
+            "median": 3074674.99025,
+            "min": 2092062.0760499998
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 34.026196510715124,
+            "max": 137.51835050570864,
+            "median": 121.58566257415939,
+            "min": 55.199553144810174
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.0031870448415471835,
+            "max": 264093696,
+            "median": 264085504,
+            "min": 264073216
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 20.575531942839913,
+            "max": 412721.4517125932,
+            "median": 378438.0544315607,
+            "min": 247421.23913608614
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 20.575531942839913,
+            "max": 806.0965853761586,
+            "median": 739.136825061642,
+            "min": 483.24460768766824
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 34.546909932821016,
+            "max": 185086.36754999997,
+            "median": 102445.07839999998,
+            "min": 86834.40759999999
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 30.62088826342174,
+            "max": 207352.54398000002,
+            "median": 117096.46172,
+            "min": 109919.065
+          }
+        },
+        "payload_64_connections_8": {
+          "ml_kem_768_handshake_latency.p95_us": {
+            "coefficient_of_variation_percent": 69.6563805622604,
+            "max": 1023810.9661999999,
+            "median": 1010618.4744,
+            "min": 10205.0526
+          },
+          "process_cpu_percent_of_one_core": {
+            "coefficient_of_variation_percent": 19.008730631208103,
+            "max": 132.39502335834635,
+            "median": 127.19766040237126,
+            "min": 83.85306102290203
+          },
+          "process_rss_bytes.peak_sampled": {
+            "coefficient_of_variation_percent": 0.027841569221426877,
+            "max": 260751360,
+            "median": 260739072,
+            "min": 260591616
+          },
+          "request_goodput_bps": {
+            "coefficient_of_variation_percent": 11.815327430835707,
+            "max": 495782.31927346333,
+            "median": 391450.4304063596,
+            "min": 387274.58453529497
+          },
+          "request_packets_per_second": {
+            "coefficient_of_variation_percent": 11.815327430835707,
+            "max": 968.3248423309831,
+            "median": 764.5516218874211,
+            "min": 756.395672920498
+          },
+          "request_response_rtt.p95_us": {
+            "coefficient_of_variation_percent": 13.636239821492444,
+            "max": 20127.6883,
+            "median": 18092.5373,
+            "min": 14356.731999999995
+          },
+          "request_response_rtt.p99_us": {
+            "coefficient_of_variation_percent": 9.672501048173213,
+            "max": 27932.25006000002,
+            "median": 22980.16659999999,
+            "min": 22805.089599999992
+          }
+        }
+      },
+      "trials": [
+        {
+          "created_utc": "2026-10-23T10:45:22Z",
+          "package_versions": {
+            "cryptography": "50.0.2",
+            "pqcrypto": "1.0.0",
+            "torch": "2.14.1+cpu"
+          },
+          "python": "3.12.3",
+          "scenario_results": {
+            "payload_1024_connections_1": {
+              "authenticated_request_records": 202,
+              "authenticated_response_records": 202,
+              "failed_request_records": 0,
+              "inspection_log_records": 202,
+              "ml_kem_768_handshake_latency.p95_us": 5909.277,
+              "process_cpu_percent_of_one_core": 64.16927154556646,
+              "process_rss_bytes.peak_sampled": 262619136,
+              "request_goodput_bps": 3299690.2979007466,
+              "request_packets_per_second": 402.79422581796223,
+              "request_response_rtt.p95_us": 4547.760599999994,
+              "request_response_rtt.p99_us": 6658.039319999996
+            },
+            "payload_1024_connections_32": {
+              "authenticated_request_records": 170,
+              "authenticated_response_records": 170,
+              "failed_request_records": 0,
+              "inspection_log_records": 170,
+              "ml_kem_768_handshake_latency.p95_us": 1180492.99945,
+              "process_cpu_percent_of_one_core": 61.79782587807882,
+              "process_rss_bytes.peak_sampled": 265293824,
+              "request_goodput_bps": 2580064.5215113843,
+              "request_packets_per_second": 314.94928241105765,
+              "request_response_rtt.p95_us": 271381.15725,
+              "request_response_rtt.p99_us": 283881.77381000004
+            },
+            "payload_1024_connections_8": {
+              "authenticated_request_records": 190,
+              "authenticated_response_records": 190,
+              "failed_request_records": 0,
+              "inspection_log_records": 190,
+              "ml_kem_768_handshake_latency.p95_us": 27352.019749999996,
+              "process_cpu_percent_of_one_core": 60.90422261477209,
+              "process_rss_bytes.peak_sampled": 263127040,
+              "request_goodput_bps": 3037817.701773161,
+              "request_packets_per_second": 370.8273561734816,
+              "request_response_rtt.p95_us": 48978.507249999995,
+              "request_response_rtt.p99_us": 50980.48465
+            },
+            "payload_128_connections_1": {
+              "authenticated_request_records": 164,
+              "authenticated_response_records": 164,
+              "failed_request_records": 0,
+              "inspection_log_records": 164,
+              "ml_kem_768_handshake_latency.p95_us": 2764.619,
+              "process_cpu_percent_of_one_core": 30.32288651165259,
+              "process_rss_bytes.peak_sampled": 261681152,
+              "request_goodput_bps": 335523.1324416069,
+              "request_packets_per_second": 327.65930902500673,
+              "request_response_rtt.p95_us": 5064.1305,
+              "request_response_rtt.p99_us": 5106.8021
+            },
+            "payload_128_connections_32": {
+              "authenticated_request_records": 378,
+              "authenticated_response_records": 378,
+              "failed_request_records": 0,
+              "inspection_log_records": 378,
+              "ml_kem_768_handshake_latency.p95_us": 3171846.80605,
+              "process_cpu_percent_of_one_core": 81.34301395458624,
+              "process_rss_bytes.peak_sampled": 264482816,
+              "request_goodput_bps": 743065.7790748072,
+              "request_packets_per_second": 725.6501748777414,
+              "request_response_rtt.p95_us": 76652.89899999999,
+              "request_response_rtt.p99_us": 90434.74204
+            },
+            "payload_128_connections_8": {
+              "authenticated_request_records": 335,
+              "authenticated_response_records": 335,
+              "failed_request_records": 0,
+              "inspection_log_records": 335,
+              "ml_kem_768_handshake_latency.p95_us": 1087420.7453,
+              "process_cpu_percent_of_one_core": 73.69016487465257,
+              "process_rss_bytes.peak_sampled": 262213632,
+              "request_goodput_bps": 682229.1263142996,
+              "request_packets_per_second": 666.2393811663082,
+              "request_response_rtt.p95_us": 22564.720999999998,
+              "request_response_rtt.p99_us": 23241.38176
+            },
+            "payload_1518_connections_1": {
+              "authenticated_request_records": 163,
+              "authenticated_response_records": 163,
+              "failed_request_records": 0,
+              "inspection_log_records": 163,
+              "ml_kem_768_handshake_latency.p95_us": 1180.543,
+              "process_cpu_percent_of_one_core": 61.6634170104332,
+              "process_rss_bytes.peak_sampled": 262926336,
+              "request_goodput_bps": 3930011.553625955,
+              "request_packets_per_second": 323.6175521760503,
+              "request_response_rtt.p95_us": 7275.036,
+              "request_response_rtt.p99_us": 8270.213600000001
+            },
+            "payload_1518_connections_32": {
+              "authenticated_request_records": 170,
+              "authenticated_response_records": 170,
+              "failed_request_records": 0,
+              "inspection_log_records": 170,
+              "ml_kem_768_handshake_latency.p95_us": 3109609.3271500003,
+              "process_cpu_percent_of_one_core": 77.11467600095344,
+              "process_rss_bytes.peak_sampled": 265576448,
+              "request_goodput_bps": 3950052.908070478,
+              "request_packets_per_second": 325.2678613365018,
+              "request_response_rtt.p95_us": 179665.67124999996,
+              "request_response_rtt.p99_us": 220613.35651000004
+            },
+            "payload_1518_connections_8": {
+              "authenticated_request_records": 176,
+              "authenticated_response_records": 176,
+              "failed_request_records": 0,
+              "inspection_log_records": 176,
+              "ml_kem_768_handshake_latency.p95_us": 1110388.7100499999,
+              "process_cpu_percent_of_one_core": 67.9794475020776,
+              "process_rss_bytes.peak_sampled": 263458816,
+              "request_goodput_bps": 4204499.994349351,
+              "request_packets_per_second": 346.22035526592157,
+              "request_response_rtt.p95_us": 85653.27649999999,
+              "request_response_rtt.p99_us": 93930.9809
+            },
+            "payload_256_connections_1": {
+              "authenticated_request_records": 366,
+              "authenticated_response_records": 366,
+              "failed_request_records": 0,
+              "inspection_log_records": 366,
+              "ml_kem_768_handshake_latency.p95_us": 1254.965,
+              "process_cpu_percent_of_one_core": 76.87024470915014,
+              "process_rss_bytes.peak_sampled": 262098944,
+              "request_goodput_bps": 1497403.569955081,
+              "request_packets_per_second": 731.1540868921294,
+              "request_response_rtt.p95_us": 1701.5417999999997,
+              "request_response_rtt.p99_us": 2675.687200000001
+            },
+            "payload_256_connections_32": {
+              "authenticated_request_records": 310,
+              "authenticated_response_records": 310,
+              "failed_request_records": 0,
+              "inspection_log_records": 310,
+              "ml_kem_768_handshake_latency.p95_us": 3169235.45445,
+              "process_cpu_percent_of_one_core": 80.10526746617447,
+              "process_rss_bytes.peak_sampled": 264699904,
+              "request_goodput_bps": 1196535.6034928318,
+              "request_packets_per_second": 584.2459001429843,
+              "request_response_rtt.p95_us": 142107.54335,
+              "request_response_rtt.p99_us": 185316.1236100001
+            },
+            "payload_256_connections_8": {
+              "authenticated_request_records": 332,
+              "authenticated_response_records": 332,
+              "failed_request_records": 0,
+              "inspection_log_records": 332,
+              "ml_kem_768_handshake_latency.p95_us": 16491.35715,
+              "process_cpu_percent_of_one_core": 92.89331168476977,
+              "process_rss_bytes.peak_sampled": 262635520,
+              "request_goodput_bps": 1341492.9324218824,
+              "request_packets_per_second": 655.0258459091223,
+              "request_response_rtt.p95_us": 17430.269899999996,
+              "request_response_rtt.p99_us": 18031.53298
+            },
+            "payload_512_connections_1": {
+              "authenticated_request_records": 182,
+              "authenticated_response_records": 182,
+              "failed_request_records": 0,
+              "inspection_log_records": 182,
+              "ml_kem_768_handshake_latency.p95_us": 2217.598,
+              "process_cpu_percent_of_one_core": 45.32425197480603,
+              "process_rss_bytes.peak_sampled": 262299648,
+              "request_goodput_bps": 1469547.673899553,
+              "request_packets_per_second": 358.77628757313306,
+              "request_response_rtt.p95_us": 9271.552349999998,
+              "request_response_rtt.p99_us": 10651.631270000002
+            },
+            "payload_512_connections_32": {
+              "authenticated_request_records": 258,
+              "authenticated_response_records": 258,
+              "failed_request_records": 0,
+              "inspection_log_records": 258,
+              "ml_kem_768_handshake_latency.p95_us": 4246571.408849999,
+              "process_cpu_percent_of_one_core": 66.09483589397777,
+              "process_rss_bytes.peak_sampled": 264966144,
+              "request_goodput_bps": 1882179.420384774,
+              "request_packets_per_second": 459.51646005487646,
+              "request_response_rtt.p95_us": 194843.03639999998,
+              "request_response_rtt.p99_us": 215093.47283
+            },
+            "payload_512_connections_8": {
+              "authenticated_request_records": 218,
+              "authenticated_response_records": 218,
+              "failed_request_records": 0,
+              "inspection_log_records": 218,
+              "ml_kem_768_handshake_latency.p95_us": 35902.6391,
+              "process_cpu_percent_of_one_core": 53.047923372183526,
+              "process_rss_bytes.peak_sampled": 262832128,
+              "request_goodput_bps": 1756328.2407863494,
+              "request_packets_per_second": 428.79107441072983,
+              "request_response_rtt.p95_us": 46719.117249999996,
+              "request_response_rtt.p99_us": 48599.19625
+            },
+            "payload_64_connections_1": {
+              "authenticated_request_records": 366,
+              "authenticated_response_records": 366,
+              "failed_request_records": 0,
+              "inspection_log_records": 366,
+              "ml_kem_768_handshake_latency.p95_us": 1625.423,
+              "process_cpu_percent_of_one_core": 59.34135497204625,
+              "process_rss_bytes.peak_sampled": 259829760,
+              "request_goodput_bps": 373846.50064421503,
+              "request_packets_per_second": 730.1689465707325,
+              "request_response_rtt.p95_us": 2404.3630999999996,
+              "request_response_rtt.p99_us": 5821.790600000005
+            },
+            "payload_64_connections_32": {
+              "authenticated_request_records": 258,
+              "authenticated_response_records": 258,
+              "failed_request_records": 0,
+              "inspection_log_records": 258,
+              "ml_kem_768_handshake_latency.p95_us": 3214057.7833000002,
+              "process_cpu_percent_of_one_core": 55.199553144810174,
+              "process_rss_bytes.peak_sampled": 264073216,
+              "request_goodput_bps": 247421.23913608614,
+              "request_packets_per_second": 483.24460768766824,
+              "request_response_rtt.p95_us": 185086.36754999997,
+              "request_response_rtt.p99_us": 207352.54398000002
+            },
+            "payload_64_connections_8": {
+              "authenticated_request_records": 488,
+              "authenticated_response_records": 488,
+              "failed_request_records": 0,
+              "inspection_log_records": 488,
+              "ml_kem_768_handshake_latency.p95_us": 1023810.9661999999,
+              "process_cpu_percent_of_one_core": 83.85306102290203,
+              "process_rss_bytes.peak_sampled": 260751360,
+              "request_goodput_bps": 495782.31927346333,
+              "request_packets_per_second": 968.3248423309831,
+              "request_response_rtt.p95_us": 14356.731999999995,
+              "request_response_rtt.p99_us": 27932.25006000002
+            }
+          },
+          "trial": 1
+        },
+        {
+          "created_utc": "2026-10-23T10:46:30Z",
+          "package_versions": {
+            "cryptography": "50.0.2",
+            "pqcrypto": "1.0.0",
+            "torch": "2.14.1+cpu"
+          },
+          "python": "3.12.3",
+          "scenario_results": {
+            "payload_1024_connections_1": {
+              "authenticated_request_records": 507,
+              "authenticated_response_records": 507,
+              "failed_request_records": 0,
+              "inspection_log_records": 507,
+              "ml_kem_768_handshake_latency.p95_us": 745.171,
+              "process_cpu_percent_of_one_core": 100.71706960528294,
+              "process_rss_bytes.peak_sampled": 262610944,
+              "request_goodput_bps": 8304036.122674615,
+              "request_packets_per_second": 1013.6762845061786,
+              "request_response_rtt.p95_us": 1544.81105,
+              "request_response_rtt.p99_us": 1800.1055700000006
+            },
+            "payload_1024_connections_32": {
+              "authenticated_request_records": 292,
+              "authenticated_response_records": 292,
+              "failed_request_records": 0,
+              "inspection_log_records": 292,
+              "ml_kem_768_handshake_latency.p95_us": 2117682.61055,
+              "process_cpu_percent_of_one_core": 129.58472779011333,
+              "process_rss_bytes.peak_sampled": 265510912,
+              "request_goodput_bps": 4631597.059110263,
+              "request_packets_per_second": 565.3805003796708,
+              "request_response_rtt.p95_us": 145574.7745,
+              "request_response_rtt.p99_us": 170373.28091000003
+            },
+            "payload_1024_connections_8": {
+              "authenticated_request_records": 282,
+              "authenticated_response_records": 282,
+              "failed_request_records": 0,
+              "inspection_log_records": 282,
+              "ml_kem_768_handshake_latency.p95_us": 9479.6071,
+              "process_cpu_percent_of_one_core": 122.20007197630214,
+              "process_rss_bytes.peak_sampled": 263143424,
+              "request_goodput_bps": 4539397.542738645,
+              "request_packets_per_second": 554.1256766038385,
+              "request_response_rtt.p95_us": 24283.232799999994,
+              "request_response_rtt.p99_us": 31689.90260000001
+            },
+            "payload_128_connections_1": {
+              "authenticated_request_records": 830,
+              "authenticated_response_records": 830,
+              "failed_request_records": 0,
+              "inspection_log_records": 830,
+              "ml_kem_768_handshake_latency.p95_us": 955.54,
+              "process_cpu_percent_of_one_core": 102.33076741107277,
+              "process_rss_bytes.peak_sampled": 261709824,
+              "request_goodput_bps": 1698192.6478431285,
+              "request_packets_per_second": 1658.3912576593052,
+              "request_response_rtt.p95_us": 800.37285,
+              "request_response_rtt.p99_us": 953.3060600000002
+            },
+            "payload_128_connections_32": {
+              "authenticated_request_records": 375,
+              "authenticated_response_records": 375,
+              "failed_request_records": 0,
+              "inspection_log_records": 375,
+              "ml_kem_768_handshake_latency.p95_us": 31109.392,
+              "process_cpu_percent_of_one_core": 137.76967933538873,
+              "process_rss_bytes.peak_sampled": 264511488,
+              "request_goodput_bps": 746917.7200284145,
+              "request_packets_per_second": 729.4118359652485,
+              "request_response_rtt.p95_us": 111746.75219999999,
+              "request_response_rtt.p99_us": 117977.64312
+            },
+            "payload_128_connections_8": {
+              "authenticated_request_records": 383,
+              "authenticated_response_records": 383,
+              "failed_request_records": 0,
+              "inspection_log_records": 383,
+              "ml_kem_768_handshake_latency.p95_us": 1049184.6458,
+              "process_cpu_percent_of_one_core": 109.74553977718833,
+              "process_rss_bytes.peak_sampled": 262242304,
+              "request_goodput_bps": 776946.9903752278,
+              "request_packets_per_second": 758.7372952883084,
+              "request_response_rtt.p95_us": 19875.404,
+              "request_response_rtt.p99_us": 20738.66675
+            },
+            "payload_1518_connections_1": {
+              "authenticated_request_records": 462,
+              "authenticated_response_records": 462,
+              "failed_request_records": 0,
+              "inspection_log_records": 462,
+              "ml_kem_768_handshake_latency.p95_us": 789.436,
+              "process_cpu_percent_of_one_core": 101.9123094902486,
+              "process_rss_bytes.peak_sampled": 263135232,
+              "request_goodput_bps": 11197858.695092117,
+              "request_packets_per_second": 922.0898134957278,
+              "request_response_rtt.p95_us": 1453.2595999999996,
+              "request_response_rtt.p99_us": 1730.2671199999995
+            },
+            "payload_1518_connections_32": {
+              "authenticated_request_records": 265,
+              "authenticated_response_records": 265,
+              "failed_request_records": 0,
+              "inspection_log_records": 265,
+              "ml_kem_768_handshake_latency.p95_us": 2172956.99715,
+              "process_cpu_percent_of_one_core": 123.63192512680392,
+              "process_rss_bytes.peak_sampled": 265850880,
+              "request_goodput_bps": 6227810.271517313,
+              "request_packets_per_second": 512.8302265742187,
+              "request_response_rtt.p95_us": 129634.03735,
+              "request_response_rtt.p99_us": 141263.85095000002
+            },
+            "payload_1518_connections_8": {
+              "authenticated_request_records": 273,
+              "authenticated_response_records": 273,
+              "failed_request_records": 0,
+              "inspection_log_records": 273,
+              "ml_kem_768_handshake_latency.p95_us": 9231.2758,
+              "process_cpu_percent_of_one_core": 128.5540152146654,
+              "process_rss_bytes.peak_sampled": 263671808,
+              "request_goodput_bps": 6582877.899462948,
+              "request_packets_per_second": 542.0683382298212,
+              "request_response_rtt.p95_us": 22571.145249999998,
+              "request_response_rtt.p99_us": 23751.46762
+            },
+            "payload_256_connections_1": {
+              "authenticated_request_records": 645,
+              "authenticated_response_records": 645,
+              "failed_request_records": 0,
+              "inspection_log_records": 645,
+              "ml_kem_768_handshake_latency.p95_us": 942.068,
+              "process_cpu_percent_of_one_core": 95.28435512503076,
+              "process_rss_bytes.peak_sampled": 262127616,
+              "request_goodput_bps": 2639308.631089322,
+              "request_packets_per_second": 1288.724917524083,
+              "request_response_rtt.p95_us": 1180.523,
+              "request_response_rtt.p99_us": 1325.6438000000003
+            },
+            "payload_256_connections_32": {
+              "authenticated_request_records": 362,
+              "authenticated_response_records": 362,
+              "failed_request_records": 0,
+              "inspection_log_records": 362,
+              "ml_kem_768_handshake_latency.p95_us": 2104011.693,
+              "process_cpu_percent_of_one_core": 135.4376214307512,
+              "process_rss_bytes.peak_sampled": 264658944,
+              "request_goodput_bps": 1439687.8049921293,
+              "request_packets_per_second": 702.9725610313131,
+              "request_response_rtt.p95_us": 94845.50185,
+              "request_response_rtt.p99_us": 103023.96277000001
+            },
+            "payload_256_connections_8": {
+              "authenticated_request_records": 363,
+              "authenticated_response_records": 363,
+              "failed_request_records": 0,
+              "inspection_log_records": 363,
+              "ml_kem_768_handshake_latency.p95_us": 8079.914449999999,
+              "process_cpu_percent_of_one_core": 136.45015725292953,
+              "process_rss_bytes.peak_sampled": 262664192,
+              "request_goodput_bps": 1473611.12596351,
+              "request_packets_per_second": 719.5366825993701,
+              "request_response_rtt.p95_us": 21941.488799999985,
+              "request_response_rtt.p99_us": 26507.46735999999
+            },
+            "payload_512_connections_1": {
+              "authenticated_request_records": 675,
+              "authenticated_response_records": 675,
+              "failed_request_records": 0,
+              "inspection_log_records": 675,
+              "ml_kem_768_handshake_latency.p95_us": 636.174,
+              "process_cpu_percent_of_one_core": 102.37692162436545,
+              "process_rss_bytes.peak_sampled": 262258688,
+              "request_goodput_bps": 5524717.133453095,
+              "request_packets_per_second": 1348.807893909447,
+              "request_response_rtt.p95_us": 792.5389,
+              "request_response_rtt.p99_us": 1019.2086199999999
+            },
+            "payload_512_connections_32": {
+              "authenticated_request_records": 313,
+              "authenticated_response_records": 313,
+              "failed_request_records": 0,
+              "inspection_log_records": 313,
+              "ml_kem_768_handshake_latency.p95_us": 2106846.29545,
+              "process_cpu_percent_of_one_core": 123.78094184856221,
+              "process_rss_bytes.peak_sampled": 265011200,
+              "request_goodput_bps": 2486089.637287589,
+              "request_packets_per_second": 606.9554778534152,
+              "request_response_rtt.p95_us": 123591.72769999997,
+              "request_response_rtt.p99_us": 155268.14958000003
+            },
+            "payload_512_connections_8": {
+              "authenticated_request_records": 332,
+              "authenticated_response_records": 332,
+              "failed_request_records": 0,
+              "inspection_log_records": 332,
+              "ml_kem_768_handshake_latency.p95_us": 1058226.10695,
+              "process_cpu_percent_of_one_core": 132.6870371392103,
+              "process_rss_bytes.peak_sampled": 262791168,
+              "request_goodput_bps": 2696204.0250389273,
+              "request_packets_per_second": 658.2529358005194,
+              "request_response_rtt.p95_us": 26421.538199999988,
+              "request_response_rtt.p99_us": 28487.211219999997
+            },
+            "payload_64_connections_1": {
+              "authenticated_request_records": 907,
+              "authenticated_response_records": 907,
+              "failed_request_records": 0,
+              "inspection_log_records": 907,
+              "ml_kem_768_handshake_latency.p95_us": 1038.628,
+              "process_cpu_percent_of_one_core": 102.92395494047372,
+              "process_rss_bytes.peak_sampled": 259788800,
+              "request_goodput_bps": 928011.0881721254,
+              "request_packets_per_second": 1812.5216565861824,
+              "request_response_rtt.p95_us": 697.6639999999996,
+              "request_response_rtt.p99_us": 858.3256399999996
+            },
+            "payload_64_connections_32": {
+              "authenticated_request_records": 390,
+              "authenticated_response_records": 390,
+              "failed_request_records": 0,
+              "inspection_log_records": 390,
+              "ml_kem_768_handshake_latency.p95_us": 2092062.0760499998,
+              "process_cpu_percent_of_one_core": 121.58566257415939,
+              "process_rss_bytes.peak_sampled": 264085504,
+              "request_goodput_bps": 378438.0544315607,
+              "request_packets_per_second": 739.136825061642,
+              "request_response_rtt.p95_us": 102445.07839999998,
+              "request_response_rtt.p99_us": 117096.46172
+            },
+            "payload_64_connections_8": {
+              "authenticated_request_records": 386,
+              "authenticated_response_records": 386,
+              "failed_request_records": 0,
+              "inspection_log_records": 386,
+              "ml_kem_768_handshake_latency.p95_us": 1010618.4744,
+              "process_cpu_percent_of_one_core": 132.39502335834635,
+              "process_rss_bytes.peak_sampled": 260739072,
+              "request_goodput_bps": 391450.4304063596,
+              "request_packets_per_second": 764.5516218874211,
+              "request_response_rtt.p95_us": 20127.6883,
+              "request_response_rtt.p99_us": 22805.089599999992
+            }
+          },
+          "trial": 2
+        },
+        {
+          "created_utc": "2026-10-23T10:47:36Z",
+          "package_versions": {
+            "cryptography": "50.0.2",
+            "pqcrypto": "1.0.0",
+            "torch": "2.14.1+cpu"
+          },
+          "python": "3.12.3",
+          "scenario_results": {
+            "payload_1024_connections_1": {
+              "authenticated_request_records": 535,
+              "authenticated_response_records": 535,
+              "failed_request_records": 0,
+              "inspection_log_records": 535,
+              "ml_kem_768_handshake_latency.p95_us": 626.482,
+              "process_cpu_percent_of_one_core": 101.99348846738101,
+              "process_rss_bytes.peak_sampled": 262602752,
+              "request_goodput_bps": 8749542.239246707,
+              "request_packets_per_second": 1068.0593553767953,
+              "request_response_rtt.p95_us": 1148.9583499999999,
+              "request_response_rtt.p99_us": 1386.8337600000004
+            },
+            "payload_1024_connections_32": {
+              "authenticated_request_records": 238,
+              "authenticated_response_records": 238,
+              "failed_request_records": 0,
+              "inspection_log_records": 238,
+              "ml_kem_768_handshake_latency.p95_us": 3241319.4258000003,
+              "process_cpu_percent_of_one_core": 109.74429646168717,
+              "process_rss_bytes.peak_sampled": 265375744,
+              "request_goodput_bps": 3776593.6773292115,
+              "request_packets_per_second": 461.009970377101,
+              "request_response_rtt.p95_us": 188089.12965000002,
+              "request_response_rtt.p99_us": 306498.0228000002
+            },
+            "payload_1024_connections_8": {
+              "authenticated_request_records": 287,
+              "authenticated_response_records": 287,
+              "failed_request_records": 0,
+              "inspection_log_records": 287,
+              "ml_kem_768_handshake_latency.p95_us": 9945.180199999997,
+              "process_cpu_percent_of_one_core": 128.4439422263335,
+              "process_rss_bytes.peak_sampled": 263135232,
+              "request_goodput_bps": 4644268.465908661,
+              "request_packets_per_second": 566.9273029673658,
+              "request_response_rtt.p95_us": 24851.38545,
+              "request_response_rtt.p99_us": 25069.33776
+            },
+            "payload_128_connections_1": {
+              "authenticated_request_records": 828,
+              "authenticated_response_records": 828,
+              "failed_request_records": 0,
+              "inspection_log_records": 828,
+              "ml_kem_768_handshake_latency.p95_us": 1934.22,
+              "process_cpu_percent_of_one_core": 101.55634879692452,
+              "process_rss_bytes.peak_sampled": 261705728,
+              "request_goodput_bps": 1694966.4036520838,
+              "request_packets_per_second": 1655.240628566488,
+              "request_response_rtt.p95_us": 791.4869499999998,
+              "request_response_rtt.p99_us": 2325.641250000006
+            },
+            "payload_128_connections_32": {
+              "authenticated_request_records": 381,
+              "authenticated_response_records": 381,
+              "failed_request_records": 0,
+              "inspection_log_records": 381,
+              "ml_kem_768_handshake_latency.p95_us": 33331.6467,
+              "process_cpu_percent_of_one_core": 138.49172849767484,
+              "process_rss_bytes.peak_sampled": 264470528,
+              "request_goodput_bps": 759368.6142244927,
+              "request_packets_per_second": 741.5709123286061,
+              "request_response_rtt.p95_us": 108365.76745,
+              "request_response_rtt.p99_us": 114075.40533000001
+            },
+            "payload_128_connections_8": {
+              "authenticated_request_records": 379,
+              "authenticated_response_records": 379,
+              "failed_request_records": 0,
+              "inspection_log_records": 379,
+              "ml_kem_768_handshake_latency.p95_us": 1055305.4245,
+              "process_cpu_percent_of_one_core": 131.58054652654744,
+              "process_rss_bytes.peak_sampled": 262238208,
+              "request_goodput_bps": 770229.8540402368,
+              "request_packets_per_second": 752.1775918361687,
+              "request_response_rtt.p95_us": 16770.3713,
+              "request_response_rtt.p99_us": 22163.47807999999
+            },
+            "payload_1518_connections_1": {
+              "authenticated_request_records": 455,
+              "authenticated_response_records": 455,
+              "failed_request_records": 0,
+              "inspection_log_records": 455,
+              "ml_kem_768_handshake_latency.p95_us": 817.739,
+              "process_cpu_percent_of_one_core": 101.91627309855255,
+              "process_rss_bytes.peak_sampled": 263000064,
+              "request_goodput_bps": 11045229.391993545,
+              "request_packets_per_second": 909.5215243736451,
+              "request_response_rtt.p95_us": 1360.1293999999996,
+              "request_response_rtt.p99_us": 1673.5833999999995
+            },
+            "payload_1518_connections_32": {
+              "authenticated_request_records": 249,
+              "authenticated_response_records": 249,
+              "failed_request_records": 0,
+              "inspection_log_records": 249,
+              "ml_kem_768_handshake_latency.p95_us": 2175029.5674,
+              "process_cpu_percent_of_one_core": 119.57395588841051,
+              "process_rss_bytes.peak_sampled": 265904128,
+              "request_goodput_bps": 5872787.648897387,
+              "request_packets_per_second": 483.59582089075985,
+              "request_response_rtt.p95_us": 137149.15389999998,
+              "request_response_rtt.p99_us": 177497.35299000004
+            },
+            "payload_1518_connections_8": {
+              "authenticated_request_records": 263,
+              "authenticated_response_records": 263,
+              "failed_request_records": 0,
+              "inspection_log_records": 263,
+              "ml_kem_768_handshake_latency.p95_us": 1055015.75955,
+              "process_cpu_percent_of_one_core": 122.04260439773462,
+              "process_rss_bytes.peak_sampled": 263532544,
+              "request_goodput_bps": 6319916.8824440325,
+              "request_packets_per_second": 520.4147630471041,
+              "request_response_rtt.p95_us": 27181.967,
+              "request_response_rtt.p99_us": 32085.149400000002
+            },
+            "payload_256_connections_1": {
+              "authenticated_request_records": 705,
+              "authenticated_response_records": 705,
+              "failed_request_records": 0,
+              "inspection_log_records": 705,
+              "ml_kem_768_handshake_latency.p95_us": 893.137,
+              "process_cpu_percent_of_one_core": 100.6347229244199,
+              "process_rss_bytes.peak_sampled": 262074368,
+              "request_goodput_bps": 2884836.2841723105,
+              "request_packets_per_second": 1408.611466881011,
+              "request_response_rtt.p95_us": 1029.3225999999997,
+              "request_response_rtt.p99_us": 1981.606560000002
+            },
+            "payload_256_connections_32": {
+              "authenticated_request_records": 366,
+              "authenticated_response_records": 366,
+              "failed_request_records": 0,
+              "inspection_log_records": 366,
+              "ml_kem_768_handshake_latency.p95_us": 3116042.1064,
+              "process_cpu_percent_of_one_core": 136.50678551577496,
+              "process_rss_bytes.peak_sampled": 264765440,
+              "request_goodput_bps": 1450292.694562324,
+              "request_packets_per_second": 708.1507297667598,
+              "request_response_rtt.p95_us": 103505.9086,
+              "request_response_rtt.p99_us": 124694.83804
+            },
+            "payload_256_connections_8": {
+              "authenticated_request_records": 364,
+              "authenticated_response_records": 364,
+              "failed_request_records": 0,
+              "inspection_log_records": 364,
+              "ml_kem_768_handshake_latency.p95_us": 1071496.55735,
+              "process_cpu_percent_of_one_core": 135.27528677392735,
+              "process_rss_bytes.peak_sampled": 262610944,
+              "request_goodput_bps": 1480857.941717079,
+              "request_packets_per_second": 723.0751668540424,
+              "request_response_rtt.p95_us": 20166.8497,
+              "request_response_rtt.p99_us": 21298.151380000003
+            },
+            "payload_512_connections_1": {
+              "authenticated_request_records": 589,
+              "authenticated_response_records": 589,
+              "failed_request_records": 0,
+              "inspection_log_records": 589,
+              "ml_kem_768_handshake_latency.p95_us": 671.065,
+              "process_cpu_percent_of_one_core": 97.27716388366214,
+              "process_rss_bytes.peak_sampled": 262365184,
+              "request_goodput_bps": 4816233.797255487,
+              "request_packets_per_second": 1175.838329408078,
+              "request_response_rtt.p95_us": 1511.8989999999988,
+              "request_response_rtt.p99_us": 1758.83868
+            },
+            "payload_512_connections_32": {
+              "authenticated_request_records": 330,
+              "authenticated_response_records": 330,
+              "failed_request_records": 0,
+              "inspection_log_records": 330,
+              "ml_kem_768_handshake_latency.p95_us": 1066870.3835,
+              "process_cpu_percent_of_one_core": 124.61710826554938,
+              "process_rss_bytes.peak_sampled": 264998912,
+              "request_goodput_bps": 2626801.619868678,
+              "request_packets_per_second": 641.3089892257515,
+              "request_response_rtt.p95_us": 120525.16339999999,
+              "request_response_rtt.p99_us": 133437.26777
+            },
+            "payload_512_connections_8": {
+              "authenticated_request_records": 347,
+              "authenticated_response_records": 347,
+              "failed_request_records": 0,
+              "inspection_log_records": 347,
+              "ml_kem_768_handshake_latency.p95_us": 1057659.0638000001,
+              "process_cpu_percent_of_one_core": 129.19210374703704,
+              "process_rss_bytes.peak_sampled": 262897664,
+              "request_goodput_bps": 2814928.55970487,
+              "request_packets_per_second": 687.2384178966968,
+              "request_response_rtt.p95_us": 19618.886999999995,
+              "request_response_rtt.p99_us": 21501.65417
+            },
+            "payload_64_connections_1": {
+              "authenticated_request_records": 889,
+              "authenticated_response_records": 889,
+              "failed_request_records": 0,
+              "inspection_log_records": 889,
+              "ml_kem_768_handshake_latency.p95_us": 873.352,
+              "process_cpu_percent_of_one_core": 102.23991646384847,
+              "process_rss_bytes.peak_sampled": 259715072,
+              "request_goodput_bps": 909571.6323834386,
+              "request_packets_per_second": 1776.5070944989036,
+              "request_response_rtt.p95_us": 737.579,
+              "request_response_rtt.p99_us": 899.5152000000007
+            },
+            "payload_64_connections_32": {
+              "authenticated_request_records": 413,
+              "authenticated_response_records": 413,
+              "failed_request_records": 0,
+              "inspection_log_records": 413,
+              "ml_kem_768_handshake_latency.p95_us": 3074674.99025,
+              "process_cpu_percent_of_one_core": 137.51835050570864,
+              "process_rss_bytes.peak_sampled": 264093696,
+              "request_goodput_bps": 412721.4517125932,
+              "request_packets_per_second": 806.0965853761586,
+              "request_response_rtt.p95_us": 86834.40759999999,
+              "request_response_rtt.p99_us": 109919.065
+            },
+            "payload_64_connections_8": {
+              "authenticated_request_records": 382,
+              "authenticated_response_records": 382,
+              "failed_request_records": 0,
+              "inspection_log_records": 382,
+              "ml_kem_768_handshake_latency.p95_us": 10205.0526,
+              "process_cpu_percent_of_one_core": 127.19766040237126,
+              "process_rss_bytes.peak_sampled": 260591616,
+              "request_goodput_bps": 387274.58453529497,
+              "request_packets_per_second": 756.395672920498,
+              "request_response_rtt.p95_us": 18092.5373,
+              "request_response_rtt.p99_us": 22980.16659999999
+            }
+          },
+          "trial": 3
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "All scenarios use synthetic TCP loopback on a shared Codespaces host; no physical NIC, fabric, packet loss, or production peer authentication is measured.",
+    "Three brief repetitions are insufficient for a stable capacity claim or rigorous confidence interval; scheduling and host contention can dominate variability.",
+    "AI diagnostic trials use a randomly initialized model and are not product AI measurements.",
+    "CPU and RSS measurements are process-wide diagnostics, not dataplane-only resource use."
+  ],
+  "schema_version": 1,
+  "source_sha256": "24caf16db8b9ad82d12494a65d6d0bd3e91c6cbdbf7571e795cd34a10b6ab604",
+  "trial_policy": {
+    "connection_counts": [
+      1,
+      8,
+      32
+    ],
+    "duration_seconds_per_scenario": 0.5,
+    "payload_sizes_bytes": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      1518
+    ],
+    "repeats_per_environment": 3,
+    "statistics": "median, min/max, and population coefficient of variation across three runs; no confidence interval claimed"
+  }
+}
