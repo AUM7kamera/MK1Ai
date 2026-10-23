@@ -106,3 +106,76 @@ Run faults only on an approved isolated test fabric. Preserve security isolation
 authentication, encryption, inspection, logging and authorization. Fault-test
 the smallest failure domain first, then compound tests only after individual
 recovery has been validated.
+
+## Communication-isolation and leakage verification
+
+Security isolation is an independent acceptance criterion from capacity. Meeting
+the 1.6 Tbps/node or 5 Pbps arithmetic targets does not establish that traffic
+isolation, authorization, or encryption survives a fault. Do not disable any of
+these controls to meet a throughput target.
+
+### Evidence available in this repository
+
+The repository has a fail-closed Linux WireGuard route gate in
+[`mk1_secure_transport.py`](../mk1_secure_transport.py), which checks both
+default routes, peer AllowedIPs, and recent handshake state. The encrypted RSI
+request path invokes the gate before fetching the pinned public key and sending
+its encrypted request. The dashboard also checks its configured network route
+before provider sends. The route check is not atomic with later network I/O.
+
+The nftables egress kill-switch is a separate, operator-rendered policy in
+[`mk1-wireguard-egress.nft.template`](../mk1-wireguard-egress.nft.template)
+and [`mk1_render_nft.py`](../mk1_render_nft.py); the application and dashboard
+systemd unit do not install it. The README explicitly requires operators to
+configure host firewall policy and warns that route checks alone cannot prevent
+a route race or later route change. Therefore a deployment missing or
+misconfiguring this host policy is a **candidate egress-boundary risk**, not a
+confirmed repository-wide data leak. Whether traffic can leave the tunnel
+depends on the deployed host's routing and firewall state, which is not
+available in this repository.
+
+The repository does not implement a multi-node fabric or tenant-routing
+control plane. There is consequently no code or deployed topology here to
+establish node/link failover destination correctness, VLAN/ACL preservation,
+cross-tenant queue isolation, or shared switch/rack/power behavior. The
+session-ratchet tests cover replay, ordering, context mismatch, tampering, and
+expiry; these are cryptographic/session properties, not fabric-routing tests.
+
+### Fault-test results and limits
+
+“Not run” means no isolated fabric, live WireGuard deployment, or packet
+capture was available. It is not evidence that the failure would be safe. For
+all cases below, expected traffic is only to the explicitly configured,
+authorized service through the authenticated encrypted channel; if path,
+policy, or peer verification fails, the expected outcome is no delivery. Actual
+destination counters and packet captures were unavailable, so they are
+recorded as not observed rather than assumed to match.
+
+| Scenario | Expected destination / allowed and denied traffic | Actual destination / denied traffic observed | Authentication, authorization, encryption | Result |
+| --- | --- | --- | --- | --- |
+| One node failure | Authorized service only; unauthorized destinations denied | Not observed; no fabric/node-failure environment | WireGuard route/handshake checks exist, but failover re-authentication was not exercised | Not verified |
+| One fabric-link-equivalent failure | Authorized service via a valid alternate path only; otherwise stop; unauthorized destinations denied | Not observed; no fabric or alternate-path control plane | Route policy and session continuity during reconvergence not exercised | Not verified |
+| One node plus one link failure | Same as individual failures; never widen destination policy | Not observed | Combined failure and re-authentication not exercised | Not verified |
+| Overload / queue exhaustion | Authorized traffic may be delayed or dropped; no unauthorized destination or cross-session delivery | Not observed; no fabric queue/capture/counters | No network queue-isolation test; ratchet session separation tests are not a queue test | Not verified |
+| Route change / reconnect / session re-establishment | Pinned, authorized peer over WireGuard only; reject invalid route/key/session | Not observed during a real send or reconnect | Unit tests exercise route/handshake rejection and pinned-key mismatch; race after check remains dependent on host kill switch | Partially tested; deployment boundary unverified |
+| Shared switch / rack / power failure | Authorized alternate path only, or fail closed; unauthorized destinations denied | Not observed; topology and shared failure domains are unspecified | Policy distribution, authentication, authorization, and encryption continuity not exercised | Not verified |
+
+Existing automated evidence includes route/AllowedIPs/handshake unit tests in
+[`tests/test_secure_transport.py`](../tests/test_secure_transport.py), egress
+template rendering tests in [`tests/test_config_templates.py`](../tests/test_config_templates.py),
+firewall-policy tests in [`tests/test_firewall_nft.py`](../tests/test_firewall_nft.py),
+and optional namespace tests in
+[`tests/integration/test_firewall_netns.py`](../tests/integration/test_firewall_netns.py).
+The namespace suite currently tests quarantine-policy behavior, not an applied
+WireGuard egress kill switch or tunnel-link failure. Crypto-dependent transport
+and session-ratchet tests were not executable in the review environment because
+required crypto packages were unavailable; the namespace suite also requires
+root/CAP_NET_ADMIN, `iproute2`, `nftables`, and explicit opt-in.
+
+Capacity is reported separately: the 1.6 Tbps/node and 5 Pbps figures remain
+conditional arithmetic, not measured network goodput. Security acceptance
+requires separate isolated-fabric tests that record expected and actual
+destinations, allowed/denied flows, authentication and authorization decisions,
+encryption state, per-destination counters, packet captures, route state,
+loss, latency, and recovery. Loss, delay, and disconnection must be reported as
+availability effects, not mislabeled as information leakage.
